@@ -57,10 +57,28 @@ class RecordVideo(gym.Wrapper):
             ``video_base_dir`` (output directory root),
             ``fps`` (optional FPS override),
             ``info_on_video`` (whether to render overlay text),
-            ``extra_info_on_video`` (list of ``info`` keys to render).
+            ``extra_info_on_video`` (list of ``info`` keys to render),
+            ``image_key`` (optional single obs key for the MP4, e.g.
+            ``main_images``; ignored when ``video_image_keys`` is set),
+            ``video_image_keys`` (optional list of obs keys tiled into each
+            MP4 frame — prefer DROID policy views ``main_images`` /
+            ``wrist_images``; do not use ``eval_images`` for policy logging),
+            ``save_camera_stills`` (if True, write one PNG per camera key on
+            ``flush_video``; first frame of the buffered segment),
+            ``camera_image_keys`` (obs keys to dump as stills; default
+            ``main_images``, ``wrist_images``),
+            ``record_env_ids`` (optional list of env indices to include),
+            ``max_envs_in_video`` (optional cap; takes first N envs when set).
         fps: Explicit FPS override. If ``None``, FPS is resolved from
             ``video_cfg.fps``, environment config/metadata, then fallback ``30``.
     """
+
+    # DROID RLDS cameras (not the third-person ``eval_images`` viewer).
+    _DEFAULT_CAMERA_STILL_KEYS = (
+        "main_images",
+        "exterior2_images",
+        "wrist_images",
+    )
 
     def __init__(self, env: gym.Env, video_cfg, fps: Optional[int] = None):
         """Initialize the wrapper and set FPS/config."""
@@ -78,11 +96,55 @@ class RecordVideo(gym.Wrapper):
         self._num_envs = getattr(env, "num_envs", 1)
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._save_futures: list[Future] = []
+        self._image_key = self._cfg_get("image_key", None)
+        video_keys = self._cfg_get("video_image_keys", None)
+        if video_keys is None:
+            self._video_image_keys: list[str] = []
+        elif isinstance(video_keys, str):
+            self._video_image_keys = [video_keys]
+        else:
+            self._video_image_keys = [str(k) for k in list(video_keys)]
+        self._record_env_ids = self._resolve_record_env_ids()
+        self._save_camera_stills = bool(self._cfg_get("save_camera_stills", False))
+        camera_keys = self._cfg_get("camera_image_keys", None)
+        if camera_keys is None:
+            self._camera_image_keys = list(self._DEFAULT_CAMERA_STILL_KEYS)
+        elif isinstance(camera_keys, str):
+            self._camera_image_keys = [camera_keys]
+        else:
+            self._camera_image_keys = [str(k) for k in list(camera_keys)]
+        # First frame per camera key for the current buffered segment.
+        self._camera_stills: dict[str, np.ndarray] = {}
 
         if fps is not None:
             self._fps = fps
         else:
             self._fps = self._get_fps_from_env(env)
+
+    def _cfg_get(self, key: str, default: Any = None) -> Any:
+        if hasattr(self.video_cfg, "get"):
+            return self.video_cfg.get(key, default)
+        return getattr(self.video_cfg, key, default)
+
+    def _resolve_record_env_ids(self) -> Optional[list[int]]:
+        """Return env indices to keep in each video frame, or None for all."""
+        record_env_ids = self._cfg_get("record_env_ids", None)
+        if record_env_ids is not None:
+            return [int(i) for i in list(record_env_ids)]
+        max_envs = self._cfg_get("max_envs_in_video", None)
+        if max_envs is not None:
+            n = max(int(max_envs), 0)
+            return list(range(n))
+        return None
+
+    def _filter_env_images(self, images: list[np.ndarray]) -> list[np.ndarray]:
+        """Keep only the configured env subset for video frames."""
+        if not images or self._record_env_ids is None:
+            return images
+        selected = [
+            images[i] for i in self._record_env_ids if 0 <= i < len(images)
+        ]
+        return selected if selected else images[:1]
 
     @property
     def is_start(self):
@@ -113,14 +175,78 @@ class RecordVideo(gym.Wrapper):
             return value
         return np.array(value)
 
+    def _as_uint8_image(self, img: np.ndarray) -> np.ndarray:
+        """Convert image arrays to uint8 RGB for MP4 writing.
+
+        Isaac Lab / many sim backends emit float images in ``[0, 1]`` (or rarely
+        ``[-1, 1]``). Casting those directly with ``astype(np.uint8)`` truncates
+        almost everything to 0 and produces black videos.
+        """
+        if img.dtype == np.uint8:
+            return img
+        if np.issubdtype(img.dtype, np.floating):
+            min_v = float(np.nanmin(img)) if img.size else 0.0
+            max_v = float(np.nanmax(img)) if img.size else 1.0
+            if min_v >= -1.0 - 1e-3 and max_v <= 1.0 + 1e-3:
+                if min_v < 0.0:
+                    img = (img + 1.0) * 0.5
+                img = img * 255.0
+            return np.clip(img, 0, 255).astype(np.uint8)
+        return np.clip(img, 0, 255).astype(np.uint8)
+
     def _get_image_from_dict(self, obs: dict) -> Optional[Any]:
         """Pick the best image field from an observation dict."""
+        if self._image_key:
+            if self._image_key in obs and obs[self._image_key] is not None:
+                return obs[self._image_key]
+            return None
         if hasattr(self.env, "capture_image"):
             return self.env.capture_image()
-        for key in ("main_images", "images", "rgb", "full_image", "main_image"):
+        # Prefer DROID policy cameras over the third-person eval viewer.
+        for key in (
+            "main_images",
+            "wrist_images",
+            "viewer_images",
+            "images",
+            "rgb",
+            "full_image",
+            "main_image",
+            "eval_images",
+        ):
             if key in obs and obs[key] is not None:
                 return obs[key]
         return None
+
+    def _resize_to_height(self, img: np.ndarray, height: int) -> np.ndarray:
+        """Resize HxWxC image to a target height, keeping aspect ratio."""
+        if img.ndim != 3 or img.shape[0] == height:
+            return img
+        h, w = img.shape[:2]
+        new_w = max(int(round(w * (height / float(h)))), 1)
+        # Nearest-neighbor via numpy (no cv2 dependency in this wrapper).
+        y_idx = (np.arange(height) * (h / height)).astype(np.int64)
+        x_idx = (np.arange(new_w) * (w / new_w)).astype(np.int64)
+        return img[y_idx][:, x_idx]
+
+    def _tile_policy_cameras(self, obs: dict) -> Optional[np.ndarray]:
+        """Horizontally tile configured ``video_image_keys`` for one env."""
+        if not self._video_image_keys:
+            return None
+        panels: list[np.ndarray] = []
+        for key in self._video_image_keys:
+            if key not in obs or obs[key] is None:
+                continue
+            still = self._first_env_still(obs[key])
+            if still is None:
+                continue
+            panels.append(still)
+        if not panels:
+            return None
+        if len(panels) == 1:
+            return panels[0]
+        target_h = max(p.shape[0] for p in panels)
+        panels = [self._resize_to_height(p, target_h) for p in panels]
+        return np.concatenate(panels, axis=1)
 
     def _extract_frame_batches(self, obs: Any) -> list[list[np.ndarray]]:
         """Extract a list of per-step image batches from obs."""
@@ -128,6 +254,11 @@ class RecordVideo(gym.Wrapper):
             return []
 
         if isinstance(obs, dict):
+            if self._video_image_keys:
+                tiled = self._tile_policy_cameras(obs)
+                if tiled is None:
+                    return []
+                return [[tiled]]
             image_src = self._get_image_from_dict(obs)
             if image_src is None:
                 return []
@@ -139,6 +270,11 @@ class RecordVideo(gym.Wrapper):
             if isinstance(obs[0], dict):
                 frames = []
                 for item in obs:
+                    if self._video_image_keys:
+                        tiled = self._tile_policy_cameras(item)
+                        if tiled is not None:
+                            frames.append([tiled])
+                        continue
                     image_src = self._get_image_from_dict(item)
                     if image_src is None:
                         continue
@@ -146,12 +282,7 @@ class RecordVideo(gym.Wrapper):
                     if batches:
                         frames.append(batches[0])
                 return frames
-            images = []
-            for item in obs:
-                img = self._to_numpy(item)
-                if img.dtype != np.uint8:
-                    img = img.astype(np.uint8)
-                images.append(img)
+            images = [self._as_uint8_image(self._to_numpy(item)) for item in obs]
             return [images] if images else []
 
         if torch is not None and isinstance(obs, torch.Tensor):
@@ -167,19 +298,12 @@ class RecordVideo(gym.Wrapper):
         if img.ndim == 3:
             if img.shape[0] in (1, 3, 4) and img.shape[-1] not in (1, 3, 4):
                 img = np.transpose(img, (1, 2, 0))
-            if img.dtype != np.uint8:
-                img = img.astype(np.uint8)
-            return [[img]]
+            return [[self._as_uint8_image(img)]]
 
         if img.ndim == 4:
             if img.shape[1] in (1, 3, 4) and img.shape[-1] not in (1, 3, 4):
                 img = np.transpose(img, (0, 2, 3, 1))
-            images = []
-            for i in range(img.shape[0]):
-                single = img[i]
-                if single.dtype != np.uint8:
-                    single = single.astype(np.uint8)
-                images.append(single)
+            images = [self._as_uint8_image(img[i]) for i in range(img.shape[0])]
             return [images]
 
         if img.ndim == 5:
@@ -187,12 +311,9 @@ class RecordVideo(gym.Wrapper):
                 img = np.transpose(img, (0, 1, 3, 4, 2))
             frames = []
             for t in range(img.shape[1]):
-                images = []
-                for i in range(img.shape[0]):
-                    single = img[i, t]
-                    if single.dtype != np.uint8:
-                        single = single.astype(np.uint8)
-                    images.append(single)
+                images = [
+                    self._as_uint8_image(img[i, t]) for i in range(img.shape[0])
+                ]
                 frames.append(images)
             return frames
 
@@ -314,6 +435,16 @@ class RecordVideo(gym.Wrapper):
         """Overlay info (optional) and append a tiled frame."""
         if not images:
             return
+        # Map filtered frames back to original env ids for overlay text.
+        if self._record_env_ids is None:
+            env_ids = list(range(len(images)))
+        else:
+            env_ids = [i for i in self._record_env_ids if 0 <= i < len(images)]
+            images = self._filter_env_images(images)
+            if not env_ids:
+                env_ids = list(range(len(images)))
+        if not images:
+            return
         if self.video_cfg.get("info_on_video", True):
             images = [
                 put_info_on_image(
@@ -322,7 +453,7 @@ class RecordVideo(gym.Wrapper):
                         infos, rewards, terminations, env_id, time_idx
                     ),
                 )
-                for env_id, img in enumerate(images)
+                for img, env_id in zip(images, env_ids)
             ]
         if len(images) > 1:
             nrows = int(np.sqrt(len(images)))
@@ -330,6 +461,51 @@ class RecordVideo(gym.Wrapper):
             self.render_images.append(full_image)
         else:
             self.render_images.append(images[0])
+
+    def _first_env_still(self, image_src: Any) -> Optional[np.ndarray]:
+        """Return a single HxWxC uint8 still for the first recorded env."""
+        batches = self._split_image_source(image_src)
+        if not batches or not batches[0]:
+            return None
+        images = self._filter_env_images(batches[0])
+        if not images:
+            return None
+        return images[0]
+
+    def _capture_camera_stills(self, obs: Any) -> None:
+        """Keep the first still of each configured camera key for this segment."""
+        if not self._save_camera_stills:
+            return
+        if isinstance(obs, (list, tuple)):
+            for item in obs:
+                if isinstance(item, dict):
+                    self._capture_camera_stills(item)
+            return
+        if not isinstance(obs, dict):
+            return
+        for key in self._camera_image_keys:
+            if key in self._camera_stills:
+                continue
+            if key not in obs or obs[key] is None:
+                continue
+            still = self._first_env_still(obs[key])
+            if still is not None:
+                self._camera_stills[key] = still
+
+    def _save_camera_still_images(self, output_dir: str, video_idx: int) -> None:
+        """Write buffered camera stills next to the MP4 (``{idx}_{key}.png``)."""
+        if not self._save_camera_stills or not self._camera_stills:
+            self._camera_stills = {}
+            return
+        os.makedirs(output_dir, exist_ok=True)
+        for key, img in self._camera_stills.items():
+            safe_key = key.replace(os.sep, "_")
+            png_path = os.path.join(output_dir, f"{video_idx}_{safe_key}.png")
+            try:
+                imageio.imwrite(png_path, img)
+            except Exception as exc:
+                warnings.warn(f"Failed to save camera still {png_path}: {exc}")
+        self._camera_stills = {}
 
     def add_new_frames(
         self,
@@ -339,6 +515,7 @@ class RecordVideo(gym.Wrapper):
         terminations: Optional[Any] = None,
     ):
         """Extract frames from obs and append to the buffer."""
+        self._capture_camera_stills(obs)
         frames = self._extract_frame_batches(obs)
         if not frames:
             warnings.warn(
@@ -446,7 +623,7 @@ class RecordVideo(gym.Wrapper):
         handler is run under Ray actor shutdown either). Without this wait,
         eval videos end at ``mdat`` and no player can open them.
         """
-        if not self.render_images:
+        if not self.render_images and not self._camera_stills:
             return
 
         output_dir = os.path.join(
@@ -456,7 +633,12 @@ class RecordVideo(gym.Wrapper):
             output_dir = os.path.join(output_dir, f"{video_sub_dir}")
 
         os.makedirs(output_dir, exist_ok=True)
-        mp4_path = os.path.join(output_dir, f"{self.video_cnt}.mp4")
+        video_idx = self.video_cnt
+        self._save_camera_still_images(output_dir, video_idx)
+        if not self.render_images:
+            self.video_cnt += 1
+            return
+        mp4_path = os.path.join(output_dir, f"{video_idx}.mp4")
         frames = list(self.render_images)
         self.render_images = []
         self.video_cnt += 1

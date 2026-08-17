@@ -12,13 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .tasks.pick_place_cube_plate import IsaaclabPickPlaceCubePlateEnv
-from .tasks.stack_cube import IsaaclabStackCubeEnv
+"""DROID abs-joint-pos cube→plate task (Isaac Lab gym + RLinf wrapper)."""
 
-REGISTER_ISAACLAB_ENVS = {
-    "Isaac-Stack-Cube-Franka-IK-Rel-Visuomotor-Rewarded-v0": IsaaclabStackCubeEnv,
-    # DROID abs-joint-pos cube→plate (Arena specs as built-in Isaac Lab task).
-    "Isaac-PickPlace-Cube-Plate-Droid-AbsJointPos-v0": IsaaclabPickPlaceCubePlateEnv,
-}
+from .env import (
+    GYM_ID,
+    IsaaclabPickPlaceCubePlateEnv,
+    register_pick_place_cube_plate_env,
+    wrap_droid_obs,
+)
 
-__all__ = [list(REGISTER_ISAACLAB_ENVS.keys())]
+__all__ = [
+    "GYM_ID",
+    "IsaaclabPickPlaceCubePlateEnv",
+    "register_pick_place_cube_plate_env",
+    "wrap_droid_obs",
+]

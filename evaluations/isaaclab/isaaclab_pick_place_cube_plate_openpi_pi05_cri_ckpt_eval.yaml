@@ -1,0 +1,99 @@
+defaults:
+  - env/isaaclab_pick_place_cube_plate@env.eval
+  - model/pi0_5@rollout.model
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+# Evaluate the converted OpenPI CRI weights under ``checkpoints/`` (from JAX
+# ``49999`` via ``prepare_cri_openpi_ckpt.sh``). No RL ``full_weights.pt``.
+cri_openpi_ckpt: ${oc.env:CRI_OPENPI_CKPT,/workspace/RLinf/checkpoints/pi05_droid_cri_rlinf_49999}
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env,rollout: all
+
+runner:
+  task_type: embodied_eval
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "isaaclab_pick_place_cube_plate_openpi_pi05_cri_ckpt_eval"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 1
+  max_steps: -1
+
+  only_eval: True
+  val_check_interval: -1
+  save_interval: -1
+
+  resume_dir: null
+  # Keep null to score the OpenPI directory in ``rollout.model.model_path``.
+  # To score an RL checkpoint instead, override:
+  #   runner.ckpt_path=/path/to/.../full_weights.pt
+  #   rollout.model.add_value_head=True
+  ckpt_path: null
+
+env:
+  group_name: "EnvGroup"
+
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 4
+    max_episode_steps: 450
+    max_steps_per_rollout_epoch: 450
+    auto_reset: True
+    ignore_terminations: True
+    use_fixed_reset_state_ids: True
+    is_eval: True
+    seed: 42
+    init_params:
+      eval_cam:
+        height: 480
+        width: 640
+    video_cfg:
+      save_video: True
+      info_on_video: True
+      fps: 20
+      max_envs_in_video: 1
+      # DROID RLDS: exterior_1 + exterior_2 + wrist.
+      video_image_keys:
+        - main_images
+        - exterior2_images
+        - wrist_images
+      save_camera_stills: True
+      camera_image_keys:
+        - main_images
+        - exterior2_images
+        - wrist_images
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: "RolloutGroup"
+  backend: "huggingface"
+  enable_offload: True
+  pipeline_stage_num: 1
+
+  model:
+    model_path: ${cri_openpi_ckpt}
+    precision: null
+    model_type: "openpi"
+    action_dim: 8
+    num_action_chunks: 15
+    num_steps: 10
+    # CRI OpenPI safetensors has no PPO value head.
+    add_value_head: False
+    openpi:
+      config_name: "pi05_droid_cri"
+      num_images_in_input: 2
+      noise_level: 0.5
+      joint_logprob: False
+      num_steps: ${rollout.model.num_steps}
+      action_env_dim: ${rollout.model.action_dim}

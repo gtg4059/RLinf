@@ -82,16 +82,37 @@ def prepare_actions_for_libero(
 def prepare_actions_for_isaaclab(
     raw_chunk_actions,
     model_type,
+    env_cfg=None,
 ) -> torch.Tensor:
     """
-    Here reture a general 7 dof action. If the action is modified, please change the output of the model
-    For example, in `RLinf/rlinf/models/embodiment/gr00t/simulation_io.py`
+    Prepare actions for Isaac Lab envs.
+
+    Stack-cube (EE 7-DoF) keeps the historical OpenVLA gripper remap. DROID
+    abs-joint-pos tasks (8-DoF) binarize the OpenPI gripper channel into {0, 1},
+    matching PolaRiS / OpenPI DROID deploy semantics.
     """
     chunk_actions = (
         torch.from_numpy(raw_chunk_actions)
         if isinstance(raw_chunk_actions, np.ndarray)
         else raw_chunk_actions
     )
+    action_space = None
+    if env_cfg is not None:
+        action_space = env_cfg.get("action_space", None)
+        if action_space is None:
+            init_params = env_cfg.get("init_params", None)
+            if init_params is not None:
+                action_space = init_params.get("action_space", None)
+
+    if action_space in ("droid_abs_joint_pos", "droid_joint_pos"):
+        if SupportedModel(model_type) == SupportedModel.OPENPI:
+            chunk_actions[..., -1] = torch.where(
+                chunk_actions[..., -1] > 0.5,
+                torch.ones_like(chunk_actions[..., -1]),
+                torch.zeros_like(chunk_actions[..., -1]),
+            )
+        return chunk_actions
+
     if SupportedModel(model_type) in [
         SupportedModel.OPENVLA,
         SupportedModel.OPENVLA_OFT,
@@ -379,6 +400,7 @@ def prepare_actions(
         chunk_actions = prepare_actions_for_isaaclab(
             raw_chunk_actions=raw_chunk_actions,
             model_type=model_type,
+            env_cfg=env_cfg,
         )
     elif env_type == SupportedEnvType.ROBOCASA365:
         chunk_actions = prepare_actions_for_robocasa(

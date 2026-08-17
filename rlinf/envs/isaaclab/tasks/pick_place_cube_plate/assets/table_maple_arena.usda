@@ -1,0 +1,35 @@
+#usda 1.0
+# Local spawn of Arena ``maple_table`` / ``maple_table_background`` table prim.
+# Payloads the ASCII ``table_maple.usda`` (MDL paths rewritten by
+# download_isaaclab_arena_assets.sh to ``.assets/isaaclab_arena/Materials``).
+(
+    defaultPrim = "Root"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "Root" (
+    prepend payload = @./table_maple.usda@
+)
+{
+    over "table_01"
+    {
+        double3 xformOp:translate = (0, 0, 0)
+
+        # Same Oak rebind as Arena scenes/maple_table.usda (relative path so it
+        # survives Isaac Lab env namespacing).
+        over "top" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            rel material:binding = <../../Looks/Oak> (
+                bindMaterialAs = "weakerThanDescendants"
+            )
+        }
+    }
+
+    over "GroundPlane"
+    {
+        token visibility = "invisible"
+    }
+}

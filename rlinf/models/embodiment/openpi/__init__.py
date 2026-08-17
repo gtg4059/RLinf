@@ -23,6 +23,13 @@ from omegaconf import DictConfig
 def get_model(cfg: DictConfig, torch_dtype=None):
     import glob
 
+    # openpi.transforms → transformers AutoProcessor eagerly probes flash-attn.
+    # Run before that import chain so a torch-ABI-mismatched wheel cannot abort
+    # worker init (see rlinf.utils.flash_attn.disable_broken_flash_attn).
+    from rlinf.utils.flash_attn import disable_broken_flash_attn
+
+    disable_broken_flash_attn()
+
     import openpi.shared.download as download
     import openpi.transforms as transforms
     import safetensors

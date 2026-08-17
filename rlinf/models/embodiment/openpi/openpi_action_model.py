@@ -43,7 +43,13 @@ from rlinf.utils.pytree import register_pytree_dataclasses
 
 
 def _to_numpy(x):
-    return np.asarray(x.detach().cpu()) if torch.is_tensor(x) else x
+    """Detach tensor and convert to NumPy (bf16/fp16 need float32 first)."""
+    if not torch.is_tensor(x):
+        return x
+    t = x.detach().cpu()
+    if t.dtype in (torch.bfloat16, torch.float16):
+        t = t.to(dtype=torch.float32)
+    return np.asarray(t)
 
 
 @dataclass(frozen=True)
@@ -351,7 +357,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         batch_size = outputs["actions"].shape[0]
         transformed_samples = []
         for i in range(batch_size):
-            sample = tree_map(lambda x: np.asarray(x[i].detach().cpu()), outputs)
+            sample = tree_map(lambda x: _to_numpy(x[i]), outputs)
             sample = self._output_transform(sample)
             transformed_samples.append(sample)
         # recombine
@@ -814,10 +820,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             processed_obs["observation/state_gripper"] = state[:, 6:7]
         else:
             processed_obs["observation/state"] = env_states
-        if env_obs["wrist_images"] is not None:
+        if env_obs.get("wrist_images") is not None:
             processed_obs["observation/wrist_image"] = env_obs["wrist_images"]
-        if env_obs["extra_view_images"] is not None:
+        if env_obs.get("extra_view_images") is not None:
             processed_obs["observation/extra_view_image"] = env_obs["extra_view_images"]
+        if env_obs.get("cri") is not None:
+            processed_obs["observation/cri"] = env_obs["cri"]
         return processed_obs
 
     def precision_processor(self, processed_obs):

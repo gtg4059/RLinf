@@ -24,7 +24,6 @@ from rlinf.runners.embodied_runner import EmbodiedRunner
 from rlinf.scheduler import Cluster
 from rlinf.utils.placement import HybridComponentPlacement
 from rlinf.workers.env.env_worker import EnvWorker
-from rlinf.workers.reward import EmbodiedAPIRewardWorker, EmbodiedRewardWorker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 mp.set_start_method("spawn", force=True)
@@ -140,6 +139,10 @@ def main(cfg) -> None:
     if reward_cfg.get("use_reward_model", False) and not reward_cfg.get(
         "standalone_realworld", False
     ):
+        # Lazy import: reward models pull torchvision/transformers and are unused
+        # when reward.use_reward_model=False (typical embodied PPO configs).
+        from rlinf.workers.reward import EmbodiedAPIRewardWorker, EmbodiedRewardWorker
+
         reward_placement = component_placement.get_strategy("reward")
         reward_worker_cls = (
             EmbodiedAPIRewardWorker

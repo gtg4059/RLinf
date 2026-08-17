@@ -1074,6 +1074,25 @@ EOF
     uv sync --active $NO_INSTALL_RLINF_CMD
 }
 
+# Verify flash-attn actually imports against the active torch. A wrong prebuilt
+# wheel (or a source build linked to a different libtorch) installs cleanly but
+# then crashes transformers with undefined CUDA symbols. On failure, uninstall
+# so runtime falls back to PyTorch SDPA.
+_verify_flash_attn_import() {
+    if python - <<'EOF'
+import importlib
+
+importlib.import_module("flash_attn")
+print("[install.sh] flash-attn import OK")
+EOF
+    then
+        return 0
+    fi
+    echo "[install.sh] WARNING: flash-attn failed to import (likely torch ABI mismatch); uninstalling so transformers can use SDPA." >&2
+    uv pip uninstall flash-attn || true
+    return 1
+}
+
 install_flash_attn() {
     local flash_ver="2.7.4.post1"
 
@@ -1111,7 +1130,8 @@ EOF
         echo "[install.sh] Building flash-attn==${flash_ver} from source on platform=${PLATFORM}..."
         uv pip uninstall flash-attn || true
         FLASH_ATTENTION_FORCE_BUILD=TRUE uv pip install "flash-attn==${flash_ver}" --no-build-isolation
-        return 0
+        _verify_flash_attn_import
+        return $?
     fi
     # Detect Python tags
     local py_major py_minor
@@ -1143,7 +1163,8 @@ EOF
     cuda_mm=$(detect_cuda_major_minor) || {
         echo "[install.sh] Could not detect CUDA version; falling back to source build." >&2
         FLASH_ATTENTION_FORCE_BUILD=TRUE uv pip install "flash-attn==${flash_ver}" --no-build-isolation
-        return 0
+        _verify_flash_attn_import
+        return $?
     }
     cuda_major="${cuda_mm%% *}"
 
@@ -1171,7 +1192,7 @@ EOF
         for host in "${flash_attn_release_hosts[@]}"; do
             base_url="${GITHUB_PREFIX}${host}/v${prebuilt_ver}"
             echo "[install.sh] Installing flash-attn prebuilt wheel ${wheel_name} from ${host}..."
-            if uv pip install "${base_url}/${wheel_name}"; then
+            if uv pip install "${base_url}/${wheel_name}" && _verify_flash_attn_import; then
                 return 0
             fi
             echo "[install.sh] flash-attn prebuilt wheel v${prebuilt_ver} was unavailable or failed to install from ${host}."
@@ -1179,6 +1200,92 @@ EOF
     done
     echo "Flash attn installation via prebuilt wheels failed. Attempting to install from source..."
     FLASH_ATTENTION_FORCE_BUILD=TRUE uv pip install "flash-attn==${flash_ver}" --no-build-isolation
+    _verify_flash_attn_import
+}
+
+# Reinstall torch/torchvision/torchaudio from a CUDA wheel index.
+# Isaac Lab (and similar) overwrite the synced torch with an older CUDA build
+# (commonly +cu124) that lacks newer GPU arches such as Blackwell sm_120.
+# Call this after those installs, then reinstall flash-attn.
+reinstall_torch_cuda_wheel() {
+    if [ "$PLATFORM" != "nvidia" ]; then
+        echo "[install.sh] Skipping CUDA torch reinstall on platform=${PLATFORM}."
+        return 0
+    fi
+
+    # Default matches pyproject torch pin; CUDA 12.8+ wheels include Blackwell sm_120.
+    local torch_ver="${1:-${TORCH_VERSION:-2.11.0}}"
+    local cuda_tag="${2:-}"
+    local index_base torch_major torch_minor torch_patch torchvision_ver
+
+    IFS='.' read -r torch_major torch_minor torch_patch <<< "$torch_ver"
+    if ! [[ "$torch_major" =~ ^[0-9]+$ && "$torch_minor" =~ ^[0-9]+$ ]]; then
+        echo "[install.sh] reinstall_torch_cuda_wheel: invalid torch version '$torch_ver'." >&2
+        return 1
+    fi
+    # torchvision minor = torch minor + 15 (e.g. torch 2.8.0 -> torchvision 0.23.0).
+    torchvision_ver="0.$((torch_minor + 15)).${torch_patch:-0}"
+
+    if [ "$USE_MIRRORS" -eq 1 ]; then
+        index_base="https://mirrors.tencent.com/pytorch-wheels/whl"
+    else
+        index_base="https://download.pytorch.org/whl"
+    fi
+
+    if [ -z "$cuda_tag" ]; then
+        if [[ "${UV_TORCH_BACKEND:-}" =~ ^cu[0-9]+$ ]]; then
+            cuda_tag="$UV_TORCH_BACKEND"
+        else
+            local driver_num=""
+            if ! driver_num=$(detect_nvidia_driver_max_cuda); then
+                local cmm cmaj cmin
+                if cmm=$(detect_cuda_major_minor); then
+                    read -r cmaj cmin <<< "$cmm"
+                    driver_num=$((cmaj * 10 + cmin))
+                else
+                    # Blackwell-ready default when neither driver nor toolkit is visible.
+                    driver_num=128
+                fi
+            fi
+            cuda_tag=$(detect_nvidia_torch_cuda_tag "$torch_ver" "$index_base" "$driver_num") || cuda_tag="cu128"
+        fi
+    fi
+
+    echo "[install.sh] Reinstalling torch==${torch_ver} / torchvision==${torchvision_ver} / torchaudio==${torch_ver} from ${index_base}/${cuda_tag}..."
+    # UV_NO_CONFIG avoids workspace pyproject pins floating the requested version.
+    UV_NO_CONFIG=1 uv pip install --force-reinstall \
+        "torch==${torch_ver}" \
+        "torchvision==${torchvision_ver}" \
+        "torchaudio==${torch_ver}" \
+        --index-url "${index_base}/${cuda_tag}"
+
+    python - <<EOF
+import torch
+print(f"[install.sh] Active torch: {torch.__version__} (cuda={torch.version.cuda})")
+print(f"[install.sh] CUDA arch list: {torch.cuda.get_arch_list() if torch.cuda.is_available() else 'n/a'}")
+EOF
+}
+
+# After Isaac Lab overwrites torch, restore a driver-compatible CUDA wheel and
+# rebuild flash-attn against that torch.
+#
+# flash-attn is best-effort: system nvcc (e.g. 12.8) often mismatches the CUDA
+# version baked into newer torch wheels (e.g. 13.0 from the cu128 index). When
+# the rebuild fails we keep the repaired torch and fall back to PyTorch SDPA —
+# matching requirements/embodied/patch_torch_blackwell.sh.
+repair_torch_after_isaaclab() {
+    local cuda_tag=""
+    if [[ "${UV_TORCH_BACKEND:-}" =~ ^cu[0-9]+$ ]]; then
+        cuda_tag="$UV_TORCH_BACKEND"
+    fi
+    reinstall_torch_cuda_wheel "${TORCH_VERSION:-2.11.0}" "$cuda_tag"
+    if ! install_flash_attn; then
+        echo "[install.sh] WARNING: flash-attn install failed after Isaac Lab torch repair; continuing with PyTorch SDPA." >&2
+    fi
+    # Docker builds usually have no GPU, so get_arch_list() is empty even for
+    # good cu128 wheels. verify_torch_blackwell.py checks the wheel tag at
+    # build time and only asserts sm_120 when a GPU is visible.
+    python "$SCRIPT_DIR/embodied/verify_torch_blackwell.py"
 }
 
 install_apex() {
@@ -1581,8 +1688,9 @@ install_openpi_model() {
             install_common_embodied_deps
             uv pip install "rlinf-openpi==0.1.1"
             install_isaaclab_env
-            # Torch is modified in Isaac Lab, install flash-attn afterwards
-            install_flash_attn
+            # Isaac Lab pins an older +cu124 torch; restore a Blackwell-capable
+            # CUDA wheel (default 2.11.0+cu128) then install flash-attn.
+            repair_torch_after_isaaclab
             uv pip install numpydantic==1.7.0 pydantic==2.11.7 numpy==1.26.0
             ;;
         roboverse)
@@ -1722,8 +1830,9 @@ install_gr00t_model() {
             ;;
         isaaclab)
             install_isaaclab_env
-            # Torch is modified in Isaac Lab, install flash-attn afterwards
-            install_flash_attn
+            # Isaac Lab pins an older +cu124 torch; restore a Blackwell-capable
+            # CUDA wheel (default 2.11.0+cu128) then install flash-attn.
+            repair_torch_after_isaaclab
             uv pip install numpydantic==1.7.0 pydantic==2.11.7 numpy==1.26.0
             ;;
         *)
@@ -2220,7 +2329,25 @@ EOF
 
 install_isaaclab_env() {
     local isaaclab_dir
+    # Pin to the RLinf IsaacLab fork tip that ships VERSION 2.3.0 (Isaac Sim 5.1).
+    # Override with ISAAC_LAB_GIT_REF=<sha|tag|branch> when needed.
+    local isaac_lab_ref="${ISAAC_LAB_GIT_REF:-4246b6b4f4a3e74ee20e002ed7536b1c788d39f4}"
     isaaclab_dir=$(clone_or_reuse_repo ISAAC_LAB_PATH "$VENV_DIR/isaaclab" https://github.com/RLinf/IsaacLab)
+
+    if [ -d "$isaaclab_dir/.git" ]; then
+        echo "[install_isaaclab_env] Checking out Isaac Lab ${isaac_lab_ref} (VERSION 2.3.0)..." >&2
+        git -C "$isaaclab_dir" fetch --depth 1 origin "${isaac_lab_ref}" >&2 \
+            || git -C "$isaaclab_dir" fetch origin "${isaac_lab_ref}" >&2
+        git -C "$isaaclab_dir" checkout --detach FETCH_HEAD >&2 \
+            || git -C "$isaaclab_dir" checkout --detach "${isaac_lab_ref}" >&2
+    fi
+
+    # Binary Isaac Sim install: isaaclab.sh and AppLauncher expect _isaac_sim.
+    local sim_root="${ISAAC_PATH:-${ISAACSIM_PATH:-}}"
+    if [ -n "$sim_root" ] && [ -d "$sim_root" ]; then
+        ln -sfn "$sim_root" "$isaaclab_dir/_isaac_sim"
+        echo "[install_isaaclab_env] Linked $isaaclab_dir/_isaac_sim -> $sim_root" >&2
+    fi
 
     pushd ~ >/dev/null
     uv pip install "flatdict==4.0.1" --no-build-isolation
@@ -2230,7 +2357,13 @@ install_isaaclab_env() {
     uv pip uninstall -y cmake || true
     uv pip install "cmake<4"
 
-    $isaaclab_dir/isaaclab.sh --install
+    # isaaclab.sh runs `tabs 4` under set -e; that fails when TERM=dumb (CI/non-TTY).
+    TERM="${TERM:-xterm-256color}"
+    if [ "$TERM" = "dumb" ] || ! tabs 4 >/dev/null 2>&1; then
+        TERM=xterm-256color
+    fi
+    export TERM
+    TERM="$TERM" "$isaaclab_dir/isaaclab.sh" --install
     popd >/dev/null
 }
 

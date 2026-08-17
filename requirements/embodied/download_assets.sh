@@ -3,7 +3,7 @@
 set -euo pipefail
 
 DOWNLOAD_DIR=${DOWNLOAD_DIR:-$HOME}
-SUPPORT_LIST=("maniskill" "openpi")
+SUPPORT_LIST=("maniskill" "openpi" "isaaclab_arena")
 GITHUB_PREFIX=${GITHUB_PREFIX:-""}
 USE_MIRRORS=${USE_MIRRORS:-0}
 ASSETS=()
@@ -26,6 +26,7 @@ Examples:
   bash requirements/embodied/download_assets.sh --assets maniskill
   bash requirements/embodied/download_assets.sh --dir /opt/.assets --assets maniskill,openpi
   bash requirements/embodied/download_assets.sh --use-mirror --assets maniskill,openpi
+  bash requirements/embodied/download_assets.sh --assets isaaclab_arena
 EOF
 }
 
@@ -185,6 +186,16 @@ main() {
 				;;
 			openpi)
 				download_openpi_assets "$DOWNLOAD_DIR"
+				;;
+			isaaclab_arena)
+				# Populates ${DOWNLOAD_DIR}/.assets/isaaclab_arena (or REPO .assets
+				# when DOWNLOAD_DIR is the repo root).
+				local arena_script="${REPO_PATH:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}/examples/embodiment/scripts/download_isaaclab_arena_assets.sh"
+				if [ ! -f "${arena_script}" ]; then
+					# DOWNLOAD_DIR may itself be the repo root.
+					arena_script="${DOWNLOAD_DIR}/examples/embodiment/scripts/download_isaaclab_arena_assets.sh"
+				fi
+				DEST_DIR="${DOWNLOAD_DIR}/.assets/isaaclab_arena" bash "${arena_script}"
 				;;
 			*)
 				echo "Unknown asset group: $asset. Supported: ${SUPPORT_LIST[*]}" >&2

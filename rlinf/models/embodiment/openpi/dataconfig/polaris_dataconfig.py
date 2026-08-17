@@ -16,9 +16,15 @@ import dataclasses
 
 import numpy as np
 import openpi.models.model as _model
+import openpi.models.tokenizer as _tokenizer
 import openpi.transforms as _transforms
 from openpi.training.config import DataConfig, DataConfigFactory, ModelTransformFactory
 from typing_extensions import override
+
+from rlinf.models.embodiment.openpi.dataconfig.cri_tokenize import (
+    TokenizePromptWithCri,
+    ensure_paligemma_cri_tokenize,
+)
 
 
 def _parse_image(image) -> np.ndarray:
@@ -34,6 +40,9 @@ def _parse_image(image) -> np.ndarray:
 class DroidJointPosInputs(_transforms.DataTransformFn):
     action_dim: int
     model_type: _model.ModelType = _model.ModelType.PI0
+    # Forward observation/cri as a separate field for LLM tokenization
+    # (openpi droid-cri; not concatenated into continuous proprio state).
+    use_cri: bool = False
 
     def __call__(self, data: dict) -> dict:
         if "observation/state" in data:
@@ -88,6 +97,13 @@ class DroidJointPosInputs(_transforms.DataTransformFn):
                 data["prompt"] = data["prompt"].decode("utf-8")
             inputs["prompt"] = data["prompt"]
 
+        if self.use_cri:
+            if "observation/cri" not in data:
+                raise KeyError("use_cri=True but observation/cri is missing from the batch")
+            inputs["cri"] = np.asarray(data["observation/cri"], dtype=np.float32).reshape(
+                -1
+            )
+
         return inputs
 
 
@@ -100,6 +116,7 @@ class DroidJointPosOutputs(_transforms.DataTransformFn):
 @dataclasses.dataclass(frozen=True)
 class LeRobotPolarisDroidDataConfig(DataConfigFactory):
     action_dim: int = 32
+    use_cri: bool = False
 
     @override
     def create(self, assets_dirs, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -108,6 +125,7 @@ class LeRobotPolarisDroidDataConfig(DataConfigFactory):
                 DroidJointPosInputs(
                     action_dim=model_config.action_dim,
                     model_type=model_config.model_type,
+                    use_cri=self.use_cri,
                 )
             ],
             outputs=[DroidJointPosOutputs()],
@@ -120,9 +138,33 @@ class LeRobotPolarisDroidDataConfig(DataConfigFactory):
         )
 
         model_transforms = ModelTransformFactory()(model_config)
+        if self.use_cri:
+            model_transforms = _replace_tokenize_prompt_with_cri(
+                model_transforms, model_config
+            )
 
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
+
+
+def _replace_tokenize_prompt_with_cri(group, model_config):
+    """Swap stock TokenizePrompt for droid-cri ``discrete_cri_input=True``."""
+    ensure_paligemma_cri_tokenize()
+    tokenizer = _tokenizer.PaligemmaTokenizer(model_config.max_token_len)
+    discrete_state = bool(getattr(model_config, "discrete_state_input", True))
+    inputs = []
+    for transform in group.inputs:
+        if type(transform).__name__ == "TokenizePrompt":
+            inputs.append(
+                TokenizePromptWithCri(
+                    tokenizer,
+                    discrete_state_input=discrete_state,
+                    discrete_cri_input=True,
+                )
+            )
+        else:
+            inputs.append(transform)
+    return dataclasses.replace(group, inputs=inputs)

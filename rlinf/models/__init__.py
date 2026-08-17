@@ -288,6 +288,13 @@ def get_model(cfg: DictConfig):
     if model_builder is None:
         return None
 
+    # Blackwell / repaired-torch images often leave a flash-attn wheel whose CUDA
+    # extension does not match the active torch ABI. transformers then crashes
+    # while importing AutoProcessor; neutralize it before any model import.
+    from rlinf.utils.flash_attn import disable_broken_flash_attn
+
+    disable_broken_flash_attn()
+
     torch_dtype = torch_dtype_from_precision(cfg.precision)
     model = model_builder(cfg, torch_dtype)
 

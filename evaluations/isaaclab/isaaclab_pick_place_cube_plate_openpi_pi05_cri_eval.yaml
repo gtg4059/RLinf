@@ -1,0 +1,106 @@
+defaults:
+  - env/isaaclab_pick_place_cube_plate@env.eval
+  - model/pi0_5@rollout.model
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+# Base OpenPI weights (architecture / norm stats). RL weights override via runner.ckpt_path.
+cri_openpi_ckpt: ${oc.env:CRI_OPENPI_CKPT,/workspace/RLinf/checkpoints/pi05_droid_cri_rlinf}
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env,rollout: all
+
+runner:
+  task_type: embodied_eval
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "isaaclab_pick_place_cube_plate_openpi_pi05_cri_eval"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: 1
+  max_steps: -1
+
+  only_eval: True
+  val_check_interval: -1
+  save_interval: -1
+
+  resume_dir: null
+  # RL full weights from FSDP training (torch.load -> load_state_dict).
+  # Override on the CLI to evaluate a different global_step.
+  ckpt_path: /workspace/RLinf/logs/20260807-05:56:38-isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri/isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri/checkpoints/global_step_900/actor/model_state_dict/full_weights.pt
+
+env:
+  group_name: "EnvGroup"
+
+  eval:
+    rollout_epoch: 1
+    total_num_envs: 4
+    max_episode_steps: 450
+    max_steps_per_rollout_epoch: 450
+    auto_reset: True
+    ignore_terminations: True
+    use_fixed_reset_state_ids: True
+    is_eval: True
+    seed: 42
+    # Front / 3/4 Arena-docs camera used by RecordVideo (policy still uses
+    # external_camera + wrist_camera at 224x224).
+    init_params:
+      eval_cam:
+        height: 480
+        width: 640
+        # Optional overrides (defaults match Arena docs hero viewpoint):
+        # pos: [1.8, -1.2, 1.35]
+        # rot: [0.79798, 0.451059, 0.196693, 0.347975]  # wxyz, opengl
+        # eye: [1.8, -1.2, 1.35]
+        # lookat: [0.4, 0.1, 0.2]
+    video_cfg:
+      save_video: True
+      info_on_video: True
+      fps: 20
+      # DROID RLDS: exterior_1 + exterior_2 + wrist.
+      max_envs_in_video: 1
+      video_image_keys:
+        - main_images
+        - exterior2_images
+        - wrist_images
+      save_camera_stills: True
+      camera_image_keys:
+        - main_images
+        - exterior2_images
+        - wrist_images
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: "RolloutGroup"
+  backend: "huggingface"
+  enable_offload: True
+  pipeline_stage_num: 1
+
+  model:
+    model_path: ${cri_openpi_ckpt}
+    precision: null
+    model_type: "openpi"
+    action_dim: 8
+    num_action_chunks: 15
+    num_steps: 10
+    # Must match training so full_weights.pt (with value head) loads cleanly.
+    add_value_head: True
+    openpi:
+      config_name: "pi05_droid_cri"
+      num_images_in_input: 2
+      noise_level: 0.5
+      joint_logprob: False
+      num_steps: ${rollout.model.num_steps}
+      value_after_vlm: True
+      value_vlm_mode: "mean_token"
+      detach_critic_input: True
+      action_env_dim: ${rollout.model.action_dim}
