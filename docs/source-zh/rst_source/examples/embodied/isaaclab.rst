@@ -124,7 +124,9 @@
 下载 Isaac Sim
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-下载 Isaac Sim 5.1.0 并初始化其 shell 环境：
+下载 Isaac Sim 5.1.0 并初始化其 shell 环境。Docker 镜像不包含 Isaac Sim，
+需单独安装，然后设置 ``ISAAC_PATH``，或把目录放在 ``run_embodiment.sh``
+能找到的位置（``./isaac_sim``、同级 ``isaac_sim``、或 ``/workspace/isaac_sim``）。
 
 .. code-block:: bash
 
@@ -196,6 +198,9 @@
    * - OpenPI π₀.₅
      - ``examples/embodiment/config/isaaclab_franka_stack_cube_ppo_openpi_pi05.yaml``
      - ``isaaclab_franka_stack_cube_ppo_openpi_pi05``
+   * - OpenPI π₀.₅ CRI（DROID joint-pos，立方体→盘子）
+     - ``examples/embodiment/config/isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri.yaml``
+     - ``isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri``
 
 .. code:: bash
 
@@ -204,6 +209,17 @@
 
    # OpenPI π₀.₅
    bash examples/embodiment/run_embodiment.sh isaaclab_franka_stack_cube_ppo_openpi_pi05
+
+   # OpenPI π₀.₅（以 pi05_droid_cri_finetune 为起点，DROID 8-D，方块→盘子）
+   # 1) 将 JAX/LoRA 权重转换为 RLinf 可加载的 safetensors：
+   #    bash examples/embodiment/scripts/prepare_cri_openpi_ckpt.sh
+   # 2) EnvWorker 会从 rlinf/envs/isaaclab/tasks/pick_place_cube_plate 注册
+   #    Isaac-PickPlace-Cube-Plate-Droid-AbsJointPos-v0（Arena DROID 规格、单布局）。
+   #    每个 episode 以 50:50 将 exterior_1 / exterior_2 采样到策略 base 图像，
+   #    与 openpi DROID RLDS 训练一致。
+   #    在线 CRI(q, qd) 会编成离散 VLM span（droid-cri / 49999）。
+   export CRI_OPENPI_CKPT=/workspace/RLinf/checkpoints/pi05_droid_cri_rlinf_49999
+   bash examples/embodiment/run_embodiment.sh isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri
 
 这条命令会：
 

@@ -125,7 +125,10 @@ Install the environment for the model you want to run:
 Download Isaac Sim
 ~~~~~~~~~~~~~~~~~~
 
-Download Isaac Sim 5.1.0 and initialize its shell environment:
+Download Isaac Sim 5.1.0 and initialize its shell environment. The Docker
+image does not ship Isaac Sim; install it separately, then set ``ISAAC_PATH``
+or place the tree where ``run_embodiment.sh`` can find it
+(``./isaac_sim``, a sibling ``isaac_sim``, or ``/workspace/isaac_sim``).
 
 .. code-block:: bash
 
@@ -197,6 +200,9 @@ Pick one config and launch training:
    * - OpenPI π₀.₅
      - ``examples/embodiment/config/isaaclab_franka_stack_cube_ppo_openpi_pi05.yaml``
      - ``isaaclab_franka_stack_cube_ppo_openpi_pi05``
+   * - OpenPI π₀.₅ CRI (DROID joint-pos, cube→plate)
+     - ``examples/embodiment/config/isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri.yaml``
+     - ``isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri``
 
 .. code:: bash
 
@@ -205,6 +211,17 @@ Pick one config and launch training:
 
    # OpenPI π₀.₅
    bash examples/embodiment/run_embodiment.sh isaaclab_franka_stack_cube_ppo_openpi_pi05
+
+   # OpenPI π₀.₅ from pi05_droid_cri_finetune (DROID 8-D, cube→plate)
+   # 1) Convert JAX/LoRA weights to RLinf-loadable safetensors:
+   #    bash examples/embodiment/scripts/prepare_cri_openpi_ckpt.sh
+   # 2) EnvWorker registers Isaac-PickPlace-Cube-Plate-Droid-AbsJointPos-v0 from
+   #    rlinf/envs/isaaclab/tasks/pick_place_cube_plate (Arena DROID specs, single layout).
+   #    Each episode samples exterior_1 vs exterior_2 50:50 into the policy base
+   #    image, matching openpi DROID RLDS training.
+   #    Online CRI(q, qd) is tokenized as a discrete VLM span (droid-cri / 49999).
+   export CRI_OPENPI_CKPT=/workspace/RLinf/checkpoints/pi05_droid_cri_rlinf_49999
+   bash examples/embodiment/run_embodiment.sh isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri
 
 What this does:
 

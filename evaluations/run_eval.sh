@@ -19,9 +19,37 @@ setup_sim_env() {
     export OMNIGIBSON_KEY_PATH="${OMNIGIBSON_KEY_PATH:-${OMNIGIBSON_DATA_PATH}/omnigibson.key}"
     export OMNIGIBSON_ASSET_PATH="${OMNIGIBSON_ASSET_PATH:-${OMNIGIBSON_DATA_PATH}/omnigibson-robot-assets/}"
     export OMNIGIBSON_HEADLESS="${OMNIGIBSON_HEADLESS:-1}"
+
+    # Prefer an explicit ISAAC_PATH; otherwise probe common layouts.
+    if [ -z "${ISAAC_PATH:-}" ] || [ ! -f "${ISAAC_PATH}/setup_conda_env.sh" ]; then
+        for _isaac_candidate in \
+            "${REPO_PATH}/isaac_sim" \
+            "${REPO_PATH}/../isaac_sim" \
+            "/mnt/E/isaac_sim" \
+            "/workspace/isaac_sim"; do
+            if [ -f "${_isaac_candidate}/setup_conda_env.sh" ] && [ -f "${_isaac_candidate}/VERSION" ]; then
+                ISAAC_PATH="$(cd "${_isaac_candidate}" && pwd)"
+                break
+            fi
+        done
+        unset _isaac_candidate
+    fi
     export ISAAC_PATH="${ISAAC_PATH:-/path/to/isaac-sim}"
     export EXP_PATH="${EXP_PATH:-$ISAAC_PATH/apps}"
     export CARB_APP_PATH="${CARB_APP_PATH:-$ISAAC_PATH/kit}"
+    export OMNI_KIT_ACCEPT_EULA="${OMNI_KIT_ACCEPT_EULA:-YES}"
+
+    if [ -n "${ISAAC_LAB_PATH:-}" ] && [ -d "${ISAAC_LAB_PATH}" ] && [ -d "${ISAAC_PATH}" ]; then
+        ln -sfn "${ISAAC_PATH}" "${ISAAC_LAB_PATH}/_isaac_sim"
+    fi
+    if [ -f "${ISAAC_PATH}/setup_conda_env.sh" ]; then
+        # Isaac's setup references ZSH_VERSION without defaults; tolerate under `set -u`.
+        set +u
+        # shellcheck disable=SC1091
+        source "${ISAAC_PATH}/setup_conda_env.sh"
+        set -u
+        echo "Using ISAAC_PATH=${ISAAC_PATH}"
+    fi
 
     # POLARIS dataset
     export POLARIS_DATA_PATH="${POLARIS_DATA_PATH:-/path/to/dataset/PolaRiS-Hub}"
@@ -49,6 +77,7 @@ infer_benchmark() {
         robocasa_*|robocasa-* ) echo "robocasa" ;;
         roboverse_*|roboverse-* ) echo "roboverse" ;;
         polaris_*|polaris-* ) echo "polaris" ;;
+        isaaclab_*|isaaclab-* ) echo "isaaclab" ;;
         * )
             echo "unknown"
             ;;
@@ -191,6 +220,13 @@ if [ "${BENCHMARK}" = "libero" ]; then
     else
         echo "Evaluation Mode: Standard LIBERO"
     fi
+    echo "Using benchmark=${BENCHMARK}, config=${CONFIG_NAME}, ROBOT_PLATFORM=${ROBOT_PLATFORM}"
+elif [ "${BENCHMARK}" = "isaaclab" ]; then
+    export ROBOT_PLATFORM="${ROBOT_PLATFORM:-LIBERO}"
+    # Local .assets tree only (downloads from S3 staging if incomplete).
+    # shellcheck disable=SC1091
+    source "${REPO_PATH}/examples/embodiment/scripts/setup_arena_assets.sh"
+    setup_arena_assets
     echo "Using benchmark=${BENCHMARK}, config=${CONFIG_NAME}, ROBOT_PLATFORM=${ROBOT_PLATFORM}"
 else
     echo "Using benchmark=${BENCHMARK}, config=${CONFIG_NAME}"

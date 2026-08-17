@@ -5,6 +5,10 @@ ARG PLATFORM=nvidia
 # Per-platform runtime versions. Override these for common CUDA/ROCm/CANN bumps, or
 # override the full base-image args below for a different image family/Ubuntu.
 ARG CUDA_VER=12.8.1
+# Torch used when an env (e.g. Isaac Lab) overwrites the synced wheel. Blackwell
+# (sm_120) needs CUDA 12.8+ builds: torch>=2.7 (default matches pyproject 2.11).
+ARG TORCH_VERSION=2.11.0
+ARG UV_TORCH_BACKEND=cu128
 ARG ROCM_VER=6.4
 ARG ROCM_ARCHS=gfx90a;gfx942
 ARG CANN_VER=9.0.0-910b
@@ -62,7 +66,12 @@ FROM ubuntu:20.04 AS base-image-embodied-franka
 ##################################################################################################
 FROM base-image-$BUILD_TARGET AS base-image
 ARG PLATFORM
+ARG TORCH_VERSION
+ARG UV_TORCH_BACKEND
 ENV RLINF_PLATFORM=${PLATFORM}
+# Propagate torch routing into install.sh (Isaac Lab repair + uv wheel index).
+ENV TORCH_VERSION=${TORCH_VERSION}
+ENV UV_TORCH_BACKEND=${UV_TORCH_BACKEND}
 
 
 ##################################################################################################
@@ -228,7 +237,7 @@ RUN source switch_env openvla && download_assets ${INSTALL_MIRROR_OPTION} --dir 
 RUN link_assets
 
 # Set default env
-RUN echo "source ${UV_PATH}/openvla/bin/activate" >> ~/.bashrc
+RUN echo "source ${UV_PATH}/openpi/bin/activate" >> ~/.bashrc
 
 FROM embodied-common-image AS embodied-behavior-openvlaoft-image
 
@@ -309,16 +318,47 @@ RUN echo "source ${UV_PATH}/openpi/bin/activate" >> ~/.bashrc
 # Embodied: IsaacLab
 ##################################################################################################
 FROM embodied-common-image AS embodied-isaaclab-image
+ARG TORCH_VERSION
+ARG UV_TORCH_BACKEND
+ARG CUDA_VER
 
 # Clone the IsaacLab env repo once into a shared path; both models below reuse it.
+# Pin matches requirements/install.sh (RLinf/IsaacLab VERSION 2.3.0, Isaac Sim 5.1).
 ENV ISAAC_LAB_PATH=/opt/envs/isaaclab
+ENV ISAAC_LAB_GIT_REF=4246b6b4f4a3e74ee20e002ed7536b1c788d39f4
+ENV ISAAC_LAB_VERSION=2.3.0
+# Isaac Lab overwrites torch; install.sh repairs to TORCH_VERSION+UV_TORCH_BACKEND
+# (default 2.11.0 + cu128) for Blackwell sm_120 / CUDA 12.8 hosts.
+# Prefer: bash docker/build_embodied_isaaclab_blackwell.sh
+# Isaac Sim itself is NOT baked in — mount/download 5.1.0 and set ISAAC_PATH at runtime.
+ENV TORCH_VERSION=${TORCH_VERSION}
+ENV UV_TORCH_BACKEND=${UV_TORCH_BACKEND}
+LABEL rlinf.component=embodied-isaaclab \
+      rlinf.isaaclab_version=${ISAAC_LAB_VERSION} \
+      rlinf.isaaclab_git_ref=${ISAAC_LAB_GIT_REF} \
+      rlinf.torch_version=${TORCH_VERSION} \
+      rlinf.uv_torch_backend=${UV_TORCH_BACKEND} \
+      rlinf.cuda_ver=${CUDA_VER} \
+      rlinf.blackwell=1
 
 # Install gr00t env, and openpi env
-RUN bash requirements/install.sh ${INSTALL_MIRROR_OPTION} --platform ${RLINF_PLATFORM} embodied --venv gr00t --model gr00t --env isaaclab && \
-    bash requirements/install.sh ${INSTALL_MIRROR_OPTION} --platform ${RLINF_PLATFORM} embodied --venv openpi --model openpi --env isaaclab
+RUN bash requirements/install.sh ${INSTALL_MIRROR_OPTION} --platform ${RLINF_PLATFORM} \
+        --torch ${TORCH_VERSION} \
+        embodied --venv gr00t --model gr00t --env isaaclab && \
+    bash requirements/install.sh ${INSTALL_MIRROR_OPTION} --platform ${RLINF_PLATFORM} \
+        --torch ${TORCH_VERSION} \
+        embodied --venv openpi --model openpi --env isaaclab
+
+# Fail the image build if either venv lost the Blackwell-capable CUDA wheel.
+# (No GPU during docker build: check wheel tag / CUDA version, not arch list.)
+RUN for venv in gr00t openpi; do \
+        echo "[Dockerfile] Verifying torch in ${venv}..."; \
+        "${UV_PATH}/${venv}/bin/python" \
+            "${UV_PATH}/requirements/embodied/verify_torch_blackwell.py"; \
+    done
 
 # Set default env
-RUN echo "source ${UV_PATH}/gr00t/bin/activate" >> ~/.bashrc
+RUN echo "source ${UV_PATH}/openpi/bin/activate" >> ~/.bashrc
 
 
 ##################################################################################################
@@ -481,6 +521,20 @@ FROM ${BUILD_TARGET}-image AS final-image
 ##################################################################################################
 RUN uv cache prune
 RUN rm -rf /var/lib/apt/lists/*
+
+# RLinf source/examples/checkpoints are NOT baked into the image (venvs live under
+# /opt/venv only). Mount the checkout at runtime, e.g.:
+#   bash docker/run_embodied_isaaclab_blackwell.sh
+#   docker run --gpus all -it --rm -v "$PWD":/workspace/RLinf -w /workspace/RLinf <image>
+RUN mkdir -p /workspace/RLinf && \
+    printf '%s\n' \
+      'RLinf source is not included in this image.' \
+      'Bind-mount your checkout before training:' \
+      '  bash docker/run_embodied_isaaclab_blackwell.sh' \
+      '  # or: docker run --gpus all -it --rm \' \
+      '  #      -v /path/to/RLinf:/workspace/RLinf -w /workspace/RLinf <image>' \
+      'Venvs: source switch_env openpi   # or gr00t' \
+      > /workspace/README.txt
 
 WORKDIR /workspace
 

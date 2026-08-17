@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Enter the embodied-isaaclab Blackwell image with the local RLinf checkout mounted.
+#
+# The Docker image only ships Python venvs under /opt/venv. RLinf source, configs,
+# checkpoints, and examples are provided by bind-mounting this repo to
+# /workspace/RLinf (same convention as the isaaclab docs).
+#
+# Usage (from anywhere; defaults to this repo root):
+#   bash docker/run_embodied_isaaclab_blackwell.sh
+#   bash docker/run_embodied_isaaclab_blackwell.sh --name rlinf-bw
+#   bash docker/run_embodied_isaaclab_blackwell.sh -- python examples/embodiment/train_embodied_agent.py --help
+#   IMAGE_TAG=rlinf:embodied-isaaclab-blackwell bash docker/run_embodied_isaaclab_blackwell.sh
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IMAGE_TAG="${IMAGE_TAG:-rlinf:embodied-isaaclab-blackwell}"
+CONTAINER_NAME="${CONTAINER_NAME:-rlinf-isaaclab-blackwell}"
+SHM_SIZE="${SHM_SIZE:-32g}"
+WORKDIR="${WORKDIR:-/workspace/RLinf}"
+EXTRA_DOCKER_ARGS=()
+CMD=()
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --tag|--image) IMAGE_TAG="${2:-}"; shift 2 ;;
+    --name) CONTAINER_NAME="${2:-}"; shift 2 ;;
+    --shm-size) SHM_SIZE="${2:-}"; shift 2 ;;
+    --repo) REPO_ROOT="$(cd "${2:-}" && pwd)"; shift 2 ;;
+    --) shift; CMD=("$@"); break ;;
+    -h|--help)
+      sed -n '2,14p' "$0"
+      exit 0
+      ;;
+    *)
+      EXTRA_DOCKER_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [ ! -d "$REPO_ROOT/rlinf" ] || [ ! -d "$REPO_ROOT/examples" ]; then
+  echo "ERROR: '$REPO_ROOT' does not look like an RLinf checkout (missing rlinf/ or examples/)." >&2
+  exit 1
+fi
+
+if ! docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
+  echo "ERROR: image '$IMAGE_TAG' not found. Build it first:" >&2
+  echo "  bash docker/build_embodied_isaaclab_blackwell.sh" >&2
+  exit 1
+fi
+
+# Drop a stale stopped container with the same name so --name reuse works.
+if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+  if docker ps --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+    echo "ERROR: container '$CONTAINER_NAME' is already running." >&2
+    echo "  docker exec -it $CONTAINER_NAME bash" >&2
+    exit 1
+  fi
+  docker rm "$CONTAINER_NAME" >/dev/null
+fi
+
+# Optional: mount a local Isaac Sim 5.1.0 tree and expose it to Isaac Lab.
+ISAAC_SIM_PATH="${ISAAC_SIM_PATH:-}"
+if [ -z "$ISAAC_SIM_PATH" ]; then
+  for candidate in \
+      "${REPO_ROOT}/../isaac_sim" \
+      "${REPO_ROOT}/isaac_sim" \
+      "/workspace/isaac_sim"; do
+    if [ -f "${candidate}/VERSION" ] && [ -f "${candidate}/setup_conda_env.sh" ]; then
+      ISAAC_SIM_PATH="$(cd "$candidate" && pwd)"
+      break
+    fi
+  done
+fi
+
+RUN_CMD=(
+  docker run -it --rm
+  --gpus all
+  --shm-size "$SHM_SIZE"
+  --network host
+  --name "$CONTAINER_NAME"
+  -v "$REPO_ROOT":/workspace/RLinf
+  -w "$WORKDIR"
+)
+if [ -n "$ISAAC_SIM_PATH" ]; then
+  RUN_CMD+=(-v "$ISAAC_SIM_PATH":/workspace/isaac_sim:ro)
+  RUN_CMD+=(-e ISAAC_PATH=/workspace/isaac_sim)
+  RUN_CMD+=(-e ISAACSIM_PATH=/workspace/isaac_sim)
+  echo "[run_embodied_isaaclab_blackwell] isaac_sim=$ISAAC_SIM_PATH -> /workspace/isaac_sim"
+fi
+RUN_CMD+=(
+  "${EXTRA_DOCKER_ARGS[@]}"
+  "$IMAGE_TAG"
+)
+
+if [ "${#CMD[@]}" -gt 0 ]; then
+  RUN_CMD+=("${CMD[@]}")
+fi
+
+echo "[run_embodied_isaaclab_blackwell] image=$IMAGE_TAG"
+echo "[run_embodied_isaaclab_blackwell] mount=$REPO_ROOT -> /workspace/RLinf"
+echo "[run_embodied_isaaclab_blackwell] workdir=$WORKDIR"
+echo "[run_embodied_isaaclab_blackwell] running: ${RUN_CMD[*]}"
+
+exec "${RUN_CMD[@]}"

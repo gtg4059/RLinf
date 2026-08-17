@@ -18,6 +18,13 @@ outputs/*
 .venv
 .docs-venv
 uv.lock
+# Local large OpenPI checkpoints (JAX source + converted RLinf weights)
+/19999/
+/49999/
+/checkpoints/
+# Isaac Sim / Arena assets bind-mounted into the Docker workspace
+/isaac_sim/
+/.assets/
 rlinf/envs/maniskill/assets
 PKG-INFO
 *.egg-info/
