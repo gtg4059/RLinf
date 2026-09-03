@@ -1,9 +1,0 @@
-GLIBC_2.38 {
-  global:
-    __isoc23_strtol;
-};
-
-GLIBCXX_3.4.32 {
-  global:
-    _ZSt21ios_base_library_initv;
-};

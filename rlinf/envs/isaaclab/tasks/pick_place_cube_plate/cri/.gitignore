@@ -1,0 +1,6 @@
+# Machine-local CRI artifacts. Do not publish.
+/Engine/
+/lib/
+*.onnx
+*.engine
+*.engine.bak*

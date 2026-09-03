@@ -18,7 +18,12 @@ outputs/*
 # Versioned SONAMEs (*.so does not match libfoo.so.1.7.1) and Windows DLLs.
 *.so.*
 *.dll
-rlinf/envs/isaaclab/tasks/pick_place_cube_plate/cri/lib/*.bak
+# CRI local artifacts — onnx / TensorRT engine / native lib (do not publish)
+rlinf/envs/isaaclab/tasks/pick_place_cube_plate/cri/Engine/
+rlinf/envs/isaaclab/tasks/pick_place_cube_plate/cri/lib/
+rlinf/envs/isaaclab/tasks/pick_place_cube_plate/cri/**/*.onnx
+rlinf/envs/isaaclab/tasks/pick_place_cube_plate/cri/**/*.engine
+rlinf/envs/isaaclab/tasks/pick_place_cube_plate/cri/**/*.engine.bak*
 .venv
 .docs-venv
 uv.lock
@@ -32,6 +37,34 @@ examples/embodiment/scripts/isaaclab_local.env
 # Isaac Sim / Arena assets bind-mounted into the Docker workspace
 /isaac_sim/
 /.assets/
+# Isaac Sim 5.x tree accidentally extracted into the repo root (do not publish)
+/VERSION
+/apps/
+/clear_caches.sh
+/config/
+/data/
+/docs/py/
+/environment.yml
+/exts/
+/extsDeprecated/
+/extscache/
+/isaac-sim*.sh
+/jupyter_kernel/
+/jupyter_notebook.sh
+/kit/
+/post_install.sh
+/python.sh
+/python_packages/
+/run_tests.py
+/setup_conda_env.sh
+/setup_python_env.sh
+/setup_ros_env.sh
+/standalone_examples/
+/tensorboard
+/tests/test_config.json
+/tests/tests-*
+/tools/
+/warmup.sh
 rlinf/envs/maniskill/assets
 PKG-INFO
 *.egg-info/

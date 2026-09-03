@@ -1,7 +1,0 @@
-# CRI/SFD natives are machine-local and must not be committed.
-# Keep sfd_compat.c and sfd_compat.map in git.
-*.so
-*.so.*
-*.dll
-*.dylib
-*.bak

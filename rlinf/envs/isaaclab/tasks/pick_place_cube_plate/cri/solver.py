@@ -55,7 +55,7 @@ _PRELOAD_SONAMES = (
 )
 
 # Must live under the analysis ``lib/`` tree. These are not in git (see
-# ``cri/lib/.gitignore``); copy them locally or point ``OPENPI_CRI_ANALYSIS_DIR``.
+# ``cri/.gitignore``); copy them locally or point ``OPENPI_CRI_ANALYSIS_DIR``.
 _REQUIRED_BUNDLED_SONAMES = (
     "libsfd_compat.so",
     "libSFD_CoreService.so",
