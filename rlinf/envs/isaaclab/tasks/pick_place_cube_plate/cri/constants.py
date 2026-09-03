@@ -27,6 +27,13 @@ PACKAGE_DIR: Path = Path(__file__).resolve().parent
 # Per-point channels may be ~0 without scene obstacles; the last channel still carries signal.
 NUM_CRI_POINTS: int = 9
 
+# Training observation width: cri_pre only (IsaacLab CRI-F policy has no time-scale s).
+NUM_CRI_OBS_DIM: int = NUM_CRI_POINTS
+
+# IsaacLab JointVelocityCriFilterActionCfg / enable_cri_filter_mode defaults.
+CRI_FILTER_LIMIT: float = 0.96
+CBF_ALPHA: float = 0.02
+
 # IsaacLab articulation_data._store_cri_output_buffers
 CRI_CLAMP_MIN: float = 0.0
 CRI_CLAMP_MAX: float = 2.0

@@ -10,9 +10,9 @@ hydra:
   searchpath:
     - file://${oc.env:EMBODIED_PATH}/config/
 
-# Evaluate the converted OpenPI CRI weights under ``checkpoints/`` (from JAX
+# Evaluate the converted OpenPI CRI weights under ``checkpoint/`` (from JAX
 # ``49999`` via ``prepare_cri_openpi_ckpt.sh``). No RL ``full_weights.pt``.
-cri_openpi_ckpt: ${oc.env:CRI_OPENPI_CKPT,/workspace/RLinf/checkpoints/pi05_droid_cri_rlinf_49999}
+cri_openpi_ckpt: ${oc.env:CRI_OPENPI_CKPT,${oc.env:REPO_PATH,/workspace/RLinf}/checkpoint/pi05_droid_cri_rlinf_49999}
 
 cluster:
   num_nodes: 1

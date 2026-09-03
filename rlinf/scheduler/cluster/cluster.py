@@ -795,6 +795,10 @@ class Cluster:
                 path_env_merge_mode,
             )
 
+        if Cluster._should_scrub_isaac_ml_archive(cls):
+            merged_env_vars = Cluster._scrub_isaac_ml_archive_env_vars(
+                merged_env_vars
+            )
         if self._runtime_code_sync_strip_roots:
             merged_env_vars = Cluster._strip_sync_roots_from_pythonpath(
                 merged_env_vars,
@@ -1002,6 +1006,22 @@ class Cluster:
             "pyproject.toml and rlinf/__init__.py, or an absolute path to "
             "the rlinf package directory."
         )
+
+    @classmethod
+    def _should_scrub_isaac_ml_archive(cls, worker_cls: type) -> bool:
+        """Actor/rollout must not inherit Isaac Sim's bundled torch."""
+        from rlinf.utils.isaac_pythonpath import should_scrub_isaac_ml_archive
+
+        return should_scrub_isaac_ml_archive(worker_cls)
+
+    @classmethod
+    def _scrub_isaac_ml_archive_env_vars(
+        cls, env_vars: dict[str, str]
+    ) -> dict[str, str]:
+        """Drop ``omni.isaac.ml_archive`` from worker PYTHONPATH."""
+        from rlinf.utils.isaac_pythonpath import scrub_isaac_ml_archive_env
+
+        return scrub_isaac_ml_archive_env(env_vars)
 
     @classmethod
     def _strip_sync_roots_from_pythonpath(

@@ -81,19 +81,30 @@
 
 .. include:: _setup_common.rst
 
+Docker 镜像只提供 venv（``/opt/venv``）。把当前 checkout 绑定到
+``/workspace/RLinf``，这样 AWS 主机、笔记本克隆和容器会共用同一套脚本。
+每台机器复制一次 env 示例后，所有主机都用同一个 ``run_embodiment.sh`` 命令。
+
 **Docker 镜像**
+
+先构建 embodied-isaaclab 镜像一次（Blackwell / ``sm_120`` 主机）。
+若已有 ``rlinf:embodied-isaaclab-blackwell`` 则跳过：
 
 .. code:: bash
 
-   docker run -it --rm --gpus all \
-      --shm-size 32g \
-      --network host \
-      --name rlinf \
-      -v .:/workspace/RLinf \
-      rlinf/rlinf:agentic-rlinf0.3-isaaclab
+   bash docker/build_embodied_isaaclab_blackwell.sh
 
-   # 国内用户可使用：
-   # docker.1ms.run/rlinf/rlinf:agentic-rlinf0.3-isaaclab
+   cp examples/embodiment/scripts/isaaclab_local.env.example \
+      examples/embodiment/scripts/isaaclab_local.env
+   # 在 isaaclab_local.env 中修改 ISAAC_SIM_PATH。
+
+   bash docker/run_embodied_isaaclab_blackwell.sh
+
+这条命令会：
+
+1. 用 ``install.sh embodied --model openpi --env isaaclab``（以及 GR00T）构建 ``rlinf:embodied-isaaclab-blackwell``。
+2. 把当前 checkout 挂到 ``/workspace/RLinf``，把 Isaac Sim 挂到 ``/workspace/isaac_sim``。
+3. 打开登录 shell，并将 ``/opt/venv/openpi`` 加入 ``PATH``。
 
 在镜像中切换到对应的虚拟环境：
 
@@ -105,9 +116,15 @@
    # OpenPI π₀.₅
    # source switch_env openpi
 
+若不用本地构建、改用已发布镜像，在 ``isaaclab_local.env`` 或命令行设置
+``IMAGE_TAG``（``rlinf/rlinf:agentic-rlinf0.3-isaaclab``；国内：
+``docker.1ms.run/rlinf/rlinf:agentic-rlinf0.3-isaaclab``）。
+
 **自定义环境**
 
-为你要运行的模型安装环境：
+在主机上安装同一组 model/env（笔记本或无 Docker 的节点）。
+在 ``isaaclab_local.env`` 里设置 ``RLINF_NO_DOCKER=1``，避免
+``run_embodiment.sh`` 再次进入镜像：
 
 .. code:: bash
 
@@ -121,12 +138,47 @@
    # bash requirements/install.sh embodied --model openpi --env isaaclab
    # source .venv/bin/activate
 
+   cp examples/embodiment/scripts/isaaclab_local.env.example \
+      examples/embodiment/scripts/isaaclab_local.env
+   # 修改 ISAAC_SIM_PATH，并设置 RLINF_NO_DOCKER=1。
+
+机器本地路径
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``examples/embodiment/scripts/isaaclab_local.env`` 已被 gitignore。
+``run_embodiment.sh`` 与 ``docker/run_embodied_isaaclab_blackwell.sh``
+在文件存在时会 source 它。
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 72
+
+   * - 变量
+     - 用途
+   * - ``ISAAC_SIM_PATH`` / ``ISAAC_PATH``
+     - Isaac Sim 5.1.0 目录。只需设置其中一个，加载脚本会同步到另一个名字。
+   * - ``CRI_OPENPI_CKPT``
+     - 转换后的 OpenPI CRI 权重。留空则使用
+       ``checkpoint/pi05_droid_cri_rlinf_49999``（然后是 ``checkpoints/``）。
+       JAX ``49999`` 请用
+       ``bash examples/embodiment/scripts/prepare_cri_openpi_ckpt.sh`` 转换。
+   * - ``IMAGE_TAG``
+     - Docker 包装脚本以及主机再启动时使用的镜像。默认
+       ``rlinf:embodied-isaaclab-blackwell``。
+   * - ``RLINF_NO_DOCKER``
+     - 在本地安装上设为 ``1``，避免 ``run_embodiment.sh`` 再进入 ``IMAGE_TAG``。
+
+方块→盘子 CRI 还需要 TensorRT 10（``libnvinfer.so.10``）。
+``run_embodiment.sh`` 会调用 ``examples/embodiment/scripts/ensure_cri_tensorrt.sh``，
+缺失时安装到 ``.assets/tensorrt``。也可用 ``CRI_EXTRA_LIB_DIRS`` 覆盖。
+
 下载 Isaac Sim
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 下载 Isaac Sim 5.1.0 并初始化其 shell 环境。Docker 镜像不包含 Isaac Sim，
-需单独安装，然后设置 ``ISAAC_PATH``，或把目录放在 ``run_embodiment.sh``
-能找到的位置（``./isaac_sim``、同级 ``isaac_sim``、或 ``/workspace/isaac_sim``）。
+需单独安装，然后在 ``isaaclab_local.env`` 中设置 ``ISAAC_SIM_PATH``，
+或把目录放在脚本能找到的位置（``./isaac_sim``、同级 ``isaac_sim``、
+或 ``/workspace/isaac_sim``）。
 
 .. code-block:: bash
 
@@ -140,6 +192,8 @@
 .. warning::
 
    每次在新终端中启动 IsaacLab 前，都需要运行 ``source ./setup_conda_env.sh``。
+   若通过 ``run_embodiment.sh`` 或 ``docker/run_embodied_isaaclab_blackwell.sh``
+   启动，脚本会替你 source。
 
 下载模型
 ----------------------------------------
@@ -211,14 +265,18 @@
    bash examples/embodiment/run_embodiment.sh isaaclab_franka_stack_cube_ppo_openpi_pi05
 
    # OpenPI π₀.₅（以 pi05_droid_cri_finetune 为起点，DROID 8-D，方块→盘子）
-   # 1) 将 JAX/LoRA 权重转换为 RLinf 可加载的 safetensors：
+   # 1) 若只有 Orbax ``49999`` 树，先转成 RLinf 可加载的 safetensors：
    #    bash examples/embodiment/scripts/prepare_cri_openpi_ckpt.sh
+   #    （写入 checkpoint/pi05_droid_cri_rlinf_49999）
    # 2) EnvWorker 会从 rlinf/envs/isaaclab/tasks/pick_place_cube_plate 注册
    #    Isaac-PickPlace-Cube-Plate-Droid-AbsJointPos-v0（Arena DROID 规格、单布局）。
    #    每个 episode 以 50:50 将 exterior_1 / exterior_2 采样到策略 base 图像，
    #    与 openpi DROID RLDS 训练一致。
    #    在线 CRI(q, qd) 会编成离散 VLM span（droid-cri / 49999）。
-   export CRI_OPENPI_CKPT=/workspace/RLinf/checkpoints/pi05_droid_cri_rlinf_49999
+   # run_embodiment.sh 会从 checkpoint/pi05_droid_cri_rlinf_49999
+   # （或旧的 checkpoints/ 路径）自动导出 CRI_OPENPI_CKPT。
+   # 缺少 TensorRT 10（libnvinfer.so.10）时会装到 .assets/tensorrt；
+   # 也可用 CRI_EXTRA_LIB_DIRS 指定。
    bash examples/embodiment/run_embodiment.sh isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri
 
 这条命令会：

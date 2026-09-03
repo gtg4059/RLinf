@@ -293,6 +293,17 @@ class FSDPModelManager:
         else:
             self._logger.info("[FSDP] Gradient checkpointing is disabled")
 
+        from rlinf.utils.isaac_pythonpath import torch_is_isaac_build
+
+        if torch_is_isaac_build():
+            raise RuntimeError(
+                "Actor imported Isaac Sim's bundled torch "
+                f"({torch.__file__}). That build is not Blackwell-safe and "
+                "causes FSDP/NCCL illegal memory access. "
+                "omni.isaac.ml_archive must not be on PYTHONPATH for "
+                "actor/rollout workers."
+            )
+
         # here record the original trainable parameters' names before FSDP wrapping
         # persist buffers' names are also recorded, which will be used for weight syncing.
         self.param_names_need_sync = collect_param_names_need_sync(module)
@@ -356,6 +367,24 @@ class FSDPModelManager:
         self._strategy.load_checkpoint(
             self.model, self.optimizer, self.lr_scheduler, load_path
         )
+        # DCP restores optimizer param-group lrs. Re-apply YAML so a resume can
+        # continue with a new actor / value learning rate.
+        self._apply_optim_lr_from_cfg()
+
+    def _apply_optim_lr_from_cfg(self) -> None:
+        """Overwrite optimizer param-group lrs from ``cfg.optim`` after resume."""
+        if self.optimizer is None:
+            return
+        optim_cfg = self._cfg.get("optim", None)
+        if optim_cfg is None:
+            return
+        actor_lr = optim_cfg.get("lr", None)
+        value_lr = optim_cfg.get("value_lr", None)
+        groups = self.optimizer.param_groups
+        if actor_lr is not None and groups:
+            groups[0]["lr"] = float(actor_lr)
+        if value_lr is not None and len(groups) > 1:
+            groups[1]["lr"] = float(value_lr)
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         """

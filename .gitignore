@@ -25,7 +25,10 @@ uv.lock
 # Local large OpenPI checkpoints (JAX source + converted RLinf weights)
 /19999/
 /49999/
+/checkpoint/
 /checkpoints/
+# Machine-local IsaacLab paths (copy from isaaclab_local.env.example)
+examples/embodiment/scripts/isaaclab_local.env
 # Isaac Sim / Arena assets bind-mounted into the Docker workspace
 /isaac_sim/
 /.assets/

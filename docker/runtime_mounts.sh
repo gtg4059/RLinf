@@ -25,18 +25,41 @@ rlinf_resolve_isaac_sim() {
   return 1
 }
 
-# Container path for the converted OpenPI CRI checkpoint living in this checkout.
+# Host -> container path for the converted OpenPI CRI checkpoint.
+# Prefers checkpoint/pi05_droid_cri_rlinf_49999, then checkpoints/.
+_RLINF_RUNTIME_MOUNTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_RLINF_RESOLVE_CRI_SCRIPT="$(cd "${_RLINF_RUNTIME_MOUNTS_DIR}/.." && pwd)/examples/embodiment/scripts/resolve_cri_openpi_ckpt.sh"
+
 rlinf_container_cri_ckpt() {
   local repo_root="$1"
-  if [ -n "${CRI_OPENPI_CKPT:-}" ]; then
-    printf '%s\n' "${CRI_OPENPI_CKPT}"
-    return 0
+  if [ -f "${_RLINF_RESOLVE_CRI_SCRIPT}" ]; then
+    # shellcheck disable=SC1090
+    source "${_RLINF_RESOLVE_CRI_SCRIPT}"
   fi
-  if [ -d "${repo_root}/checkpoints/pi05_droid_cri_rlinf_49999" ]; then
-    printf '%s\n' "/workspace/RLinf/checkpoints/pi05_droid_cri_rlinf_49999"
-    return 0
+
+  local host_path=""
+  if [ -n "${CRI_OPENPI_CKPT:-}" ] && [ -d "${CRI_OPENPI_CKPT}" ]; then
+    host_path="${CRI_OPENPI_CKPT}"
+  elif command -v resolve_cri_openpi_ckpt >/dev/null 2>&1; then
+    host_path="$(resolve_cri_openpi_ckpt "${repo_root}")" || host_path=""
   fi
-  return 1
+  if [ -z "${host_path}" ]; then
+    return 1
+  fi
+
+  local repo_abs
+  repo_abs="$(cd "${repo_root}" && pwd)"
+  case "${host_path}" in
+    /workspace/RLinf/*)
+      printf '%s\n' "${host_path}"
+      ;;
+    "${repo_abs}"/*)
+      printf '%s\n' "/workspace/RLinf/${host_path#"${repo_abs}"/}"
+      ;;
+    *)
+      printf '%s\n' "${host_path}"
+      ;;
+  esac
 }
 
 # Prefer a locally built tag, then the published image the live `rlinf` container uses.

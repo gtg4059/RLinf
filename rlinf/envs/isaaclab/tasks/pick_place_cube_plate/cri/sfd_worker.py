@@ -83,10 +83,25 @@ def main() -> int:
             return 0
         if not msg or msg.get("op") == "stop":
             return 0
-        if msg.get("op") != "compute":
-            _send({"error": f"unknown op {msg.get('op')}"})
+        op = msg.get("op")
+        if op not in ("compute", "run_cri_filter"):
+            _send({"error": f"unknown op {op}"})
             continue
         try:
+            if op == "run_cri_filter":
+                result = solver.run_cri_filter(msg["q"], msg["qd"])
+                _send(
+                    {
+                        "cri_pre": np.asarray(result["cri_pre"], dtype=np.float32),
+                        "qd_cmd": np.asarray(result["qd_cmd"], dtype=np.float32),
+                        "delta": np.asarray(result["delta"], dtype=np.float32),
+                        "cri_limit": float(result["cri_limit"]),
+                        "cbf_alpha": float(result["cbf_alpha"]),
+                        "approach_limit": float(result["approach_limit"]),
+                        "enabled": bool(result["enabled"]),
+                    }
+                )
+                continue
             cri = solver.compute(msg["q"], msg["qd"], return_torch=False)
             _send({"cri": np.asarray(cri, dtype=np.float32)})
         except Exception as exc:

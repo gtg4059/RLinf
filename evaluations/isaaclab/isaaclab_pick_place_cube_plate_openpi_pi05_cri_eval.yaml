@@ -11,7 +11,7 @@ hydra:
     - file://${oc.env:EMBODIED_PATH}/config/
 
 # Base OpenPI weights (architecture / norm stats). RL weights override via runner.ckpt_path.
-cri_openpi_ckpt: ${oc.env:CRI_OPENPI_CKPT,/workspace/RLinf/checkpoints/pi05_droid_cri_rlinf}
+cri_openpi_ckpt: ${oc.env:CRI_OPENPI_CKPT,${oc.env:REPO_PATH,/workspace/RLinf}/checkpoint/pi05_droid_cri_rlinf_49999}
 
 cluster:
   num_nodes: 1

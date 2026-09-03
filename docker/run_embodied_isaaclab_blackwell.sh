@@ -14,7 +14,9 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE_TAG="${IMAGE_TAG:-rlinf:embodied-isaaclab-blackwell}"
+# shellcheck disable=SC1091
+source "${REPO_ROOT}/docker/runtime_mounts.sh"
+# Default IMAGE_TAG after sourcing isaaclab_local.env so that file can override.
 CONTAINER_NAME="${CONTAINER_NAME:-rlinf-isaaclab-blackwell}"
 SHM_SIZE="${SHM_SIZE:-32g}"
 WORKDIR="${WORKDIR:-/workspace/RLinf}"
@@ -38,6 +40,12 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+# Optional machine-local ISAAC_* / CRI_OPENPI_CKPT / IMAGE_TAG (after --repo).
+# shellcheck disable=SC1091
+source "${REPO_ROOT}/examples/embodiment/scripts/source_isaaclab_local_env.sh"
+source_isaaclab_local_env "${REPO_ROOT}"
+IMAGE_TAG="${IMAGE_TAG:-rlinf:embodied-isaaclab-blackwell}"
 
 if [ ! -d "$REPO_ROOT/rlinf" ] || [ ! -d "$REPO_ROOT/examples" ]; then
   echo "ERROR: '$REPO_ROOT' does not look like an RLinf checkout (missing rlinf/ or examples/)." >&2
@@ -84,10 +92,18 @@ RUN_CMD=(
   -w "$WORKDIR"
 )
 if [ -n "$ISAAC_SIM_PATH" ]; then
-  RUN_CMD+=(-v "$ISAAC_SIM_PATH":/workspace/isaac_sim:ro)
+  # Kit writes user.config.json, pip3-envs, and shader cache under kit/data + kit/cache.
+  # A read-only bind-mount causes OSError: [Errno 30] Read-only file system.
+  mkdir -p "${ISAAC_SIM_PATH}/kit/data" "${ISAAC_SIM_PATH}/kit/cache"
+  RUN_CMD+=(-v "$ISAAC_SIM_PATH":/workspace/isaac_sim)
   RUN_CMD+=(-e ISAAC_PATH=/workspace/isaac_sim)
   RUN_CMD+=(-e ISAACSIM_PATH=/workspace/isaac_sim)
-  echo "[run_embodied_isaaclab_blackwell] isaac_sim=$ISAAC_SIM_PATH -> /workspace/isaac_sim"
+  echo "[run_embodied_isaaclab_blackwell] isaac_sim=$ISAAC_SIM_PATH -> /workspace/isaac_sim (rw)"
+fi
+CRI_CKPT="$(rlinf_container_cri_ckpt "$REPO_ROOT" || true)"
+if [ -n "$CRI_CKPT" ]; then
+  RUN_CMD+=(-e CRI_OPENPI_CKPT="$CRI_CKPT")
+  echo "[run_embodied_isaaclab_blackwell] CRI_OPENPI_CKPT=$CRI_CKPT"
 fi
 RUN_CMD+=(
   "${EXTRA_DOCKER_ARGS[@]}"
@@ -95,7 +111,8 @@ RUN_CMD+=(
 )
 
 if [ "${#CMD[@]}" -gt 0 ]; then
-  RUN_CMD+=("${CMD[@]}")
+  # Login shell so ~/.bashrc activates /opt/venv/openpi.
+  RUN_CMD+=(bash -lc "$(printf '%q ' "${CMD[@]}")")
 fi
 
 echo "[run_embodied_isaaclab_blackwell] image=$IMAGE_TAG"

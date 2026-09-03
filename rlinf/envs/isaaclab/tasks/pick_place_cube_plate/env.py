@@ -257,7 +257,12 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             init_params.get("gripper_keys", _DEFAULT_GRIPPER_KEYS)
         )
         # Online CRI(q, qd) → discrete VLM tokens (openpi droid-cri / 49999).
+        # CBF-QP filter: policy CRI is cri_pre; command is library qd_cmd (not s).
         self._compute_cri = bool(init_params.get("compute_cri", True))
+        self._cri_filter = bool(init_params.get("cri_filter", True))
+        self._cri_limit = float(init_params.get("cri_limit", 0.96))
+        self._cbf_alpha = float(init_params.get("cbf_alpha", 0.02))
+        self._cri_filter_enabled = bool(init_params.get("cri_filter_enabled", True))
         self._cri_solver = None
         # Match openpi DROID RLDS: sample one exterior view per episode
         # (tf.random.uniform() > 0.5 in droid_rlds_dataset.restructure).
@@ -400,11 +405,19 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             self._cri_solver = CriSolver(
                 batch_size=max(int(self.num_envs), 1),
                 device=self.device,
+                cri_filter=self._cri_filter,
+                cri_limit=self._cri_limit,
+                cbf_alpha=self._cbf_alpha,
+                filter_enabled=self._cri_filter_enabled,
             )
         return self._cri_solver
 
     def _attach_cri(self, env_obs: dict[str, Any]) -> dict[str, Any]:
-        """Compute Safetics CRI from arm q/qd and attach ``env_obs['cri']``."""
+        """Compute Safetics CRI from arm q/qd and attach ``env_obs['cri']``.
+
+        Filter-on uses the current-tick ``cri_pre`` (RLinf wraps after ``step``).
+        ``qd_cmd`` is not injected into the robot command here.
+        """
         if not self._compute_cri:
             return env_obs
         q = env_obs["states"][:, :7]

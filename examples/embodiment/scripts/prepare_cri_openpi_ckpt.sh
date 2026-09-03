@@ -4,17 +4,16 @@
 # Preferred (handles LoRA merge):
 #   bash examples/embodiment/scripts/prepare_cri_openpi_ckpt.sh \
 #     /workspace/RLinf/49999 \
-#     /workspace/RLinf/checkpoints/pi05_droid_cri_rlinf_49999
+#     /workspace/RLinf/checkpoint/pi05_droid_cri_rlinf_49999
 #
 # Then:
-#   export CRI_OPENPI_CKPT=/workspace/RLinf/checkpoints/pi05_droid_cri_rlinf_49999
 #   bash examples/embodiment/run_embodiment.sh isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 SRC_ROOT="${1:-${REPO_ROOT}/49999}"
-OUT_DIR="${2:-${REPO_ROOT}/checkpoints/pi05_droid_cri_rlinf_49999}"
+OUT_DIR="${2:-${REPO_ROOT}/checkpoint/pi05_droid_cri_rlinf_49999}"
 
 if [[ ! -d "${SRC_ROOT}" ]]; then
   echo "ERROR: source checkpoint dir not found: ${SRC_ROOT}" >&2

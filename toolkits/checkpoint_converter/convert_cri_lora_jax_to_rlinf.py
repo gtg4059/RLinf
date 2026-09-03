@@ -25,8 +25,8 @@ Pipeline:
 Example::
 
     python toolkits/checkpoint_converter/convert_cri_lora_jax_to_rlinf.py \\
-        --input-dir /workspace/RLinf/19999 \\
-        --output-dir /workspace/RLinf/checkpoints/pi05_droid_cri_rlinf
+        --input-dir /workspace/RLinf/49999 \\
+        --output-dir /workspace/RLinf/checkpoint/pi05_droid_cri_rlinf_49999
 """
 
 from __future__ import annotations
@@ -289,13 +289,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--input-dir",
         type=Path,
-        default=Path("/workspace/RLinf/19999"),
+        default=Path("/workspace/RLinf/49999"),
         help="JAX checkpoint dir containing params/ and assets/",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/workspace/RLinf/checkpoints/pi05_droid_cri_rlinf"),
+        default=Path("/workspace/RLinf/checkpoint/pi05_droid_cri_rlinf_49999"),
         help="Output directory for RLinf-loadable safetensors",
     )
     parser.add_argument("--action-horizon", type=int, default=15)

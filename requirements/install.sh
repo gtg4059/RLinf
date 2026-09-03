@@ -1692,6 +1692,8 @@ install_openpi_model() {
             # CUDA wheel (default 2.11.0+cu128) then install flash-attn.
             repair_torch_after_isaaclab
             uv pip install numpydantic==1.7.0 pydantic==2.11.7 numpy==1.26.0
+            # Safetics CRI worker needs TensorRT 10 (libnvinfer.so.10), not 11.x.
+            uv pip install "tensorrt-cu13-libs==10.16.1.11"
             ;;
         roboverse)
             create_and_sync_venv

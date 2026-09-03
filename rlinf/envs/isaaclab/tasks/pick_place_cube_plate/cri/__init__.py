@@ -23,30 +23,38 @@ Offline RLDS annotation (DROID → CRI-augmented dataset) lives in
 
 from .compute import compute_cri
 from .constants import (
+    CBF_ALPHA,
     CRI_CLAMP_MAX,
     CRI_CLAMP_MIN,
+    CRI_FILTER_LIMIT,
     DEFAULT_NUM_JOINTS,
     DEFAULT_ZERO_VEL_EPS,
     DROID_CONTROL_DT,
+    NUM_CRI_OBS_DIM,
     NUM_CRI_POINTS,
     PACKAGE_DIR,
 )
+from .filter import compute_episode_cri_f
 from .postprocess import apply_cri_zero_vel_filter, clamp_cri
 from .solver import CriSolver, resolve_analysis_dir
 from .velocity import joint_velocity_from_positions
 
 __all__ = [
+    "CBF_ALPHA",
     "CRI_CLAMP_MAX",
     "CRI_CLAMP_MIN",
+    "CRI_FILTER_LIMIT",
     "DEFAULT_NUM_JOINTS",
     "DEFAULT_ZERO_VEL_EPS",
     "DROID_CONTROL_DT",
+    "NUM_CRI_OBS_DIM",
     "NUM_CRI_POINTS",
     "PACKAGE_DIR",
     "CriSolver",
     "apply_cri_zero_vel_filter",
     "clamp_cri",
     "compute_cri",
+    "compute_episode_cri_f",
     "joint_velocity_from_positions",
     "resolve_analysis_dir",
 ]

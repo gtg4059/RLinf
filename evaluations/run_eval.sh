@@ -227,6 +227,28 @@ elif [ "${BENCHMARK}" = "isaaclab" ]; then
     # shellcheck disable=SC1091
     source "${REPO_PATH}/examples/embodiment/scripts/setup_arena_assets.sh"
     setup_arena_assets
+    # Converted OpenPI CRI weights for cube pick-place (checkpoint/ then checkpoints/).
+    # shellcheck disable=SC1091
+    source "${REPO_PATH}/examples/embodiment/scripts/resolve_cri_openpi_ckpt.sh"
+    if export_cri_openpi_ckpt "${REPO_PATH}"; then
+        echo "Using CRI_OPENPI_CKPT=${CRI_OPENPI_CKPT}"
+    elif [[ "${CONFIG_NAME}" == *pick_place_cube_plate*cri* ]]; then
+        echo "ERROR: converted OpenPI CRI checkpoint not found." >&2
+        echo "Expected: ${REPO_PATH}/checkpoint/pi05_droid_cri_rlinf_49999" >&2
+        echo "Or set CRI_OPENPI_CKPT=/path/to/pi05_droid_cri_rlinf_49999" >&2
+        exit 1
+    fi
+    if [[ "${CONFIG_NAME}" == *pick_place_cube_plate*cri* ]]; then
+        # shellcheck disable=SC1091
+        source "${REPO_PATH}/examples/embodiment/scripts/ensure_cri_tensorrt.sh"
+        if export_cri_tensorrt "${REPO_PATH}"; then
+            echo "Using CRI_EXTRA_LIB_DIRS=${CRI_EXTRA_LIB_DIRS}"
+        else
+            echo "ERROR: TensorRT 10 (libnvinfer.so.10) is required for online CRI." >&2
+            echo "Install tensorrt-cu13-libs==10.16.1.11 or set CRI_EXTRA_LIB_DIRS." >&2
+            exit 1
+        fi
+    fi
     echo "Using benchmark=${BENCHMARK}, config=${CONFIG_NAME}, ROBOT_PLATFORM=${ROBOT_PLATFORM}"
 else
     echo "Using benchmark=${BENCHMARK}, config=${CONFIG_NAME}"

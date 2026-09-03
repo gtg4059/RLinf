@@ -82,19 +82,31 @@ Installation
 
 .. include:: _setup_common.rst
 
+The Docker image ships venvs only (``/opt/venv``). Bind-mount this checkout to
+``/workspace/RLinf`` so an AWS host, a laptop clone, and the container share the
+same scripts. Copy the env example once per machine, then use the same
+``run_embodiment.sh`` command on every host.
+
 **Docker image**
+
+Build the embodied-isaaclab image once (Blackwell / ``sm_120`` hosts). Skip this
+if ``rlinf:embodied-isaaclab-blackwell`` is already present:
 
 .. code:: bash
 
-   docker run -it --rm --gpus all \
-      --shm-size 32g \
-      --network host \
-      --name rlinf \
-      -v .:/workspace/RLinf \
-      rlinf/rlinf:agentic-rlinf0.3-isaaclab
+   bash docker/build_embodied_isaaclab_blackwell.sh
 
-   # For mainland China users:
-   # docker.1ms.run/rlinf/rlinf:agentic-rlinf0.3-isaaclab
+   cp examples/embodiment/scripts/isaaclab_local.env.example \
+      examples/embodiment/scripts/isaaclab_local.env
+   # Edit ISAAC_SIM_PATH in isaaclab_local.env.
+
+   bash docker/run_embodied_isaaclab_blackwell.sh
+
+What this does:
+
+1. Builds ``rlinf:embodied-isaaclab-blackwell`` with ``install.sh embodied --model openpi --env isaaclab`` (and GR00T).
+2. Mounts this checkout at ``/workspace/RLinf`` and Isaac Sim at ``/workspace/isaac_sim``.
+3. Opens a login shell with ``/opt/venv/openpi`` on ``PATH``.
 
 Switch to the matching virtual environment inside the image:
 
@@ -106,9 +118,16 @@ Switch to the matching virtual environment inside the image:
    # OpenPI π₀.₅
    # source switch_env openpi
 
+To use a published image instead of a local build, set ``IMAGE_TAG`` in
+``isaaclab_local.env`` or on the command line
+(``rlinf/rlinf:agentic-rlinf0.3-isaaclab``; mainland China:
+``docker.1ms.run/rlinf/rlinf:agentic-rlinf0.3-isaaclab``).
+
 **Custom environment**
 
-Install the environment for the model you want to run:
+Install the same model/env combo on the host (laptop or a node without Docker).
+Set ``RLINF_NO_DOCKER=1`` in ``isaaclab_local.env`` so ``run_embodiment.sh``
+does not re-enter the image:
 
 .. code:: bash
 
@@ -122,13 +141,50 @@ Install the environment for the model you want to run:
    # bash requirements/install.sh embodied --model openpi --env isaaclab
    # source .venv/bin/activate
 
+   cp examples/embodiment/scripts/isaaclab_local.env.example \
+      examples/embodiment/scripts/isaaclab_local.env
+   # Edit ISAAC_SIM_PATH and set RLINF_NO_DOCKER=1.
+
+Machine-local paths
+~~~~~~~~~~~~~~~~~~~
+
+``examples/embodiment/scripts/isaaclab_local.env`` is gitignored. Both
+``run_embodiment.sh`` and ``docker/run_embodied_isaaclab_blackwell.sh`` source it
+when it exists.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 28 72
+
+   * - Variable
+     - Purpose
+   * - ``ISAAC_SIM_PATH`` / ``ISAAC_PATH``
+     - Isaac Sim 5.1.0 tree. Set one; the loader copies it onto the other name.
+   * - ``CRI_OPENPI_CKPT``
+     - Converted OpenPI CRI weights. Leave unset to use
+       ``checkpoint/pi05_droid_cri_rlinf_49999`` (then ``checkpoints/``).
+       Convert JAX ``49999`` with
+       ``bash examples/embodiment/scripts/prepare_cri_openpi_ckpt.sh``.
+   * - ``IMAGE_TAG``
+     - Docker image for the wrapper and for host re-launch. Default
+       ``rlinf:embodied-isaaclab-blackwell``.
+   * - ``RLINF_NO_DOCKER``
+     - Set ``1`` on a native install so ``run_embodiment.sh`` does not
+       re-launch into ``IMAGE_TAG``.
+
+Cube→plate CRI also needs TensorRT 10 (``libnvinfer.so.10``).
+``run_embodiment.sh`` calls ``examples/embodiment/scripts/ensure_cri_tensorrt.sh``
+and installs into ``.assets/tensorrt`` when missing. Override with
+``CRI_EXTRA_LIB_DIRS``.
+
 Download Isaac Sim
 ~~~~~~~~~~~~~~~~~~
 
 Download Isaac Sim 5.1.0 and initialize its shell environment. The Docker
-image does not ship Isaac Sim; install it separately, then set ``ISAAC_PATH``
-or place the tree where ``run_embodiment.sh`` can find it
-(``./isaac_sim``, a sibling ``isaac_sim``, or ``/workspace/isaac_sim``).
+image does not ship Isaac Sim; install it separately, then set
+``ISAAC_SIM_PATH`` in ``isaaclab_local.env`` or place the tree where the
+scripts can find it (``./isaac_sim``, a sibling ``isaac_sim``, or
+``/workspace/isaac_sim``).
 
 .. code-block:: bash
 
@@ -141,7 +197,9 @@ or place the tree where ``run_embodiment.sh`` can find it
 
 .. warning::
 
-   Run ``source ./setup_conda_env.sh`` in every new terminal before launching IsaacLab.
+   Run ``source ./setup_conda_env.sh`` in every new terminal before launching IsaacLab
+   unless you start through ``run_embodiment.sh`` or
+   ``docker/run_embodied_isaaclab_blackwell.sh`` (both source it for you).
 
 Download the Model
 ------------------
@@ -213,14 +271,18 @@ Pick one config and launch training:
    bash examples/embodiment/run_embodiment.sh isaaclab_franka_stack_cube_ppo_openpi_pi05
 
    # OpenPI π₀.₅ from pi05_droid_cri_finetune (DROID 8-D, cube→plate)
-   # 1) Convert JAX/LoRA weights to RLinf-loadable safetensors:
+   # 1) Convert JAX/LoRA weights if you only have the Orbax ``49999`` tree:
    #    bash examples/embodiment/scripts/prepare_cri_openpi_ckpt.sh
+   #    (writes checkpoint/pi05_droid_cri_rlinf_49999)
    # 2) EnvWorker registers Isaac-PickPlace-Cube-Plate-Droid-AbsJointPos-v0 from
    #    rlinf/envs/isaaclab/tasks/pick_place_cube_plate (Arena DROID specs, single layout).
    #    Each episode samples exterior_1 vs exterior_2 50:50 into the policy base
    #    image, matching openpi DROID RLDS training.
    #    Online CRI(q, qd) is tokenized as a discrete VLM span (droid-cri / 49999).
-   export CRI_OPENPI_CKPT=/workspace/RLinf/checkpoints/pi05_droid_cri_rlinf_49999
+   # run_embodiment.sh auto-exports CRI_OPENPI_CKPT from
+   # checkpoint/pi05_droid_cri_rlinf_49999 (or the older checkpoints/ path).
+   # It also installs TensorRT 10 (libnvinfer.so.10) into .assets/tensorrt
+   # when missing; override with CRI_EXTRA_LIB_DIRS.
    bash examples/embodiment/run_embodiment.sh isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri
 
 What this does:
