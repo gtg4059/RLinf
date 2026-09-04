@@ -44,6 +44,11 @@ from isaaclab.sensors import CameraCfg, TiledCameraCfg
 from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg, UsdFileCfg
 from isaaclab.utils import configclass
 
+from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.constants import (
+    ISAACLAB_DECIMATION,
+    ISAACLAB_SIM_DT,
+)
+
 from . import mdp
 
 # Repo root: rlinf/envs/isaaclab/tasks/pick_place_cube_plate/env_cfg.py → parents[5]
@@ -467,9 +472,10 @@ class PickPlaceCubePlateEnvCfg(ManagerBasedRLEnvCfg):
     curriculum = None
 
     def __post_init__(self):
-        self.decimation = 4
-        self.episode_length_s = 20.0
-        self.sim.dt = 1.0 / 200.0
+        # OpenPI DROID is 15 Hz (action_horizon=15 → 1 s). decimation 4 (IsaacLab default).
+        self.decimation = ISAACLAB_DECIMATION
+        self.episode_length_s = 30.0  # 450 env steps at 15 Hz
+        self.sim.dt = ISAACLAB_SIM_DT
         self.sim.render_interval = self.decimation
         # Arena pick_and_place_maple_table env_cfg_callback viewer.
         self.viewer.eye = (1.5, 0.0, 1.0)

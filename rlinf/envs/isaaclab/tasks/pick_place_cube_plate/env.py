@@ -267,7 +267,11 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._cri_penalty_limit = float(init_params.get("cri_penalty_limit", 0.96))
         self._cri_penalty_sigma = float(init_params.get("cri_penalty_sigma", 20.0))
         self._cri_ovf_threshold = float(init_params.get("cri_ovf_threshold", 2.0))
-        self._cri_step_dt = float(init_params.get("cri_step_dt", 0.02))
+        from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.constants import (
+            DROID_CONTROL_DT,
+        )
+
+        self._cri_step_dt = float(init_params.get("cri_step_dt", DROID_CONTROL_DT))
         self._cri_solver = None
         self._cri_obs_cache = None
         self._last_q = None
@@ -306,6 +310,8 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         wrist_cam = getattr(self.cfg.init_params, "wrist_cam", None)
         eval_cam = getattr(self.cfg.init_params, "eval_cam", None)
         episode_length_s = getattr(self.cfg.init_params, "episode_length_s", None)
+        sim_dt = getattr(self.cfg.init_params, "sim_dt", None)
+        decimation = getattr(self.cfg.init_params, "decimation", None)
 
         def make_env_isaaclab():
             import os
@@ -340,6 +346,11 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
 
             if episode_length_s is not None:
                 isaac_env_cfg.episode_length_s = float(episode_length_s)
+            if sim_dt is not None:
+                isaac_env_cfg.sim.dt = float(sim_dt)
+            if decimation is not None:
+                isaac_env_cfg.decimation = int(decimation)
+                isaac_env_cfg.sim.render_interval = isaac_env_cfg.decimation
             if table_cam is not None:
                 h = int(table_cam.height)
                 w = int(table_cam.width)

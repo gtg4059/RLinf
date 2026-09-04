@@ -39,8 +39,14 @@ CRI_OVF_SIGMA: float = 20.0
 CRI_OVF_THRESHOLD: float = 2.0
 CRI_PENALTY_WEIGHT: float = -0.02
 
-# cube-plate ManagerBasedRLEnv: decimation 4 * sim.dt 1/200.
-ISAACLAB_STEP_DT: float = 0.02
+# DROID teleop / OpenPI π₀.₅ control rate (examples/droid/main.py, action_horizon=15).
+DROID_CONTROL_FREQUENCY_HZ: float = 15.0
+DROID_CONTROL_DT: float = 1.0 / DROID_CONTROL_FREQUENCY_HZ
+
+# cube-plate ManagerBasedRLEnv: IsaacLab-standard decimation 4, control 15 Hz (OpenPI).
+ISAACLAB_DECIMATION: int = 4
+ISAACLAB_SIM_DT: float = DROID_CONTROL_DT / ISAACLAB_DECIMATION
+ISAACLAB_STEP_DT: float = ISAACLAB_SIM_DT * ISAACLAB_DECIMATION
 
 # IsaacLab articulation_data._store_cri_output_buffers
 CRI_CLAMP_MIN: float = 0.0
@@ -51,7 +57,3 @@ DEFAULT_ZERO_VEL_EPS: float = float(os.environ.get("SFD_CRI_ZERO_VEL_EPS", "1e-6
 
 # Franka Panda arm DOF used by DROID + bundled Panda ST_AnalysisInfo.json.
 DEFAULT_NUM_JOINTS: int = 7
-
-# DROID teleop / control rate (examples/droid/main.py).
-DROID_CONTROL_FREQUENCY_HZ: float = 15.0
-DROID_CONTROL_DT: float = 1.0 / DROID_CONTROL_FREQUENCY_HZ

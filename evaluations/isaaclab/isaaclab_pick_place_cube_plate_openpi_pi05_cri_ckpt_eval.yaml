@@ -61,7 +61,7 @@ env:
     video_cfg:
       save_video: True
       info_on_video: True
-      fps: 20
+      fps: 15
       max_envs_in_video: 1
       # DROID RLDS: exterior_1 + exterior_2 + wrist.
       video_image_keys:

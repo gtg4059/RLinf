@@ -273,6 +273,7 @@ Docker 镜像只提供 venv（``/opt/venv``）。把当前 checkout 绑定到
    #    Isaac-PickPlace-Cube-Plate-Droid-AbsJointPos-v0（Arena DROID 规格、单布局）。
    #    每个 episode 以 50:50 将 exterior_1 / exterior_2 采样到策略 base 图像，
    #    与 openpi DROID RLDS 训练一致。
+   #    控制频率为 15 Hz（OpenPI DROID / action_horizon=15），不是 IsaacLab 默认 50 Hz。
    #    在线 CRI(q, qd) 会编成离散 VLM span（droid-cri / 49999）。
    # 专用启动脚本会进入本机 embodied-isaaclab 镜像
    # （先 rlinf:embodied-isaaclab-u24，再 rlinf:embodied-isaaclab-blackwell），

@@ -279,6 +279,7 @@ Pick one config and launch training:
    #    rlinf/envs/isaaclab/tasks/pick_place_cube_plate (Arena DROID specs, single layout).
    #    Each episode samples exterior_1 vs exterior_2 50:50 into the policy base
    #    image, matching openpi DROID RLDS training.
+   #    Control rate is 15 Hz (OpenPI DROID / action_horizon=15), not IsaacLab 50 Hz.
    #    Online CRI(q, qd) is tokenized as a discrete VLM span (droid-cri / 49999).
    # The dedicated launcher enters the local embodied-isaaclab image
    # (rlinf:embodied-isaaclab-u24, then rlinf:embodied-isaaclab-blackwell)
