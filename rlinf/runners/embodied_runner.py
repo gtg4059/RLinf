@@ -28,7 +28,10 @@ from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.logging import get_logger
 from rlinf.utils.metric_logger import MetricLogger
 from rlinf.utils.metric_utils import compute_evaluate_metrics, print_metrics_table
-from rlinf.utils.runner_utils import check_progress
+from rlinf.utils.runner_utils import (
+    check_progress,
+    should_eval_at_start,
+)
 from rlinf.utils.timers import Timer
 
 logger = logging.getLogger(__name__)
@@ -305,6 +308,20 @@ class EmbodiedRunner:
         training_metrics = [result.get("training_metrics", {}) for result in results]
         return rollout_metrics, training_metrics
 
+    def _maybe_eval_at_start(self) -> dict:
+        """Evaluate (and record videos) at global step 0 before the first update."""
+        if not should_eval_at_start(self.cfg, self.global_step):
+            return {}
+        self.logger.info("Evaluating the initial policy at step 0.")
+        self.actor.set_global_step(self.global_step)
+        self.rollout.set_global_step(self.global_step)
+        self.env.set_global_step(self.global_step).wait()
+        self.update_rollout_weights()
+        eval_metrics = self.evaluate()
+        eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
+        self.metric_logger.log(data=eval_metrics, step=self.global_step)
+        return eval_metrics
+
     def _maybe_eval_and_checkpoint(self, step: int) -> dict:
         run_val, save_model, _ = check_progress(
             self.global_step,
@@ -318,6 +335,7 @@ class EmbodiedRunner:
         eval_metrics = {}
         if run_val:
             with self.timer("eval"):
+                self.env.set_global_step(self.global_step).wait()
                 self.update_rollout_weights()
                 eval_metrics = self.evaluate()
                 eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
@@ -481,10 +499,12 @@ class EmbodiedRunner:
 
         start_step = self.global_step
         start_time = time.time()
+        self._maybe_eval_at_start()
         for _step in range(start_step, self.max_steps):
             # set global step
             self.actor.set_global_step(self.global_step)
             self.rollout.set_global_step(self.global_step)
+            self.env.set_global_step(self.global_step)
 
             profiled_step = (
                 self.global_step
@@ -565,10 +585,12 @@ class EmbodiedRunner:
     def run_pipeline(self):
         start_step = self.global_step
         start_time = time.time()
+        self._maybe_eval_at_start()
         for _step in range(start_step, self.max_steps):
             # set global step
             self.actor.set_global_step(self.global_step)
             self.rollout.set_global_step(self.global_step)
+            self.env.set_global_step(self.global_step)
 
             profiled_step = (
                 self.global_step

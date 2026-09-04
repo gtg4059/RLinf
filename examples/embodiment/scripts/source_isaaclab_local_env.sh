@@ -19,10 +19,15 @@ source_isaaclab_local_env() {
     source "${env_file}"
     set +a
   fi
-  if [ -n "${ISAAC_SIM_PATH:-}" ] && [ -z "${ISAAC_PATH:-}" ]; then
+  # Only alias a path that is actually an Isaac Sim tree. A host path from
+  # isaaclab_local.env is often invisible inside Docker; leave it unset so
+  # run_embodiment.sh can probe /workspace/RLinf or /workspace/isaac_sim.
+  if [ -n "${ISAAC_SIM_PATH:-}" ] && [ -z "${ISAAC_PATH:-}" ] \
+      && [ -f "${ISAAC_SIM_PATH}/setup_conda_env.sh" ]; then
     export ISAAC_PATH="${ISAAC_SIM_PATH}"
   fi
-  if [ -n "${ISAAC_PATH:-}" ] && [ -z "${ISAAC_SIM_PATH:-}" ]; then
+  if [ -n "${ISAAC_PATH:-}" ] && [ -z "${ISAAC_SIM_PATH:-}" ] \
+      && [ -f "${ISAAC_PATH}/setup_conda_env.sh" ]; then
     export ISAAC_SIM_PATH="${ISAAC_PATH}"
   fi
 }

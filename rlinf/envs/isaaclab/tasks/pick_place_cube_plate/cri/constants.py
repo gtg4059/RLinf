@@ -34,6 +34,14 @@ NUM_CRI_OBS_DIM: int = NUM_CRI_POINTS
 CRI_FILTER_LIMIT: float = 0.96
 CBF_ALPHA: float = 0.02
 
+# IsaacLab CRI_OVF_exp (reach mdp.rewards) + cube-plate sparse-success scale.
+CRI_OVF_SIGMA: float = 20.0
+CRI_OVF_THRESHOLD: float = 2.0
+CRI_PENALTY_WEIGHT: float = -0.02
+
+# cube-plate ManagerBasedRLEnv: decimation 4 * sim.dt 1/200.
+ISAACLAB_STEP_DT: float = 0.02
+
 # IsaacLab articulation_data._store_cri_output_buffers
 CRI_CLAMP_MIN: float = 0.0
 CRI_CLAMP_MAX: float = 2.0

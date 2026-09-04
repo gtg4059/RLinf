@@ -9,7 +9,8 @@
 #   bash docker/run_embodied_isaaclab_blackwell.sh
 #   bash docker/run_embodied_isaaclab_blackwell.sh --name rlinf-bw
 #   bash docker/run_embodied_isaaclab_blackwell.sh -- python examples/embodiment/train_embodied_agent.py --help
-#   IMAGE_TAG=rlinf:embodied-isaaclab-blackwell bash docker/run_embodied_isaaclab_blackwell.sh
+#   IMAGE_TAG=rlinf:embodied-isaaclab-u24 bash docker/run_embodied_isaaclab_blackwell.sh
+#   bash examples/embodiment/scripts/train_cri_openpi_ckpt.sh
 
 set -euo pipefail
 
@@ -45,7 +46,8 @@ done
 # shellcheck disable=SC1091
 source "${REPO_ROOT}/examples/embodiment/scripts/source_isaaclab_local_env.sh"
 source_isaaclab_local_env "${REPO_ROOT}"
-IMAGE_TAG="${IMAGE_TAG:-rlinf:embodied-isaaclab-blackwell}"
+# Prefer the locally built u24 tag, then the older blackwell name.
+IMAGE_TAG="${IMAGE_TAG:-$(rlinf_resolve_isaaclab_image)}"
 
 if [ ! -d "$REPO_ROOT/rlinf" ] || [ ! -d "$REPO_ROOT/examples" ]; then
   echo "ERROR: '$REPO_ROOT' does not look like an RLinf checkout (missing rlinf/ or examples/)." >&2
@@ -54,7 +56,8 @@ fi
 
 if ! docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
   echo "ERROR: image '$IMAGE_TAG' not found. Build it first:" >&2
-  echo "  bash docker/build_embodied_isaaclab_blackwell.sh" >&2
+  echo "  bash docker/build_embodied_isaaclab_u24.sh" >&2
+  echo "  # Ubuntu 22.04: bash docker/build_embodied_isaaclab_blackwell.sh" >&2
   exit 1
 fi
 
@@ -68,37 +71,36 @@ if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
   docker rm "$CONTAINER_NAME" >/dev/null
 fi
 
-# Optional: mount a local Isaac Sim 5.1.0 tree and expose it to Isaac Lab.
-ISAAC_SIM_PATH="${ISAAC_SIM_PATH:-}"
-if [ -z "$ISAAC_SIM_PATH" ]; then
-  for candidate in \
-      "${REPO_ROOT}/../isaac_sim" \
-      "${REPO_ROOT}/isaac_sim" \
-      "/workspace/isaac_sim"; do
-    if [ -f "${candidate}/VERSION" ] && [ -f "${candidate}/setup_conda_env.sh" ]; then
-      ISAAC_SIM_PATH="$(cd "$candidate" && pwd)"
-      break
-    fi
-  done
-fi
+# Optional: expose a local Isaac Sim 5.1.0 tree to Isaac Lab.
+ISAAC_SIM_PATH="$(rlinf_resolve_isaac_sim "$REPO_ROOT" || true)"
 
 RUN_CMD=(
   docker run -it --rm
-  --gpus all
-  --shm-size "$SHM_SIZE"
-  --network host
-  --name "$CONTAINER_NAME"
-  -v "$REPO_ROOT":/workspace/RLinf
-  -w "$WORKDIR"
+    --gpus all
+    --shm-size "$SHM_SIZE"
+    --network host
+    --name "$CONTAINER_NAME"
+    -v "$REPO_ROOT":/workspace/RLinf
+    -w "$WORKDIR"
+    -e ISAAC_LAB_PATH=/opt/envs/isaaclab
 )
 if [ -n "$ISAAC_SIM_PATH" ]; then
-  # Kit writes user.config.json, pip3-envs, and shader cache under kit/data + kit/cache.
-  # A read-only bind-mount causes OSError: [Errno 30] Read-only file system.
-  mkdir -p "${ISAAC_SIM_PATH}/kit/data" "${ISAAC_SIM_PATH}/kit/cache"
-  RUN_CMD+=(-v "$ISAAC_SIM_PATH":/workspace/isaac_sim)
-  RUN_CMD+=(-e ISAAC_PATH=/workspace/isaac_sim)
-  RUN_CMD+=(-e ISAACSIM_PATH=/workspace/isaac_sim)
-  echo "[run_embodied_isaaclab_blackwell] isaac_sim=$ISAAC_SIM_PATH -> /workspace/isaac_sim (rw)"
+  ISAAC_SIM_ABS="$(cd "$ISAAC_SIM_PATH" && pwd -P)"
+  REPO_ABS="$(cd "$REPO_ROOT" && pwd -P)"
+  if [ "$ISAAC_SIM_ABS" = "$REPO_ABS" ]; then
+    # Sim was extracted into this checkout; the repo mount is enough.
+    RUN_CMD+=(-e ISAAC_PATH=/workspace/RLinf)
+    RUN_CMD+=(-e ISAACSIM_PATH=/workspace/RLinf)
+    echo "[run_embodied_isaaclab_blackwell] isaac_sim=$ISAAC_SIM_PATH -> ISAAC_PATH=/workspace/RLinf"
+  else
+    # Kit writes user.config.json, pip3-envs, and shader cache under kit/data + kit/cache.
+    # A read-only bind-mount causes OSError: [Errno 30] Read-only file system.
+    mkdir -p "${ISAAC_SIM_PATH}/kit/data" "${ISAAC_SIM_PATH}/kit/cache"
+    RUN_CMD+=(-v "$ISAAC_SIM_PATH":/workspace/isaac_sim)
+    RUN_CMD+=(-e ISAAC_PATH=/workspace/isaac_sim)
+    RUN_CMD+=(-e ISAACSIM_PATH=/workspace/isaac_sim)
+    echo "[run_embodied_isaaclab_blackwell] isaac_sim=$ISAAC_SIM_PATH -> /workspace/isaac_sim (rw)"
+  fi
 fi
 CRI_CKPT="$(rlinf_container_cri_ckpt "$REPO_ROOT" || true)"
 if [ -n "$CRI_CKPT" ]; then

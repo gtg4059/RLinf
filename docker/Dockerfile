@@ -98,10 +98,13 @@ RUN if [ "$NO_MIRROR" != "1" ]; then \
             sed -i 's@//.*archive.ubuntu.com@//mirrors.ustc.edu.cn@g' /etc/apt/sources.list; \
         fi; \
     fi
+# Ubuntu 22.04 has runit-systemd; 24.04 replaced it with runit-run.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git vim libibverbs-dev openssh-server sudo runit runit-systemd tmux \
+    git vim libibverbs-dev openssh-server sudo runit tmux \
     build-essential python3-dev cmake pkg-config iproute2 pciutils python3 python3-pip \
-    wget unzip curl
+    wget unzip curl \
+    && (apt-get install -y --no-install-recommends runit-systemd \
+        || apt-get install -y --no-install-recommends runit-run)
 
 
 ##################################################################################################
@@ -117,8 +120,10 @@ ENV INSTALL_MIRROR_OPTION=${INSTALL_MIRROR_OPTION:-"--use-mirror"}
 ENV HF_ENDPOINT=${NO_MIRROR:+"https://huggingface.co"}
 ENV HF_ENDPOINT=${HF_ENDPOINT:-"https://hf-mirror.com"}
 
+# Ubuntu 24.04: PEP 668 + Debian pip has no RECORD, so --upgrade pip cannot uninstall it.
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
 RUN pip config set global.index-url ${PIP_INDEX}
-RUN python3 -m pip install -i ${PIP_INDEX} --upgrade pip setuptools wheel uv
+RUN python3 -m pip install -i ${PIP_INDEX} --upgrade --ignore-installed setuptools wheel uv
 
 ENV HF_HOME=/opt/.cache/huggingface
 RUN mkdir -p $HF_HOME

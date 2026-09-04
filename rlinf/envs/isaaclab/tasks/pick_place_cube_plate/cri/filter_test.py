@@ -27,6 +27,16 @@ def test_command_delta_norm():
     np.testing.assert_allclose(d, [5.0], atol=1e-6)
 
 
+def test_abs_joint_to_qd_nom():
+    from .filter import abs_joint_to_qd_nom
+
+    q = np.array([[0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+    q_tgt = np.array([[0.02, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=np.float32)
+    qd = abs_joint_to_qd_nom(q_tgt, q, dt=0.02)
+    np.testing.assert_allclose(qd[0, 0], 1.0, atol=1e-6)
+    np.testing.assert_allclose(qd[0, 1:], 0.0, atol=1e-6)
+
+
 def test_shift_first_step_zero():
     cri = np.arange(3 * NUM_CRI_POINTS, dtype=np.float32).reshape(3, NUM_CRI_POINTS) + 1.0
     extra = np.array([[0.5], [0.6], [0.7]], dtype=np.float32)

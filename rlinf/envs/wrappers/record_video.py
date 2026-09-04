@@ -68,7 +68,10 @@ class RecordVideo(gym.Wrapper):
             ``camera_image_keys`` (obs keys to dump as stills; default
             ``main_images``, ``wrist_images``),
             ``record_env_ids`` (optional list of env indices to include),
-            ``max_envs_in_video`` (optional cap; takes first N envs when set).
+            ``max_envs_in_video`` (optional cap; takes first N envs when set),
+            ``max_videos`` (optional cap on flushed MP4s; after this many
+            writes, later rollouts are not recorded — use for early-train
+            clips without dumping every epoch).
         fps: Explicit FPS override. If ``None``, FPS is resolved from
             ``video_cfg.fps``, environment config/metadata, then fallback ``30``.
     """
@@ -105,6 +108,8 @@ class RecordVideo(gym.Wrapper):
         else:
             self._video_image_keys = [str(k) for k in list(video_keys)]
         self._record_env_ids = self._resolve_record_env_ids()
+        raw_max_videos = self._cfg_get("max_videos", None)
+        self._max_videos = None if raw_max_videos is None else max(int(raw_max_videos), 0)
         self._save_camera_stills = bool(self._cfg_get("save_camera_stills", False))
         camera_keys = self._cfg_get("camera_image_keys", None)
         if camera_keys is None:
@@ -136,6 +141,12 @@ class RecordVideo(gym.Wrapper):
             n = max(int(max_envs), 0)
             return list(range(n))
         return None
+
+    def _recording_active(self) -> bool:
+        """Return True until ``max_videos`` flushed clips have been written."""
+        if self._max_videos is None:
+            return True
+        return self.video_cnt < self._max_videos
 
     def _filter_env_images(self, images: list[np.ndarray]) -> list[np.ndarray]:
         """Keep only the configured env subset for video frames."""
@@ -415,8 +426,9 @@ class RecordVideo(gym.Wrapper):
                         value = value.item()
                     elif value.size == 1:
                         value = value.reshape(-1)[0].item()
-                elif isinstance(value, numbers.Number):
-                    pass
+                elif isinstance(value, (numbers.Number, np.generic)):
+                    if isinstance(value, np.generic):
+                        value = value.item()
                 else:
                     warnings.warn(f"Unsupported value type {type(value)} for key {key}")
                     continue
@@ -515,6 +527,8 @@ class RecordVideo(gym.Wrapper):
         terminations: Optional[Any] = None,
     ):
         """Extract frames from obs and append to the buffer."""
+        if not self._recording_active():
+            return
         self._capture_camera_stills(obs)
         frames = self._extract_frame_batches(obs)
         if not frames:

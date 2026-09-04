@@ -166,7 +166,8 @@ when it exists.
        Convert JAX ``49999`` with
        ``bash examples/embodiment/scripts/prepare_cri_openpi_ckpt.sh``.
    * - ``IMAGE_TAG``
-     - Docker image for the wrapper and for host re-launch. Default
+     - Docker image for the wrapper and for host re-launch. Leave unset
+       to auto-pick ``rlinf:embodied-isaaclab-u24``, then
        ``rlinf:embodied-isaaclab-blackwell``.
    * - ``RLINF_NO_DOCKER``
      - Set ``1`` on a native install so ``run_embodiment.sh`` does not
@@ -183,8 +184,8 @@ Download Isaac Sim
 Download Isaac Sim 5.1.0 and initialize its shell environment. The Docker
 image does not ship Isaac Sim; install it separately, then set
 ``ISAAC_SIM_PATH`` in ``isaaclab_local.env`` or place the tree where the
-scripts can find it (``./isaac_sim``, a sibling ``isaac_sim``, or
-``/workspace/isaac_sim``).
+scripts can find it (``./isaac_sim``, this checkout if Sim was extracted
+into it, a sibling ``isaac_sim``, or ``/workspace/isaac_sim``).
 
 .. code-block:: bash
 
@@ -279,11 +280,14 @@ Pick one config and launch training:
    #    Each episode samples exterior_1 vs exterior_2 50:50 into the policy base
    #    image, matching openpi DROID RLDS training.
    #    Online CRI(q, qd) is tokenized as a discrete VLM span (droid-cri / 49999).
-   # run_embodiment.sh auto-exports CRI_OPENPI_CKPT from
-   # checkpoint/pi05_droid_cri_rlinf_49999 (or the older checkpoints/ path).
-   # It also installs TensorRT 10 (libnvinfer.so.10) into .assets/tensorrt
-   # when missing; override with CRI_EXTRA_LIB_DIRS.
-   bash examples/embodiment/run_embodiment.sh isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri
+   # The dedicated launcher enters the local embodied-isaaclab image
+   # (rlinf:embodied-isaaclab-u24, then rlinf:embodied-isaaclab-blackwell)
+   # and exports CRI_OPENPI_CKPT from checkpoint/pi05_droid_cri_rlinf_49999
+   # (or the older checkpoints/ path). TensorRT 10 (libnvinfer.so.10) is
+   # installed into .assets/tensorrt when missing; override with CRI_EXTRA_LIB_DIRS.
+   bash examples/embodiment/scripts/train_cri_openpi_ckpt.sh
+   # equivalent:
+   # bash examples/embodiment/run_embodiment.sh isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri
 
 What this does:
 

@@ -34,6 +34,9 @@ from .constants import DEFAULT_ZERO_VEL_EPS
 from .constants import NUM_CRI_POINTS
 from .cri_realtime_monitor import configure_cri_filter
 from .filter import command_delta
+from .ipc import CRI_IPC_WRITE_FD_ENV
+from .ipc import pickle_recv as _pickle_recv
+from .ipc import pickle_send as _pickle_send
 from .postprocess import apply_cri_zero_vel_filter, clamp_cri
 
 logger = logging.getLogger(__name__)
@@ -298,73 +301,312 @@ def _bootstrap_sfd_coreservice(analysis_dir: Path):
     try:
         import sfd_coreservice  # type: ignore[import-not-found]
     except ImportError as exc:
+        hint = ""
+        err = str(exc)
+        if "GLIBCXX" in err:
+            hint = (
+                " The CRI extension needs GLIBCXX_3.4.32+ (Ubuntu 22.04 docker "
+                "only has 3.4.30). Copy a newer libstdc++.so.6 into "
+                f"{analysis_dir / 'lib' / 'cxx'} or set CRI_LIBSTDCXX_DIR."
+            )
+        elif "GLIBC_" in err:
+            hint = (
+                " libSafetyCore needs GLIBC_2.38+ (Ubuntu 22.04 docker has 2.35). "
+                "Copy a host ld-linux-x86-64.so.2 + libc.so.6 into "
+                f"{analysis_dir / 'lib' / 'cxx'} or set CRI_GLIBC_LOADER. "
+                "The CRI worker must start through that loader."
+            )
+        elif "c10_cuda_check_implementation" in err:
+            hint = (
+                " libSafetyCore is linked against Isaac Sim torch 2.7 "
+                "(c10 symbol ...ib). OpenPI torch 2.11 exports ...jb and cannot "
+                "load it. Put omni.isaac.ml_archive/pip_prebundle first on "
+                "PYTHONPATH or set CRI_ISAAC_TORCH_SITE."
+            )
         raise ImportError(
             f"Failed to import sfd_coreservice from {lib_dir} "
             f"(python {sys.version_info.major}.{sys.version_info.minor}). {exc}"
+            f"{hint}"
         ) from exc
 
     return sfd_coreservice
 
 
-def _torch_is_isaac_build() -> bool:
-    """Isaac Sim's torch 2.7 cannot satisfy the CRI ``libc10`` symbols."""
-    path = Path(getattr(torch, "__file__", "") or "").as_posix()
+# SafetyCore 1.7.1 is linked to Isaac torch 2.7's c10 ABI (`...ib`).
+# OpenPI torch 2.11 renamed the same helper to `...jb`.
+_CRI_C10_CHECK_ISAAC = b"c10_cuda_check_implementationEiPKcS2_ib"
+_CRI_ISAAC_TORCH_SITE_ENV = "CRI_ISAAC_TORCH_SITE"
+
+
+def _torch_is_isaac_build(torch_file: str | None = None) -> bool:
+    """True when the imported torch came from Isaac Sim's ML prebundle."""
+    path = (torch_file or getattr(torch, "__file__", "") or "").replace("\\", "/")
     return (
         "isaac_sim" in path
         or "isaac-sim" in path
         or "isaacsim" in path
         or "omni.isaac.ml_archive" in path
+        or "isaacsim-ml-prebundle" in path
     )
 
 
-def _pickle_send(buf, obj: object) -> None:
-    import pickle
-    import struct
+def _safety_core_needs_isaac_c10(analysis_dir: Path | None = None) -> bool:
+    """True when bundled ``libSafetyCore`` references the Isaac 2.7 c10 symbol."""
+    roots: list[Path] = []
+    if analysis_dir is not None:
+        roots.append(_resolve_bundled_lib_dir(Path(analysis_dir)))
+        roots.append(Path(analysis_dir) / "lib")
+    roots.append(_PACKAGE_ANALYSIS_DIR / "lib")
+    seen: set[Path] = set()
+    for root in roots:
+        so = root / "libSafetyCore.so.1.7.1"
+        if not so.is_file():
+            continue
+        resolved = so.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            return _CRI_C10_CHECK_ISAAC in resolved.read_bytes()
+        except OSError:
+            continue
+    return True
 
-    payload = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
-    buf.write(struct.pack("<Q", len(payload)))
-    buf.write(payload)
-    buf.flush()
+
+def discover_isaac_torch_site() -> Path | None:
+    """Return Isaac Sim ``pip_prebundle`` that contains ``torch``.
+
+    Order: ``CRI_ISAAC_TORCH_SITE``, ``ISAAC_PATH`` / ``ISAAC_SIM_PATH`` /
+    ``ISAACSIM_PATH`` ``exts/omni.isaac.ml_archive/pip_prebundle``, then the
+    usual checkout / container mounts.
+    """
+    candidates: list[Path] = []
+    env_site = os.environ.get(_CRI_ISAAC_TORCH_SITE_ENV)
+    if env_site:
+        candidates.append(Path(env_site).expanduser())
+    for key in ("ISAAC_PATH", "ISAAC_SIM_PATH", "ISAACSIM_PATH"):
+        root = os.environ.get(key)
+        if root:
+            candidates.append(
+                Path(root).expanduser() / "exts" / "omni.isaac.ml_archive" / "pip_prebundle"
+            )
+    for root in (
+        Path("/workspace/RLinf"),
+        Path("/workspace/isaac_sim"),
+        Path("/home/ubuntu/RLinf"),
+        _PACKAGE_ANALYSIS_DIR.parents[5] if len(_PACKAGE_ANALYSIS_DIR.parents) >= 6 else None,
+    ):
+        if root is None:
+            continue
+        candidates.append(root / "exts" / "omni.isaac.ml_archive" / "pip_prebundle")
+    seen: set[Path] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if (resolved / "torch" / "__init__.py").is_file():
+            return resolved
+    return None
 
 
-def _pickle_recv(buf, *, timeout_s: float | None = None) -> object:
-    import pickle
-    import select
-    import struct
+def _current_torch_satisfies_cri(analysis_dir: Path | None = None) -> bool:
+    """Whether the already-imported torch can satisfy ``libSafetyCore``."""
+    if _safety_core_needs_isaac_c10(analysis_dir):
+        return _torch_is_isaac_build()
+    return not _torch_is_isaac_build()
 
-    if timeout_s is not None:
-        ready, _, _ = select.select([buf], [], [], timeout_s)
-        if not ready:
-            raise TimeoutError(f"CRI worker did not respond within {timeout_s}s")
-    header = buf.read(8)
-    if len(header) < 8:
-        raise EOFError("CRI worker exited before sending a reply")
-    (n,) = struct.unpack("<Q", header)
-    data = buf.read(n)
-    if len(data) < n:
-        raise EOFError("CRI worker reply truncated")
-    return pickle.loads(data)
+
+# Ubuntu 22.04 docker ships GLIBCXX_3.4.30 / GLIBC 2.35; CRI needs 3.4.32+
+# and GLIBC_2.38 (__isoc23_strtol). libc version nodes cannot be shimmed.
+_REQUIRED_GLIBCXX = "GLIBCXX_3.4.32"
+_REQUIRED_GLIBC = "GLIBC_2.38"
+_GLIBC_LOADER_NAME = "ld-linux-x86-64.so.2"
+
+
+def _libstdcxx_has_symbol(path: Path, symbol: str) -> bool:
+    """Return True if ``path`` contains the ELF version symbol ``symbol``."""
+    try:
+        return symbol.encode("ascii") in path.read_bytes()
+    except OSError:
+        return False
+
+
+def discover_libstdcxx_dir(analysis_dir: Path | None = None) -> Path | None:
+    """Directory with a ``libstdc++.so.6`` that exports ``GLIBCXX_3.4.32``.
+
+    Order: ``CRI_LIBSTDCXX`` (file), ``CRI_LIBSTDCXX_DIR``, ``lib/cxx`` under
+    the analysis/package tree. The file is not in git; copy a host/conda
+    ``libstdc++.so.6`` into ``cri/lib/cxx`` for the Ubuntu 22.04 image.
+    """
+    candidates: list[Path] = []
+    env_file = os.environ.get("CRI_LIBSTDCXX")
+    if env_file:
+        candidates.append(Path(env_file).expanduser())
+    env_dir = os.environ.get("CRI_LIBSTDCXX_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir).expanduser() / "libstdc++.so.6")
+    roots: list[Path] = []
+    if analysis_dir is not None:
+        roots.append(Path(analysis_dir) / "lib" / "cxx")
+        roots.append(Path(analysis_dir) / "lib")
+    else:
+        roots.append(_PACKAGE_ANALYSIS_DIR / "lib" / "cxx")
+        roots.append(_PACKAGE_ANALYSIS_DIR / "lib")
+    for root in roots:
+        candidates.append(root / "libstdc++.so.6")
+    seen: set[Path] = set()
+    for candidate in candidates:
+        path = candidate
+        if path.is_dir():
+            path = path / "libstdc++.so.6"
+        if not path.is_file():
+            continue
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if _libstdcxx_has_symbol(resolved, _REQUIRED_GLIBCXX):
+            return resolved.parent
+    return None
+
+
+def discover_glibc_loader(analysis_dir: Path | None = None) -> Path | None:
+    """Return ``ld-linux-x86-64.so.2`` sitting next to a GLIBC_2.38 ``libc.so.6``.
+
+    Order: ``CRI_GLIBC_LOADER``, ``CRI_GLIBC_DIR``, then ``lib/cxx`` under the
+    analysis tree (or the package tree when ``analysis_dir`` is omitted).
+    Launch the CRI worker through this loader; ``LD_LIBRARY_PATH`` alone
+    cannot replace the process libc version nodes.
+    """
+    candidates: list[Path] = []
+    env_file = os.environ.get("CRI_GLIBC_LOADER")
+    if env_file:
+        candidates.append(Path(env_file).expanduser())
+    env_dir = os.environ.get("CRI_GLIBC_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir).expanduser() / _GLIBC_LOADER_NAME)
+    roots: list[Path] = []
+    if analysis_dir is not None:
+        roots.append(Path(analysis_dir) / "lib" / "cxx")
+        roots.append(Path(analysis_dir) / "lib")
+    else:
+        roots.append(_PACKAGE_ANALYSIS_DIR / "lib" / "cxx")
+        roots.append(_PACKAGE_ANALYSIS_DIR / "lib")
+    for root in roots:
+        candidates.append(root / _GLIBC_LOADER_NAME)
+    seen: set[Path] = set()
+    for candidate in candidates:
+        path = candidate
+        if path.is_dir():
+            path = path / _GLIBC_LOADER_NAME
+        if not path.is_file():
+            continue
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        libc = resolved.parent / "libc.so.6"
+        if libc.is_file() and _libstdcxx_has_symbol(libc, _REQUIRED_GLIBC):
+            return resolved
+    return None
+
+
+def build_cri_worker_cmd(
+    python: str, worker: Path, env: dict[str, str]
+) -> list[str]:
+    """Argv for ``sfd_worker.py``, optionally prefixed with a newer glibc loader."""
+    argv = [python, "-u", str(worker)]
+    loader = discover_glibc_loader()
+    if loader is None:
+        return argv
+    libpath = env.get("LD_LIBRARY_PATH", "")
+    return [str(loader), "--library-path", libpath, *argv]
+
+
+def _is_non_torch_isaac_path(entry: str) -> bool:
+    """Isaac Kit / Sim paths that must not shadow the chosen CRI torch."""
+    norm = (entry or "").replace("\\", "/")
+    if "omni.isaac.ml_archive" in norm:
+        return False
+    return (
+        "isaac_sim" in norm
+        or "isaac-sim" in norm
+        or "isaacsim" in norm
+        or "/kit/python/" in norm
+        or "/python_packages" in norm
+        or "omni.isaac.core_archive" in norm
+    )
 
 
 def _clean_worker_env() -> dict[str, str]:
     env = os.environ.copy()
+    isaac_site = discover_isaac_torch_site()
+    if isaac_site is not None:
+        env[_CRI_ISAAC_TORCH_SITE_ENV] = str(isaac_site)
     for key in ("PYTHONPATH", "LD_LIBRARY_PATH"):
         raw = env.get(key, "")
         env[key] = os.pathsep.join(
-            p
-            for p in raw.split(os.pathsep)
-            if p
-            and "isaac_sim" not in p
-            and "isaac-sim" not in p
-            and "isaacsim" not in p
-            and "omni.isaac.ml_archive" not in p
+            p for p in raw.split(os.pathsep) if p and not _is_non_torch_isaac_path(p)
         )
+    if isaac_site is not None and _safety_core_needs_isaac_c10():
+        torch_lib = isaac_site / "torch" / "lib"
+        env["PYTHONPATH"] = os.pathsep.join(
+            [str(isaac_site)]
+            + [p for p in env.get("PYTHONPATH", "").split(os.pathsep) if p and p != str(isaac_site)]
+        )
+        if torch_lib.is_dir():
+            env["LD_LIBRARY_PATH"] = os.pathsep.join(
+                [str(torch_lib)]
+                + [p for p in env.get("LD_LIBRARY_PATH", "").split(os.pathsep) if p and p != str(torch_lib)]
+            )
+    prefix: list[str] = []
+    seen: set[Path] = set()
+    loader = discover_glibc_loader()
+    cxx_dir = discover_libstdcxx_dir()
+    for directory in (
+        loader.parent if loader is not None else None,
+        cxx_dir,
+    ):
+        if directory is None:
+            continue
+        resolved = directory.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        prefix.append(str(resolved))
+    if prefix:
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(
+            prefix + [env.get("LD_LIBRARY_PATH", "")]
+        )
+    if loader is not None:
+        # ``ld-linux --library-path`` replaces LD_LIBRARY_PATH; keep the
+        # distro dirs so OpenSSL / libpython still resolve.
+        extra = [
+            "/lib/x86_64-linux-gnu",
+            "/usr/lib/x86_64-linux-gnu",
+            "/lib64",
+            "/usr/lib64",
+        ]
+        current = [p for p in env.get("LD_LIBRARY_PATH", "").split(os.pathsep) if p]
+        for path in extra:
+            if path not in current:
+                current.append(path)
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(current)
     env["PYTHONNOUSERSITE"] = "1"
     return env
 
 
 class _CriSubprocessClient:
-    """Persistent CRI worker so EnvWorker can keep Isaac's torch loaded."""
+    """Persistent CRI worker so EnvWorker can keep Isaac's torch loaded.
+
+    Pickle replies arrive on a dedicated pipe. Worker stdout/stderr are the
+    CRI log file so TensorRT and ``sfd_setup`` prints cannot be read as a
+    payload length.
+    """
 
     def __init__(self, solver_kwargs: dict) -> None:
         import subprocess
@@ -372,18 +614,32 @@ class _CriSubprocessClient:
         worker = Path(__file__).resolve().parent / "sfd_worker.py"
         log_path = Path(os.environ.get("CRI_WORKER_LOG", "/tmp/rlinf_cri_worker.log"))
         self._log_file = log_path.open("ab")
-        self._proc = subprocess.Popen(
-            [sys.executable, "-u", str(worker)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=self._log_file,
-            env=_clean_worker_env(),
-            cwd=str(worker.parent),
-        )
-        assert self._proc.stdin is not None and self._proc.stdout is not None
+        ipc_r, ipc_w = os.pipe()
+        os.set_inheritable(ipc_w, True)
+        env = _clean_worker_env()
+        env[CRI_IPC_WRITE_FD_ENV] = str(ipc_w)
+        self._ipc_in = None
+        self._proc = None
+        try:
+            self._proc = subprocess.Popen(
+                build_cri_worker_cmd(sys.executable, worker, env),
+                stdin=subprocess.PIPE,
+                stdout=self._log_file,
+                stderr=subprocess.STDOUT,
+                env=env,
+                cwd=str(worker.parent),
+                pass_fds=(ipc_w,),
+            )
+        except Exception:
+            os.close(ipc_r)
+            raise
+        finally:
+            os.close(ipc_w)
+        self._ipc_in = os.fdopen(ipc_r, "rb", buffering=0)
+        assert self._proc.stdin is not None
         try:
             _pickle_send(self._proc.stdin, solver_kwargs)
-            reply = _pickle_recv(self._proc.stdout, timeout_s=180)
+            reply = _pickle_recv(self._ipc_in, timeout_s=180)
         except Exception as exc:
             self.close()
             raise RuntimeError(
@@ -403,9 +659,9 @@ class _CriSubprocessClient:
     def _call(self, payload: dict[str, Any]) -> dict[str, Any]:
         if self._proc is None or self._proc.poll() is not None:
             raise RuntimeError("CRI worker is not running")
-        assert self._proc.stdin is not None and self._proc.stdout is not None
+        assert self._proc.stdin is not None and self._ipc_in is not None
         _pickle_send(self._proc.stdin, payload)
-        reply = _pickle_recv(self._proc.stdout, timeout_s=60)
+        reply = _pickle_recv(self._ipc_in, timeout_s=60)
         if "error" in reply:
             raise RuntimeError(reply["error"])
         return reply
@@ -433,13 +689,20 @@ class _CriSubprocessClient:
                 if proc.stdin is not None:
                     _pickle_send(proc.stdin, {"op": "stop"})
                     proc.stdin.close()
-            except (BrokenPipeError, EOFError, OSError):
+            except (BrokenPipeError, EOFError, OSError, ValueError):
                 pass
             try:
                 proc.wait(timeout=5)
             except Exception:
                 proc.kill()
             self._proc = None
+        ipc_in = getattr(self, "_ipc_in", None)
+        if ipc_in is not None:
+            try:
+                ipc_in.close()
+            except Exception:
+                pass
+            self._ipc_in = None
         log_file = getattr(self, "_log_file", None)
         if log_file is not None:
             try:
@@ -472,8 +735,10 @@ def _as_batch_f64(x: np.ndarray | torch.Tensor, *, name: str, device: torch.devi
 class CriSolver:
     """Thin wrapper around ``sfd_coreservice.CoreService`` for RLinf / OpenPI.
 
-    Isaac Sim torch (docker ``rlinf:agentic-rlinf0.4-isaaclab``) cannot load
-    the CRI extension in-process; a subprocess worker is used instead.
+    ``libSafetyCore`` is linked to Isaac Sim torch 2.7. When that torch is
+    already imported (EnvWorker), CRI loads in-process. OpenPI torch 2.11
+    cannot satisfy the c10 ABI, so a subprocess with Isaac's prebundle is
+    used instead.
 
     Usage::
 
@@ -514,7 +779,11 @@ class CriSolver:
         self._remote: _CriSubprocessClient | None = None
         self._solver = None
 
-        use_inprocess = (not _torch_is_isaac_build()) if inprocess is None else bool(inprocess)
+        use_inprocess = (
+            _current_torch_satisfies_cri(self.analysis_dir)
+            if inprocess is None
+            else bool(inprocess)
+        )
         if not use_inprocess:
             self._remote = _CriSubprocessClient(
                 {

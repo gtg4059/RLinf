@@ -256,14 +256,26 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._gripper_keys = tuple(
             init_params.get("gripper_keys", _DEFAULT_GRIPPER_KEYS)
         )
-        # Online CRI(q, qd) → discrete VLM tokens (openpi droid-cri / 49999).
-        # CBF-QP filter: policy CRI is cri_pre; command is library qd_cmd (not s).
+        # IsaacLab CRI-F: one run_cri_filter(q, qd_nom) per env.step.
+        # Policy CRI is the previous-tick cri_pre cache (reset/first obs = 0).
         self._compute_cri = bool(init_params.get("compute_cri", True))
         self._cri_filter = bool(init_params.get("cri_filter", True))
         self._cri_limit = float(init_params.get("cri_limit", 0.96))
         self._cbf_alpha = float(init_params.get("cbf_alpha", 0.02))
-        self._cri_filter_enabled = bool(init_params.get("cri_filter_enabled", True))
+        self._cri_filter_enabled = bool(init_params.get("cri_filter_enabled", False))
+        self._cri_penalty_weight = float(init_params.get("cri_penalty_weight", -0.02))
+        self._cri_penalty_limit = float(init_params.get("cri_penalty_limit", 0.96))
+        self._cri_penalty_sigma = float(init_params.get("cri_penalty_sigma", 20.0))
+        self._cri_ovf_threshold = float(init_params.get("cri_ovf_threshold", 2.0))
+        self._cri_step_dt = float(init_params.get("cri_step_dt", 0.02))
         self._cri_solver = None
+        self._cri_obs_cache = None
+        self._last_q = None
+        self._cri_solve_count = 0
+        self._cri_step_count = 0
+        self._last_task_success = None
+        self._last_cri_max = None
+        self._last_cri_ovf = None
         # Match openpi DROID RLDS: sample one exterior view per episode
         # (tf.random.uniform() > 0.5 in droid_rlds_dataset.restructure).
         self._sample_exterior_camera = bool(
@@ -284,6 +296,7 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._use_exterior2 = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
         )
+        self._init_cri_buffers()
 
     def _make_env_function(self):
         num_envs = int(self.cfg.init_params.num_envs)
@@ -378,8 +391,48 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         seed: int | None = None,
         env_ids: torch.Tensor | None = None,
     ):
+        self._reset_cri_filter_rows(env_ids)
         self._resample_exterior_camera(env_ids)
-        return super().reset(seed=seed, env_ids=env_ids)
+        obs, infos = super().reset(seed=seed, env_ids=env_ids)
+        self._remember_q(obs)
+        return obs, infos
+
+    def _init_cri_buffers(self) -> None:
+        from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.constants import (
+            DEFAULT_NUM_JOINTS,
+            NUM_CRI_POINTS,
+        )
+
+        self._cri_obs_cache = torch.zeros(
+            self.num_envs, NUM_CRI_POINTS, device=self.device, dtype=torch.float32
+        )
+        self._last_q = torch.zeros(
+            self.num_envs, DEFAULT_NUM_JOINTS, device=self.device, dtype=torch.float32
+        )
+        self._cri_solve_count = 0
+        self._cri_step_count = 0
+
+    def _reset_cri_filter_rows(self, env_ids: torch.Tensor | None = None) -> None:
+        """IsaacLab CRI-F reset: CRI obs=0, no solver."""
+        if self._cri_obs_cache is None:
+            return
+        self._last_task_success = None
+        self._last_cri_max = None
+        self._last_cri_ovf = None
+        if env_ids is None:
+            self._cri_obs_cache.zero_()
+            self._last_q.zero_()
+            self._cri_solve_count = 0
+            self._cri_step_count = 0
+            return
+        ids = torch.as_tensor(env_ids, device=self.device).reshape(-1)
+        self._cri_obs_cache.index_fill_(0, ids, 0.0)
+        self._last_q.index_fill_(0, ids, 0.0)
+
+    def _remember_q(self, env_obs: dict[str, Any]) -> None:
+        if self._last_q is None or env_obs.get("states") is None:
+            return
+        self._last_q.copy_(env_obs["states"][:, : self._last_q.shape[-1]])
 
     def _wrap_obs(self, obs):
         use_exterior2 = self._use_exterior2 if self._sample_exterior_camera else None
@@ -405,7 +458,7 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             self._cri_solver = CriSolver(
                 batch_size=max(int(self.num_envs), 1),
                 device=self.device,
-                cri_filter=self._cri_filter,
+                cri_filter=True,
                 cri_limit=self._cri_limit,
                 cbf_alpha=self._cbf_alpha,
                 filter_enabled=self._cri_filter_enabled,
@@ -413,27 +466,92 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         return self._cri_solver
 
     def _attach_cri(self, env_obs: dict[str, Any]) -> dict[str, Any]:
-        """Compute Safetics CRI from arm q/qd and attach ``env_obs['cri']``.
-
-        Filter-on uses the current-tick ``cri_pre`` (RLinf wraps after ``step``).
-        ``qd_cmd`` is not injected into the robot command here.
-        """
+        """Attach previous-tick ``cri_filter_pre``. Does not call the solver."""
         if not self._compute_cri:
             return env_obs
-        q = env_obs["states"][:, :7]
-        qd = env_obs.get("joint_vel")
-        if qd is None:
-            qd = torch.zeros_like(q)
-        cri = self._get_cri_solver().compute(q, qd, return_torch=True)
-        env_obs["cri"] = cri.to(device=self.device, dtype=torch.float32)
+        if self._cri_obs_cache is None:
+            self._init_cri_buffers()
+        env_obs["cri"] = self._cri_obs_cache.to(
+            device=self.device, dtype=torch.float32
+        )
         return env_obs
 
+    def _store_cri_pre(self, cri_pre: torch.Tensor) -> None:
+        if self._cri_obs_cache is None:
+            self._init_cri_buffers()
+        cri = cri_pre.to(device=self.device, dtype=torch.float32)
+        if cri.dim() == 1:
+            cri = cri.unsqueeze(0)
+        self._cri_obs_cache.copy_(cri[: self.num_envs])
+
+    def _solve_cri_for_action(self, actions: Any) -> torch.Tensor:
+        """One ``run_cri_filter(q, qd_nom)`` for this env.step."""
+        from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.filter import (
+            abs_joint_to_qd_nom,
+        )
+
+        act = torch.as_tensor(actions, device=self.device, dtype=torch.float32)
+        if act.dim() == 1:
+            act = act.unsqueeze(0)
+        q_tgt = act[..., :7]
+        qd_nom = abs_joint_to_qd_nom(q_tgt, self._last_q, self._cri_step_dt)
+        self._cri_step_count += 1
+        self._cri_solve_count += 1
+        result = self._get_cri_solver().run_cri_filter(self._last_q, qd_nom)
+        cri = torch.as_tensor(
+            result["cri_pre"], device=self.device, dtype=torch.float32
+        )
+        if cri.dim() == 1:
+            cri = cri.unsqueeze(0)
+        return cri[: self.num_envs]
+
+    def _record_metrics(self, step_reward, terminations, infos):
+        episode_info = {}
+        self.returns += step_reward
+        if self._last_task_success is None:
+            task_hit = step_reward > 0
+        else:
+            task_hit = self._last_task_success
+        self.success_once = self.success_once | task_hit
+        episode_info["success_once"] = self.success_once.clone()
+        episode_info["return"] = self.returns.clone()
+        episode_info["episode_len"] = self.elapsed_steps.clone()
+        episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]
+        if self._last_cri_max is not None:
+            episode_info["cri_max"] = self._last_cri_max
+        if self._last_cri_ovf is not None:
+            episode_info["cri_ovf"] = self._last_cri_ovf
+        if self._cri_step_count > 0:
+            ratio = float(self._cri_solve_count) / float(self._cri_step_count)
+            if self._cri_obs_cache is not None:
+                episode_info["cri_solves_per_step"] = self._cri_obs_cache.new_full(
+                    (self.num_envs,), ratio
+                )
+            else:
+                episode_info["cri_solves_per_step"] = torch.full(
+                    (self.num_envs,),
+                    ratio,
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+        infos["episode"] = episode_info
+        return infos
+
     def step(self, actions=None, auto_reset=True):
+        from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.rewards import (
+            cri_ovf_exp,
+        )
+
+        cri_pre = None
+        if actions is not None and self._compute_cri:
+            cri_pre = self._solve_cri_for_action(actions)
+
         obs, step_reward, terminations, truncations, infos = self.env.step(actions)
 
         terminations = terminations.clone()
         truncations = truncations.clone()
-        step_reward = step_reward.clone()
+        r_task = step_reward.clone()
+        step_reward = r_task.clone()
 
         if isinstance(infos, dict):
             success = infos.get("success", infos.get("is_success"))
@@ -443,7 +561,26 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
                     success_t = success_t.expand_as(terminations)
                 terminations = terminations | success_t.reshape_as(terminations)
 
+        ovf = None
+        if cri_pre is not None and self._cri_penalty_weight != 0.0:
+            ovf = cri_ovf_exp(
+                cri_pre,
+                limit=self._cri_penalty_limit,
+                sigma=self._cri_penalty_sigma,
+                ovf_threshold=self._cri_ovf_threshold,
+            )
+            step_reward = r_task + self._cri_penalty_weight * ovf.to(
+                device=r_task.device, dtype=r_task.dtype
+            )
+
+        self._last_task_success = r_task > 0
+        self._last_cri_max = None if cri_pre is None else cri_pre.amax(dim=-1)
+        self._last_cri_ovf = ovf
+
         obs = self._wrap_obs(obs)
+        self._remember_q(obs)
+        if cri_pre is not None:
+            self._store_cri_pre(cri_pre)
         self._elapsed_steps += 1
         truncations = (self.elapsed_steps >= self.cfg.max_episode_steps) | truncations
         dones = terminations | truncations

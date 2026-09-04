@@ -43,13 +43,19 @@ init_params:
   # sample exterior_1 vs exterior_2 into the policy base slot, once per episode.
   sample_exterior_camera: True
   sample_exterior_camera_prob: 0.5
-  # Online Safetics CRI(q, qd) → OpenPI discrete "CRI:" tokens (droid-cri / 49999).
-  # CBF-QP filter (IsaacLab CRI-F): cri_pre only, no time-scale s.
+  # IsaacLab CRI-F data: one run_cri_filter(q, qd_nom) per env.step.
+  # OpenPI CRI tokens are previous-tick cri_pre (reset/first obs = 0).
   compute_cri: True
   cri_filter: True
   cri_limit: 0.96
   cbf_alpha: 0.02
-  cri_filter_enabled: True
+  # False: log CRI only; do not rewrite the plant command with qd_cmd.
+  cri_filter_enabled: False
+  cri_penalty_weight: -0.02
+  cri_penalty_limit: 0.96
+  cri_penalty_sigma: 20.0
+  cri_ovf_threshold: 2.0
+  cri_step_dt: 0.02
   # Optional obs key overrides (defaults match Arena DROID / OpenPI names).
   # main_image_keys: ["external_camera", "exterior_image_1_left"]
   # wrist_image_keys: ["wrist_camera", "wrist_image_left"]

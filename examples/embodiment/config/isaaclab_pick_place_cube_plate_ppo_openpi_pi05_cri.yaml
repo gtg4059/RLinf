@@ -15,7 +15,9 @@ hydra:
 
 # RLinf-loadable OpenPI weights converted from JAX ``49999`` (LoRA merged).
 # Default: <repo>/checkpoint/pi05_droid_cri_rlinf_49999 (also accepts checkpoints/).
-# run_embodiment.sh auto-exports CRI_OPENPI_CKPT. Prepare with:
+# Host launch (enters rlinf:embodied-isaaclab-u24, then the blackwell tag):
+#   bash examples/embodiment/scripts/train_cri_openpi_ckpt.sh
+# run_embodiment.sh also auto-exports CRI_OPENPI_CKPT. Prepare with:
 #   bash examples/embodiment/scripts/prepare_cri_openpi_ckpt.sh
 # Override at launch with CRI_OPENPI_CKPT=/path/to/pytorch/dir
 cri_openpi_ckpt: ${oc.env:CRI_OPENPI_CKPT,${oc.env:REPO_PATH,/workspace/RLinf}/checkpoint/pi05_droid_cri_rlinf_49999}
@@ -38,13 +40,15 @@ runner:
   max_steps: -1
 
   only_eval: False
-  val_check_interval: -1
+  val_check_interval: 50
+  # One eval rollout of the pretrained policy before the first PPO update.
+  eval_at_start: True
   # Denser saves so a second collapse can be caught before 100 steps.
   save_interval: 50
   weight_sync_interval: 1
 
   # Continue PPO from the peak RL snapshot (success ~91.5%), not step 300.
-  resume_dir: ${oc.env:REPO_PATH,/workspace/RLinf}/logs/20260818-12:49:26-isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri/isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri/checkpoints/global_step_200
+  resume_dir: null # ${oc.env:REPO_PATH,/workspace/RLinf}/logs/20260818-12:49:26-isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri/isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri/checkpoints/global_step_200
   ckpt_path: null
 
 algorithm:
@@ -82,36 +86,73 @@ env:
 
   train:
     rollout_epoch: 2
-    # 8× RTX PRO 6000 Blackwell (97887 MiB), collocated actor+env+rollout.
-    # Live generate at 48 envs/GPU ≈ 51GB (actor ~16 + rollout ~18 + Isaac ~15).
-    # Scale to 64/GPU (~67GB est.). 96/GPU still hits RTX descriptor OOM.
-    # 8 GPUs × 64 envs/GPU = 512. Must be divisible by env world size (8).
-    total_num_envs: 512
+    # Collocated actor+env+rollout on all visible GPUs.
+    # Per-GPU envs = total_num_envs / actor_world_size. Must divide evenly.
+    # This host currently exposes 2 GPUs → 64 envs/GPU.
+    total_num_envs: 128
     max_episode_steps: 450
     max_steps_per_rollout_epoch: 450
     use_fixed_reset_state_ids: True
     seed: 42
     # Policy base camera: 50:50 exterior_1/2 per episode (openpi DROID RLDS).
-    # CRI(q, qd) is computed online and tokenized as a discrete VLM span
-    # (openpi droid-cri / 49999). Both flags live in the env yaml init_params.
-    # No video/stills during training (use eval_* configs to dump cameras).
+    # CRI-F: one run_cri_filter(q, qd_nom) per tick; OpenPI sees cri_filter_pre.
+    # Plant command is not rewritten (cri_filter_enabled=False). Soft CRI(0.96)
+    # penalty is added to sparse task success. Flags also live in env yaml.
+    init_params:
+      cri_filter: True
+      cri_filter_enabled: False
+      cri_penalty_weight: -0.005
+      cri_penalty_limit: 0.96
+    # First two train rollouts only (env 0). Later epochs skip encoding.
     video_cfg:
-      save_video: False
-      save_camera_stills: False
+      save_video: True
+      info_on_video: True
+      fps: 20
+      max_envs_in_video: 1
+      max_videos: 2
+      extra_info_on_video:
+        - episode.success_once
+        - episode.cri_max
+        - episode.cri_ovf
+      video_image_keys:
+        - main_images
+        - exterior2_images
+        - wrist_images
+      save_camera_stills: True
+      camera_image_keys:
+        - main_images
+        - exterior2_images
+        - wrist_images
       video_base_dir: ${runner.logger.log_path}/video/train
 
   eval:
     rollout_epoch: 1
-    # 8 GPUs × 32 envs/GPU. Must be divisible by env world size (8).
-    total_num_envs: 256
+    # Must be divisible by env world size. 2 GPUs → 32 envs/GPU.
+    total_num_envs: 64
     max_episode_steps: 450
     max_steps_per_rollout_epoch: 450
     auto_reset: True
     ignore_terminations: True
     use_fixed_reset_state_ids: True
     video_cfg:
-      save_video: False
-      save_camera_stills: False
+      save_video: True
+      info_on_video: True
+      fps: 20
+      max_envs_in_video: 1
+      max_videos: 1
+      extra_info_on_video:
+        - episode.success_once
+        - episode.cri_max
+        - episode.cri_ovf
+      video_image_keys:
+        - main_images
+        - exterior2_images
+        - wrist_images
+      save_camera_stills: True
+      camera_image_keys:
+        - main_images
+        - exterior2_images
+        - wrist_images
       video_base_dir: ${runner.logger.log_path}/video/eval
     seed: 42
 
@@ -130,11 +171,13 @@ actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
   # Per-rank micro-batch. After rollout offload, ~60GB remains (Isaac+actor).
-  # global_batch_size must be divisible by micro_batch_size * actor_world_size (128*8).
+  # global_batch_size must be divisible by micro_batch_size * actor_world_size.
   micro_batch_size: 128
-  # Local rollout: (512/8 envs) * rollout_epoch(2) * (450/15 chunks) = 3840
-  # batch_per_rank = 10240/8 = 1280, and 3840 % 1280 == 0 (3 PPO steps / update).
-  global_batch_size: 10240
+  # Per-rank chunk-level rollout:
+  #   (total_num_envs / actor_ws) * rollout_epoch * (max_steps / num_action_chunks)
+  #   2 GPUs: (128/2)*2*(450/15) = 3840
+  # batch_per_rank = 2560/2 = 1280, and 3840 % 1280 == 0 (3 PPO minibatches).
+  global_batch_size: 2560
   seed: 42
   enable_offload: False
 

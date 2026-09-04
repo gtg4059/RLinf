@@ -47,12 +47,32 @@ from rlinf.utils.nested_dict_process import (
     update_nested_cfg,
 )
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.utils.runner_utils import should_enable_eval
 from rlinf.utils.utils import (
     flatten_embodied_batch,
     pack_batch,
     preprocess_embodied_batch,
 )
 from rlinf.workers.env.history_manager import HistoryManager
+
+
+def gather_episode_stat(value: Any, mask: torch.Tensor) -> torch.Tensor:
+    """Select episode stats for environments where ``mask`` is True.
+
+    Per-env vectors are boolean-indexed. Scalars (0-dim tensors, size-1
+    arrays, Python / NumPy numbers) are expanded to one value per done env.
+    """
+    if not torch.is_tensor(value):
+        value = torch.as_tensor(value)
+    value = value.detach()
+    n_done = int(mask.reshape(-1).sum().item())
+    if value.ndim == 0 or value.numel() == 1:
+        return value.reshape(()).to(dtype=value.dtype).expand(n_done).cpu().contiguous()
+    if value.shape[:1] == mask.shape:
+        return value[mask].cpu()
+    if mask.ndim == 1 and value.shape[0] == mask.numel():
+        return value[mask].cpu()
+    return value.reshape(()).expand(n_done).cpu().contiguous()
 
 
 class EnvWorker(Worker):
@@ -62,6 +82,7 @@ class EnvWorker(Worker):
         self.cfg = cfg
         self.train_video_cnt = 0
         self.eval_video_cnt = 0
+        self.global_step = 0
         self.should_stop = False
 
         self.env_list = []
@@ -106,9 +127,7 @@ class EnvWorker(Worker):
         train_env_cfg = self.cfg.env.get("train", None)
         eval_env_cfg = self.cfg.env.get("eval", None)
         self.enable_train = not self.only_eval and train_env_cfg is not None
-        self.enable_eval = (
-            self.cfg.runner.get("val_check_interval", -1) > 0 or self.only_eval
-        )
+        self.enable_eval = should_enable_eval(self.cfg)
         self.rollout_epoch = (
             train_env_cfg.rollout_epoch if train_env_cfg is not None else 1
         )
@@ -477,18 +496,20 @@ class EnvWorker(Worker):
             if self.cfg.env.train.ignore_terminations:
                 if chunk_truncations[:, -1].any():
                     assert chunk_truncations[:, -1].all()
-                    if "episode" in infos:
-                        for key in infos["episode"]:
-                            env_info[key] = infos["episode"][key].cpu()
+                if "episode" in infos:
+                    for key in infos["episode"]:
+                        env_info[key] = torch.as_tensor(infos["episode"][key]).cpu()
             else:
                 if "episode" in infos:
                     for key in infos["episode"]:
-                        env_info[key] = infos["episode"][key].cpu()
+                        env_info[key] = torch.as_tensor(infos["episode"][key]).cpu()
         elif chunk_dones.any():
             if "final_info" in infos:
                 final_info = infos["final_info"]
                 for key in final_info["episode"]:
-                    env_info[key] = final_info["episode"][key][chunk_dones[:, -1]].cpu()
+                    env_info[key] = gather_episode_stat(
+                        final_info["episode"][key], chunk_dones[:, -1]
+                    )
 
         intervene_actions = (
             infos["intervene_action"] if "intervene_action" in infos else None
@@ -571,10 +592,14 @@ class EnvWorker(Worker):
             if "final_info" in infos:
                 final_info = infos["final_info"]
                 for key in final_info["episode"]:
-                    env_info[key] = final_info["episode"][key][newly_done].cpu()
+                    env_info[key] = gather_episode_stat(
+                        final_info["episode"][key], newly_done
+                    )
             elif "episode" in infos:
                 for key in infos["episode"]:
-                    env_info[key] = infos["episode"][key][newly_done].cpu()
+                    env_info[key] = gather_episode_stat(
+                        infos["episode"][key], newly_done
+                    )
 
         rlt_switch_flags = (
             infos["rlt_switch_flags"] if "rlt_switch_flags" in infos else None
@@ -726,21 +751,26 @@ class EnvWorker(Worker):
         adjusted_rewards[:, -1] += self.cfg.algorithm.gamma * final_values
         return adjusted_rewards
 
+    def set_global_step(self, global_step: int) -> None:
+        """Record the runner step so flushed videos land under ``step_{N}``."""
+        self.global_step = int(global_step)
+
     def finish_rollout(self, mode="train"):
         # reset
+        video_sub_dir = f"step_{self.global_step}"
         if mode == "train":
             for i in range(self.stage_num):
                 if self.cfg.env.train.video_cfg.save_video:
                     flush_video = get_env_attr(self.env_list[i], "flush_video")
                     if callable(flush_video):
-                        flush_video()
+                        flush_video(video_sub_dir=video_sub_dir)
                 self.env_list[i].update_reset_state_ids()
         elif mode == "eval":
             for i in range(self.stage_num):
                 if self.cfg.env.eval.video_cfg.save_video:
                     flush_video = get_env_attr(self.eval_env_list[i], "flush_video")
                     if callable(flush_video):
-                        flush_video()
+                        flush_video(video_sub_dir=video_sub_dir)
                 if not self.cfg.env.eval.auto_reset:
                     self.eval_env_list[i].update_reset_state_ids()
 

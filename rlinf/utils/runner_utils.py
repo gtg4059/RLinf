@@ -21,6 +21,42 @@ from rlinf.utils.logging import get_logger
 logger = get_logger()
 
 
+def _runner_get(cfg: Any, key: str, default: Any = None) -> Any:
+    """Read a ``runner.*`` field from a DictConfig, namespace, or mapping."""
+    runner = getattr(cfg, "runner", None)
+    if runner is None and isinstance(cfg, dict):
+        runner = cfg.get("runner")
+    if runner is None:
+        return default
+    if hasattr(runner, "get"):
+        return runner.get(key, default)
+    return getattr(runner, key, default)
+
+
+def should_enable_eval(cfg: Any) -> bool:
+    """Return True when eval env/rollout workers should be constructed.
+
+    Eval is enabled for periodic validation (``val_check_interval > 0``),
+    eval-only runs, or a one-shot initial eval (``eval_at_start``).
+    """
+    only_eval = bool(_runner_get(cfg, "only_eval", False))
+    task_type = _runner_get(cfg, "task_type", None)
+    if task_type == "embodied_eval":
+        only_eval = True
+    val_check_interval = _runner_get(cfg, "val_check_interval", -1)
+    eval_at_start = bool(_runner_get(cfg, "eval_at_start", False))
+    return (
+        (val_check_interval is not None and val_check_interval > 0)
+        or only_eval
+        or eval_at_start
+    )
+
+
+def should_eval_at_start(cfg: Any, global_step: int) -> bool:
+    """Return True when the runner should evaluate the initial policy at step 0."""
+    return bool(_runner_get(cfg, "eval_at_start", False)) and int(global_step) == 0
+
+
 def safe_is_divisible(a, b):
     """a safe divisible check to allow b to be 0"""
     if a == 0 or b == 0:

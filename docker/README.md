@@ -49,13 +49,15 @@ pair it with Isaac Sim **5.1.0** mounted at runtime (`ISAAC_PATH`).
 **Recommended:** use the helper that locks the working defaults:
 
 ```shell
-bash docker/build_embodied_isaaclab_blackwell.sh
-# optional: --tag rlinf:isaaclab-bw --no-cache --torch 2.11.0 --cuda-tag cu128
+bash docker/build_embodied_isaaclab_u24.sh
+# optional: --no-cache --torch 2.11.0 --cuda-tag cu128
+# Ubuntu 22.04 tag: bash docker/build_embodied_isaaclab_blackwell.sh
 # or: bash docker/bake_isaaclab_into_image.sh rebuild
 ```
 
 Defaults (overridable build-args / env vars):
 
+- `UBUNTU_VER=24.04` (matches the AWS CRI image `rlinf:embodied-isaaclab-u24`)
 - `CUDA_VER=12.8.1` (base image toolkit)
 - `TORCH_VERSION=2.11.0` (matches repo `pyproject.toml`)
 - `UV_TORCH_BACKEND=cu128` (Blackwell-capable CUDA wheel index; may resolve to `+cu130`)
@@ -65,10 +67,12 @@ Equivalent raw `docker build`:
 ```shell
 docker build -f docker/Dockerfile \
     --build-arg BUILD_TARGET=embodied-isaaclab \
+    --build-arg UBUNTU_VER=24.04 \
+    --build-arg CUDA_VER=12.8.1 \
     --build-arg TORCH_VERSION=2.11.0 \
     --build-arg UV_TORCH_BACKEND=cu128 \
     --build-arg NO_MIRROR=1 \
-    -t rlinf:embodied-isaaclab-blackwell .
+    -t rlinf:embodied-isaaclab-u24 .
 ```
 
 To patch an **already running** container/venv without rebuilding:
@@ -85,14 +89,18 @@ Only venvs under `/opt/venv` are installed. Mount the checkout (required for
 `rlinf/`, `examples/`, checkpoints). Install Isaac Sim **separately**
 (Isaac Sim 5.1.0; see `docs/source-en/rst_source/examples/embodied/isaaclab.rst`),
 then set `ISAAC_PATH` or leave the tree where `run_embodiment.sh` probes
-(`./isaac_sim`, a sibling `isaac_sim`, `/workspace/isaac_sim`).
+(`./isaac_sim`, this checkout if Sim was extracted into it, a sibling
+`isaac_sim`, `/workspace/isaac_sim`).
 
 ```shell
 bash docker/run_embodied_isaaclab_blackwell.sh
 # equivalent:
 # docker run --gpus all -it --rm --shm-size 32g --network host \
 #   -v "$PWD":/workspace/RLinf -w /workspace/RLinf \
-#   rlinf:embodied-isaaclab-blackwell
+#   rlinf:embodied-isaaclab-u24
+
+# CRI PPO from checkpoint/pi05_droid_cri_rlinf_49999 (auto-picks the u24 image):
+# bash examples/embodiment/scripts/train_cri_openpi_ckpt.sh
 ```
 
 If a separately installed Isaac Sim tree is visible on the host, the helper

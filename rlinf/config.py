@@ -31,6 +31,7 @@ from rlinf.utils.placement import (
     ModelParallelComponentPlacement,
     PlacementMode,
 )
+from rlinf.utils.runner_utils import should_enable_eval
 
 if TYPE_CHECKING:
     from megatron.core.model_parallel_config import ModelParallelConfig
@@ -854,6 +855,23 @@ def validate_megatron_cfg(cfg: DictConfig) -> DictConfig:
     return cfg
 
 
+def embodied_chunk_rollout_size_per_actor_rank(
+    total_num_envs: int,
+    rollout_epoch: int,
+    max_steps_per_rollout_epoch: int,
+    num_action_chunks: int,
+    actor_world_size: int,
+) -> int:
+    """Flattened chunk-level samples one actor rank sees after a train rollout."""
+    if actor_world_size <= 0:
+        raise ValueError("actor_world_size must be > 0")
+    return (
+        (int(total_num_envs) // int(actor_world_size))
+        * int(rollout_epoch)
+        * (int(max_steps_per_rollout_epoch) // int(num_action_chunks))
+    )
+
+
 def validate_embodied_cfg(cfg):
     only_eval = (
         cfg.runner.get("only_eval", False)
@@ -868,13 +886,15 @@ def validate_embodied_cfg(cfg):
     )
     with open_dict(cfg):
         cfg.runner.val_check_interval = cfg.runner.get("val_check_interval", -1)
-    enable_eval = cfg.runner.val_check_interval > 0 or only_eval
+        cfg.runner.eval_at_start = bool(cfg.runner.get("eval_at_start", False))
+    enable_eval = should_enable_eval(cfg)
 
     with open_dict(cfg):
         if enable_eval:
             assert cfg.env.get("eval", None) is not None, (
                 "env.eval config is required when runner.val_check_interval > 0, "
-                "runner.only_eval=True, or runner.task_type=embodied_eval."
+                "runner.eval_at_start=True, runner.only_eval=True, or "
+                "runner.task_type=embodied_eval."
             )
             cfg.env.eval.group_size = cfg.env.eval.get("group_size", 1)
         if algorithm_cfg.get("rollout_epoch", None) is not None:
@@ -1004,7 +1024,8 @@ def validate_embodied_cfg(cfg):
     if enable_eval:
         assert cfg.env.get("eval", None) is not None, (
             "env.eval config is required when runner.val_check_interval > 0, "
-            "runner.only_eval=True, or runner.task_type=embodied_eval."
+            "runner.eval_at_start=True, runner.only_eval=True, or "
+            "runner.task_type=embodied_eval."
         )
         assert cfg.env.eval.total_num_envs > 0, (
             "Total number of parallel environments for evaluation must be greater than 0"
@@ -1060,6 +1081,38 @@ def validate_embodied_cfg(cfg):
         ), (
             "env.train.max_steps_per_rollout_epoch must be divisible by actor.model.num_action_chunks"
         )
+        actor_world_size = component_placement.get_world_size("actor")
+        if (
+            str(cfg.algorithm.get("logprob_type", "chunk_level")).lower()
+            == "chunk_level"
+            and cfg.actor.get("global_batch_size") is not None
+            and actor_world_size > 0
+            and int(cfg.env.train.total_num_envs) % actor_world_size == 0
+        ):
+            rollout_per_rank = embodied_chunk_rollout_size_per_actor_rank(
+                cfg.env.train.total_num_envs,
+                cfg.env.train.rollout_epoch,
+                cfg.env.train.max_steps_per_rollout_epoch,
+                model_cfg.num_action_chunks,
+                actor_world_size,
+            )
+            batch_per_rank = int(cfg.actor.global_batch_size) // actor_world_size
+            assert batch_per_rank > 0, (
+                "actor.global_batch_size must be >= actor_world_size"
+            )
+            assert rollout_per_rank % batch_per_rank == 0, (
+                f"per-rank rollout size ({rollout_per_rank}) is not divisible by "
+                f"actor.global_batch_size / actor_world_size ({batch_per_rank}). "
+                f"With {actor_world_size} actor ranks, "
+                f"(env.train.total_num_envs={cfg.env.train.total_num_envs} / "
+                f"{actor_world_size}) * rollout_epoch={cfg.env.train.rollout_epoch} * "
+                f"(max_steps={cfg.env.train.max_steps_per_rollout_epoch} / "
+                f"num_action_chunks={model_cfg.num_action_chunks}) = {rollout_per_rank}. "
+                f"Set actor.global_batch_size so it divides "
+                f"{rollout_per_rank * actor_world_size} and stays divisible by "
+                f"micro_batch_size * actor_world_size "
+                f"({cfg.actor.micro_batch_size * actor_world_size})."
+            )
     with open_dict(cfg):
         weight_sync_interval = cfg.runner.get("weight_sync_interval", 1)
         assert weight_sync_interval > 0, "weight_sync_interval must be greater than 0"

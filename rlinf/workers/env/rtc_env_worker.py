@@ -35,6 +35,7 @@ from rlinf.data.embodied_io_struct import (
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.scheduler import Channel
 from rlinf.workers.env.env_worker import EnvWorker
+from rlinf.workers.env.env_worker import gather_episode_stat
 
 
 class RTCEnvWorker(EnvWorker):
@@ -178,7 +179,9 @@ class RTCEnvWorker(EnvWorker):
                     final_info = infos["final_info"]
                     if "episode" in final_info:
                         for key in final_info["episode"]:
-                            env_info[key] = final_info["episode"][key][dones].cpu()
+                            env_info[key] = gather_episode_stat(
+                                final_info["episode"][key], dones
+                            )
         env_output = EnvOutput(
             obs=extracted_obs,
             final_obs=final_obs,

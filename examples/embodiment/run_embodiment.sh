@@ -10,7 +10,7 @@ _RLINF_ORIG_ARGS=("$@")
 source "${REPO_PATH}/examples/embodiment/scripts/source_isaaclab_local_env.sh"
 source_isaaclab_local_env "${REPO_PATH}"
 
-# Preferred OpenPI venv shipped in rlinf:embodied-isaaclab-blackwell.
+# Preferred OpenPI venv shipped in the embodied-isaaclab image (u24 / blackwell).
 if [ -z "${VIRTUAL_ENV:-}" ] && [ -f /opt/venv/openpi/bin/activate ]; then
     # shellcheck disable=SC1091
     source /opt/venv/openpi/bin/activate
@@ -34,20 +34,22 @@ _rlinf_python_has_torch() {
 }
 
 # Host checkout has no `python` and no OpenPI torch. Re-enter the image.
-_RLINF_IMAGE_TAG="${IMAGE_TAG:-rlinf:embodied-isaaclab-blackwell}"
+# shellcheck disable=SC1091
+source "${REPO_PATH}/docker/runtime_mounts.sh"
+_RLINF_IMAGE_TAG="$(rlinf_resolve_isaaclab_image)"
 if ! PYTHON="$(_rlinf_find_python)" || ! _rlinf_python_has_torch "${PYTHON}"; then
     if [ ! -f /.dockerenv ] && [ "${RLINF_NO_DOCKER:-0}" != "1" ] \
         && command -v docker >/dev/null 2>&1 \
         && docker image inspect "${_RLINF_IMAGE_TAG}" >/dev/null 2>&1; then
         echo "Host Python is missing or has no torch. Re-launching inside ${_RLINF_IMAGE_TAG}" >&2
-        exec bash "${REPO_PATH}/docker/run_embodied_isaaclab_blackwell.sh" -- \
+        IMAGE_TAG="${_RLINF_IMAGE_TAG}" exec bash "${REPO_PATH}/docker/run_embodied_isaaclab_blackwell.sh" -- \
             bash examples/embodiment/run_embodiment.sh "${_RLINF_ORIG_ARGS[@]}"
     fi
     echo "ERROR: no usable Python with torch found." >&2
     echo "OpenPI + IsaacLab training needs the embodied-isaaclab image:" >&2
     echo "  bash docker/run_embodied_isaaclab_blackwell.sh" >&2
     echo "  source switch_env openpi" >&2
-    echo "  bash examples/embodiment/run_embodiment.sh isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri" >&2
+    echo "  bash examples/embodiment/scripts/train_cri_openpi_ckpt.sh" >&2
     exit 1
 fi
 export PYTHON
@@ -67,19 +69,14 @@ export OMNIGIBSON_KEY_PATH=${OMNIGIBSON_KEY_PATH:-$OMNIGIBSON_DATA_PATH/omnigibs
 export OMNIGIBSON_ASSET_PATH=${OMNIGIBSON_ASSET_PATH:-$OMNIGIBSON_DATA_PATH/omnigibson-robot-assets/}
 export OMNIGIBSON_HEADLESS=${OMNIGIBSON_HEADLESS:-1}
 # Isaac Sim is a separate install (not in the Docker image). Prefer ISAAC_PATH;
-# otherwise probe ./isaac_sim, a sibling tree, /mnt/E/isaac_sim, /workspace/isaac_sim.
+# otherwise probe ./isaac_sim, this checkout (Sim extracted into the repo),
+# a sibling tree, /mnt/E/isaac_sim, /workspace/isaac_sim.
 if [ -z "${ISAAC_PATH:-}" ] || [ ! -f "${ISAAC_PATH}/setup_conda_env.sh" ]; then
-    for _isaac_candidate in \
-        "${REPO_PATH}/isaac_sim" \
-        "${REPO_PATH}/../isaac_sim" \
-        "/mnt/E/isaac_sim" \
-        "/workspace/isaac_sim"; do
-        if [ -f "${_isaac_candidate}/setup_conda_env.sh" ] && [ -f "${_isaac_candidate}/VERSION" ]; then
-            ISAAC_PATH="$(cd "${_isaac_candidate}" && pwd)"
-            break
-        fi
-    done
-    unset _isaac_candidate
+    _isaac_resolved="$(rlinf_resolve_isaac_sim "${REPO_PATH}" || true)"
+    if [ -n "${_isaac_resolved}" ]; then
+        ISAAC_PATH="${_isaac_resolved}"
+    fi
+    unset _isaac_resolved
 fi
 export ISAAC_PATH="${ISAAC_PATH:-/path/to/isaac-sim}"
 export EXP_PATH=${EXP_PATH:-$ISAAC_PATH/apps}

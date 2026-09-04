@@ -61,7 +61,8 @@ runner
        ``enable_p2p`` 不兼容。详见 :doc:`env_decoupled_mode`。
 
 诸如 ``runner.task_type``\ （设为 ``embodied``）、``runner.max_epochs``、
-``runner.save_interval``、``runner.val_check_interval`` 与 ``runner.resume_dir``
+``runner.save_interval``、``runner.val_check_interval``、
+``runner.eval_at_start`` 与 ``runner.resume_dir``
 等共享键在 :doc:`basic_config` 中说明。
 
 algorithm

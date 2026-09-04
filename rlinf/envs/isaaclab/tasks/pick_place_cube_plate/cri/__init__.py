@@ -27,15 +27,21 @@ from .constants import (
     CRI_CLAMP_MAX,
     CRI_CLAMP_MIN,
     CRI_FILTER_LIMIT,
+    CRI_OVF_SIGMA,
+    CRI_OVF_THRESHOLD,
+    CRI_PENALTY_WEIGHT,
     DEFAULT_NUM_JOINTS,
     DEFAULT_ZERO_VEL_EPS,
     DROID_CONTROL_DT,
+    ISAACLAB_STEP_DT,
     NUM_CRI_OBS_DIM,
     NUM_CRI_POINTS,
     PACKAGE_DIR,
 )
+from .filter import abs_joint_to_qd_nom
 from .filter import compute_episode_cri_f
 from .postprocess import apply_cri_zero_vel_filter, clamp_cri
+from .rewards import cri_ovf_exp
 from .solver import CriSolver, resolve_analysis_dir
 from .velocity import joint_velocity_from_positions
 
@@ -44,17 +50,23 @@ __all__ = [
     "CRI_CLAMP_MAX",
     "CRI_CLAMP_MIN",
     "CRI_FILTER_LIMIT",
+    "CRI_OVF_SIGMA",
+    "CRI_OVF_THRESHOLD",
+    "CRI_PENALTY_WEIGHT",
     "DEFAULT_NUM_JOINTS",
     "DEFAULT_ZERO_VEL_EPS",
     "DROID_CONTROL_DT",
+    "ISAACLAB_STEP_DT",
     "NUM_CRI_OBS_DIM",
     "NUM_CRI_POINTS",
     "PACKAGE_DIR",
     "CriSolver",
+    "abs_joint_to_qd_nom",
     "apply_cri_zero_vel_filter",
     "clamp_cri",
     "compute_cri",
     "compute_episode_cri_f",
+    "cri_ovf_exp",
     "joint_velocity_from_positions",
     "resolve_analysis_dir",
 ]

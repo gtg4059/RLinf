@@ -68,7 +68,8 @@ runner
 
 Shared keys such as ``runner.task_type`` (set to ``embodied``),
 ``runner.max_epochs``, ``runner.save_interval``, ``runner.val_check_interval``,
-and ``runner.resume_dir`` are documented in :doc:`basic_config`.
+``runner.eval_at_start``, and ``runner.resume_dir`` are documented in
+:doc:`basic_config`.
 
 algorithm
 ~~~~~~~~~~~~~~~

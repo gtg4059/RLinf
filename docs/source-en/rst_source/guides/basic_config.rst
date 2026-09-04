@@ -124,6 +124,10 @@ runner
        ``runner.max_epochs``.
    * - ``runner.val_check_interval``
      - How often to launch a validation rollout (``-1`` to disable).
+   * - ``runner.eval_at_start``
+     - If ``True``, run one validation (and write eval videos) at global step 0
+       before the first training update. Resume from a later checkpoint skips
+       this. Requires ``env.eval``.
    * - ``runner.save_interval``
      - Checkpoint frequency in trainer steps.
    * - ``runner.seq_length``

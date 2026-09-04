@@ -37,6 +37,7 @@ from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.utils.runner_utils import should_enable_eval
 
 
 class MultiStepRolloutWorker(Worker):
@@ -68,9 +69,7 @@ class MultiStepRolloutWorker(Worker):
         train_env_cfg = cfg.env.get("train", None)
         eval_env_cfg = cfg.env.get("eval", None)
         self.enable_train = not self.only_eval and train_env_cfg is not None
-        self.enable_eval = (
-            cfg.runner.get("val_check_interval", -1) > 0 or self.only_eval
-        )
+        self.enable_eval = should_enable_eval(cfg)
         self.rollout_epoch = (
             train_env_cfg.rollout_epoch if train_env_cfg is not None else 1
         )

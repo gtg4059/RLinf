@@ -1,23 +1,30 @@
 # Shared host-side mount helpers for docker/run_*.sh
 # shellcheck shell=bash
 
+# True when $1 is an Isaac Sim standalone tree (setup_conda_env.sh + VERSION).
+rlinf_is_isaac_sim_tree() {
+  local candidate="${1:-}"
+  [ -n "${candidate}" ] \
+    && [ -f "${candidate}/setup_conda_env.sh" ] \
+    && [ -f "${candidate}/VERSION" ]
+}
+
 # Locate a separately installed Isaac Sim 5.x standalone tree (not in the image).
-# Order: ISAAC_SIM_PATH, <repo>/isaac_sim, <repo>/../isaac_sim, /mnt/E/isaac_sim.
+# Order: ISAAC_SIM_PATH, ISAAC_PATH, <repo>/isaac_sim, <repo> itself (Sim
+# extracted into the checkout), sibling isaac_sim, /mnt/E/isaac_sim,
+# /workspace/isaac_sim. Broken isaac_sim symlinks are skipped.
 rlinf_resolve_isaac_sim() {
   local repo_root="$1"
   local candidate
-  if [ -n "${ISAAC_SIM_PATH:-}" ]; then
-    candidate="${ISAAC_SIM_PATH}"
-    if [ -f "${candidate}/setup_conda_env.sh" ] && [ -f "${candidate}/VERSION" ]; then
-      (cd "${candidate}" && pwd)
-      return 0
-    fi
-  fi
   for candidate in \
+      "${ISAAC_SIM_PATH:-}" \
+      "${ISAAC_PATH:-}" \
       "${repo_root}/isaac_sim" \
+      "${repo_root}" \
       "${repo_root}/../isaac_sim" \
-      "/mnt/E/isaac_sim"; do
-    if [ -f "${candidate}/setup_conda_env.sh" ] && [ -f "${candidate}/VERSION" ]; then
+      "/mnt/E/isaac_sim" \
+      "/workspace/isaac_sim"; do
+    if rlinf_is_isaac_sim_tree "${candidate}"; then
       (cd "${candidate}" && pwd)
       return 0
     fi
@@ -62,21 +69,30 @@ rlinf_container_cri_ckpt() {
   esac
 }
 
-# Prefer a locally built tag, then the published image the live `rlinf` container uses.
+# Prefer an already-exported IMAGE_TAG, else the first locally present candidate.
+# Remaining args are fallback tags (first arg is also the default if none exist).
 rlinf_resolve_image() {
-  local preferred="${1:-}"
-  local fallback="${2:-}"
+  local first="${1:-}"
   if [ -n "${IMAGE_TAG:-}" ]; then
     printf '%s\n' "${IMAGE_TAG}"
     return 0
   fi
   local tag
-  for tag in ${preferred} ${fallback}; do
+  for tag in "$@"; do
     [ -z "${tag}" ] && continue
-    if docker image inspect "${tag}" >/dev/null 2>&1; then
+    if command -v docker >/dev/null 2>&1 \
+        && docker image inspect "${tag}" >/dev/null 2>&1; then
       printf '%s\n' "${tag}"
       return 0
     fi
   done
-  printf '%s\n' "${preferred:-${fallback}}"
+  printf '%s\n' "${first}"
+}
+
+# Local embodied-isaaclab tags. The Ubuntu 24.04 Blackwell build is tagged
+# rlinf:embodied-isaaclab-u24; the helper also accepts the older blackwell name.
+rlinf_resolve_isaaclab_image() {
+  rlinf_resolve_image \
+    rlinf:embodied-isaaclab-u24 \
+    rlinf:embodied-isaaclab-blackwell
 }

@@ -120,6 +120,9 @@ runner
      - 最大全局步数；为 ``-1`` 时，依据 ``runner.max_epochs`` 自动确定。
    * - ``runner.val_check_interval``
      - 验证 rollout 的触发频率（``-1`` 关闭）。
+   * - ``runner.eval_at_start``
+     - 为 ``True`` 时，在第一次训练更新前（global step 0）先跑一轮验证并写入
+       eval 视频。从更晚的 checkpoint 恢复时会跳过。需要 ``env.eval``。
    * - ``runner.save_interval``
      - 保存 checkpoint 的步数间隔。
    * - ``runner.seq_length``

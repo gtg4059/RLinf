@@ -24,6 +24,7 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import torch
 
 from .constants import CBF_ALPHA
 from .constants import CRI_FILTER_LIMIT
@@ -31,6 +32,21 @@ from .constants import DEFAULT_NUM_JOINTS
 from .constants import DROID_CONTROL_DT
 from .constants import NUM_CRI_POINTS
 from .velocity import joint_velocity_from_positions
+
+
+def abs_joint_to_qd_nom(
+    q_tgt: np.ndarray | torch.Tensor,
+    q: np.ndarray | torch.Tensor,
+    dt: float,
+) -> np.ndarray | torch.Tensor:
+    """Convert absolute joint targets to IsaacLab ``qd_nom = (q_tgt - q) / dt``."""
+    if dt <= 0.0:
+        raise ValueError(f"dt must be positive, got {dt}")
+    if isinstance(q_tgt, torch.Tensor) or isinstance(q, torch.Tensor):
+        tgt = torch.as_tensor(q_tgt)
+        cur = torch.as_tensor(q, device=tgt.device, dtype=tgt.dtype)
+        return (tgt - cur) / dt
+    return (np.asarray(q_tgt) - np.asarray(q)) / dt
 
 
 def shift_cri_filter_obs(
