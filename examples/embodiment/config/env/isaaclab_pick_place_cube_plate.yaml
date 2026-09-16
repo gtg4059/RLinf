@@ -44,18 +44,30 @@ init_params:
   # sample exterior_1 vs exterior_2 into the policy base slot, once per episode.
   sample_exterior_camera: True
   sample_exterior_camera_prob: 0.5
-  # IsaacLab CRI-F data: one run_cri_filter(q, qd_nom) per env.step.
+  # IsaacLab CRI-F data: one run_cri_filter(q, qd) per env.step from
+  # measured joint_pos / joint_vel (not commanded qd_nom).
   # OpenPI CRI tokens are previous-tick cri_pre (reset/first obs = 0).
   compute_cri: True
   cri_filter: True
   cri_limit: 0.96
   cbf_alpha: 0.02
+  # False: Isaac resets done envs inside step; RLinf cycle can succeed again.
+  # True: hold leftover steps until the next RLinf bootstrap reset.
+  hold_after_done: False
   # False: log CRI only; do not rewrite the plant command with qd_cmd.
   cri_filter_enabled: False
   cri_penalty_weight: -0.02
   cri_penalty_limit: 0.96
   cri_penalty_sigma: 20.0
   cri_ovf_threshold: 2.0
+  # Soft: cri_penalty_weight * cri_ovf_exp every step (dense).
+  # Hard: terminate + one-shot penalty when cri_max >= threshold (Isaac OVF).
+  cri_ovf_termination_enabled: False
+  cri_ovf_term_threshold: null  # default: cri_penalty_limit (0.96)
+  cri_ovf_term_penalty: null  # default: -success_step_reward/3 (~-0.022)
+  # Living cost until the first RLinf-cycle success. 0 = off.
+  # Train default -dt/100 ≈ -0.000667. 30 steps saved ≈ success/3.
+  time_penalty_weight: 0.0
   cri_step_dt: 0.0666666667  # 1/15, OpenPI DROID control dt
   # Optional obs key overrides (defaults match Arena DROID / OpenPI names).
   # main_image_keys: ["external_camera", "exterior_image_1_left"]

@@ -46,15 +46,17 @@ env:
 
   eval:
     rollout_epoch: 1
-    total_num_envs: 4
-    max_episode_steps: 450
-    max_steps_per_rollout_epoch: 450
+    # Must divide env world size (8 GPUs → 8, 16, 32, …).
+    total_num_envs: 8
+    max_episode_steps: 150
+    max_steps_per_rollout_epoch: 150
     auto_reset: True
     ignore_terminations: True
     use_fixed_reset_state_ids: True
     is_eval: True
     seed: 42
     init_params:
+      episode_length_s: 10.0
       eval_cam:
         height: 480
         width: 640
@@ -63,6 +65,13 @@ env:
       info_on_video: True
       fps: 15
       max_envs_in_video: 1
+      max_videos: null
+      save_trajectory: True
+      extra_info_on_video:
+        - episode.success_once
+        - episode.success_count
+        - episode.Episode_Reward/cri_ovf
+        - episode.cri_ovf_term_count
       # DROID RLDS: exterior_1 + exterior_2 + wrist.
       video_image_keys:
         - main_images

@@ -761,6 +761,20 @@ def merge_rollout_epochs(batch: dict[str, Any], rollout_epoch: int) -> dict[str,
     return ret_dict
 
 
+def mask_after_first_done(
+    *,
+    auto_reset: bool,
+    ignore_terminations: bool,
+    hold_after_done: bool,
+) -> bool:
+    """True when leftover steps after the first done are hold-padding.
+
+    Isaac reset-and-continue (``hold_after_done=False``) starts a new task
+    episode in those steps; masking them drops later +1 successes.
+    """
+    return (not auto_reset) and (not ignore_terminations) and hold_after_done
+
+
 def preprocess_embodied_batch(
     batch: dict[str, Any],
     *,
@@ -772,10 +786,15 @@ def preprocess_embodied_batch(
     group_size: int,
     rewards_lower_bound: float | None = None,
     rewards_upper_bound: float | None = None,
+    hold_after_done: bool = False,
 ) -> dict[str, torch.Tensor]:
     batch = merge_rollout_epochs(batch, rollout_epoch)
 
-    if not auto_reset and not ignore_terminations:
+    if mask_after_first_done(
+        auto_reset=auto_reset,
+        ignore_terminations=ignore_terminations,
+        hold_after_done=hold_after_done,
+    ):
         dones = batch["dones"]
         loss_mask, loss_mask_sum = compute_loss_mask(dones)
 

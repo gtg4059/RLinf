@@ -23,6 +23,17 @@ import numpy as np
 import torch
 
 from rlinf.envs.isaaclab.isaaclab_env import IsaaclabBaseEnv
+from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.hold import (
+    apply_hold_actions,
+    clone_obs,
+    overwrite_frozen_obs,
+    update_hold_actions,
+)
+from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.isaac_reset import (
+    isaac_reset_row_ids,
+    set_chunk_hold,
+    zero_rows,
+)
 
 GYM_ID = "Isaac-PickPlace-Cube-Plate-Droid-AbsJointPos-v0"
 
@@ -211,6 +222,83 @@ def wrap_droid_obs(
     return env_obs
 
 
+def measured_arm_q_qd(
+    obs: dict[str, Any],
+    *,
+    num_envs: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """IsaacLab measured arm ``(q, qd)`` for CRI.
+
+    ``q`` is observed joint positions (``states[..., :7]``).
+    ``qd`` is Isaac ``robot.data.joint_vel`` exposed as policy ``joint_vel``.
+    """
+    states = obs.get("states")
+    if states is None:
+        raise RuntimeError("CRI needs observed joint positions in obs['states']")
+    q = torch.as_tensor(states, device=device, dtype=torch.float32)
+    if q.dim() == 1:
+        q = q.unsqueeze(0)
+    q = q[:num_envs, :7]
+    if q.shape[-1] != 7:
+        raise RuntimeError(f"CRI needs 7 arm joints in states, got shape {tuple(q.shape)}")
+    qd = obs.get("joint_vel")
+    if qd is None:
+        raise RuntimeError(
+            "CRI needs IsaacLab measured joint_vel in obs. "
+            "Policy ObservationsCfg must include arm_joint_vel."
+        )
+    qd_t = torch.as_tensor(qd, device=device, dtype=torch.float32)
+    if qd_t.dim() == 1:
+        qd_t = qd_t.unsqueeze(0)
+    qd_t = qd_t[:num_envs, :7]
+    if qd_t.shape != q.shape:
+        raise RuntimeError(
+            f"CRI q/qd shape mismatch: q={tuple(q.shape)} qd={tuple(qd_t.shape)}"
+        )
+    return q, qd_t
+
+
+def build_traj_info(
+    *,
+    states: torch.Tensor | None,
+    actions: Any = None,
+    cri: torch.Tensor | None = None,
+    cri_ovf: torch.Tensor | None = None,
+    joint_vel: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    """Per-step robot / CRI arrays aligned with a RecordVideo frame.
+
+    ``cri`` is this-tick ``cri_pre`` (the motion that produced the frame),
+    not the delayed policy observation.
+    """
+    traj: dict[str, torch.Tensor] = {}
+    if states is not None:
+        state_t = torch.as_tensor(states, dtype=torch.float32)
+        if state_t.dim() == 1:
+            state_t = state_t.unsqueeze(0)
+        traj["states"] = state_t
+        traj["q"] = state_t[..., :7]
+        if state_t.shape[-1] > 7:
+            traj["gripper"] = state_t[..., 7:8]
+    if actions is not None:
+        action_t = torch.as_tensor(actions, dtype=torch.float32)
+        if action_t.dim() == 1:
+            action_t = action_t.unsqueeze(0)
+        traj["action"] = action_t
+    if cri is not None:
+        cri_t = torch.as_tensor(cri, dtype=torch.float32)
+        if cri_t.dim() == 1:
+            cri_t = cri_t.unsqueeze(0)
+        traj["cri"] = cri_t
+    if joint_vel is not None:
+        qd_t = torch.as_tensor(joint_vel, dtype=torch.float32)
+        if qd_t.dim() == 1:
+            qd_t = qd_t.unsqueeze(0)
+        traj["qd"] = qd_t
+    return traj
+
+
 def register_pick_place_cube_plate_env() -> str:
     """Register the Isaac Lab gym id if it is not already present."""
     if GYM_ID not in gym.envs.registry:
@@ -256,8 +344,9 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._gripper_keys = tuple(
             init_params.get("gripper_keys", _DEFAULT_GRIPPER_KEYS)
         )
-        # IsaacLab CRI-F: one run_cri_filter(q, qd_nom) per env.step.
-        # Policy CRI is the previous-tick cri_pre cache (reset/first obs = 0).
+        # IsaacLab CRI-F: one run_cri_filter(q, qd) per env.step from
+        # measured observations (joint_pos, joint_vel). Policy CRI is the
+        # previous-tick cri_pre cache (reset/first obs = 0).
         self._compute_cri = bool(init_params.get("compute_cri", True))
         self._cri_filter = bool(init_params.get("cri_filter", True))
         self._cri_limit = float(init_params.get("cri_limit", 0.96))
@@ -267,6 +356,25 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._cri_penalty_limit = float(init_params.get("cri_penalty_limit", 0.96))
         self._cri_penalty_sigma = float(init_params.get("cri_penalty_sigma", 20.0))
         self._cri_ovf_threshold = float(init_params.get("cri_ovf_threshold", 2.0))
+        self._cri_ovf_termination_enabled = bool(
+            init_params.get("cri_ovf_termination_enabled", False)
+        )
+        term_threshold = init_params.get("cri_ovf_term_threshold", None)
+        self._cri_ovf_term_threshold = float(
+            self._cri_penalty_limit
+            if term_threshold is None
+            else term_threshold
+        )
+        term_penalty = init_params.get("cri_ovf_term_penalty", None)
+        if term_penalty is None:
+            from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.rewards import (
+                cri_ovf_termination_step_penalty,
+            )
+
+            self._cri_ovf_term_penalty = cri_ovf_termination_step_penalty()
+        else:
+            self._cri_ovf_term_penalty = float(term_penalty)
+        self._time_penalty_weight = float(init_params.get("time_penalty_weight", 0.0))
         from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.constants import (
             DROID_CONTROL_DT,
         )
@@ -278,8 +386,8 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._cri_solve_count = 0
         self._cri_step_count = 0
         self._last_task_success = None
-        self._last_cri_max = None
-        self._last_cri_ovf = None
+        self._last_cri_ovf_term = None
+        self._last_time_penalty = None
         # Match openpi DROID RLDS: sample one exterior view per episode
         # (tf.random.uniform() > 0.5 in droid_rlds_dataset.restructure).
         self._sample_exterior_camera = bool(
@@ -288,6 +396,10 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._sample_exterior_camera_prob = float(
             init_params.get("sample_exterior_camera_prob", 0.5)
         )
+        # False: Isaac Lab resets done envs inside step(); RLinf keeps the
+        # 450-step cycle so pick-place can succeed more than once.
+        # True: freeze leftover steps (no Isaac reset) until bootstrap reset.
+        self._hold_after_done = bool(init_params.get("hold_after_done", False))
         super().__init__(
             cfg,
             num_envs,
@@ -300,7 +412,59 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._use_exterior2 = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
         )
+        self._frozen = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._hold_actions = None
+        self._hold_obs = None
+        self._success_count = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self._cri_ovf_sum = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self._cri_penalty_sum = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self._cri_ovf_term_count = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self._time_penalty_sum = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self._chunk_hold = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._chunk_hold_actions = None
         self._init_cri_buffers()
+
+    def chunk_step(self, chunk_actions):
+        """Clear intra-chunk reset-hold so the next policy chunk can act."""
+        self._chunk_hold.zero_()
+        self._chunk_hold_actions = None
+        return super().chunk_step(chunk_actions)
+
+    def _reset_metrics(self, env_idx=None):
+        super()._reset_metrics(env_idx)
+        if getattr(self, "_success_count", None) is None:
+            return
+        if env_idx is not None:
+            ids = torch.as_tensor(env_idx, device=self.device).reshape(-1)
+            self._success_count.index_fill_(0, ids, 0.0)
+            if getattr(self, "_cri_ovf_sum", None) is not None:
+                self._cri_ovf_sum.index_fill_(0, ids, 0.0)
+                self._cri_penalty_sum.index_fill_(0, ids, 0.0)
+            if getattr(self, "_cri_ovf_term_count", None) is not None:
+                self._cri_ovf_term_count.index_fill_(0, ids, 0.0)
+            if getattr(self, "_time_penalty_sum", None) is not None:
+                self._time_penalty_sum.index_fill_(0, ids, 0.0)
+            return
+        self._success_count.zero_()
+        if getattr(self, "_cri_ovf_sum", None) is not None:
+            self._cri_ovf_sum.zero_()
+            self._cri_penalty_sum.zero_()
+        if getattr(self, "_cri_ovf_term_count", None) is not None:
+            self._cri_ovf_term_count.zero_()
+        if getattr(self, "_time_penalty_sum", None) is not None:
+            self._time_penalty_sum.zero_()
 
     def _make_env_function(self):
         num_envs = int(self.cfg.init_params.num_envs)
@@ -323,6 +487,13 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
 
             sim_app = AppLauncher(headless=True, enable_cameras=True).app
 
+            from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.scene_guard import (
+                harden_isaac_scene,
+                prepare_isaac_render,
+            )
+
+            maple_usd = prepare_isaac_render()
+
             # Local import: env_cfg pulls Isaac Lab and requires AppLauncher first.
             from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.env_cfg import (
                 PickPlaceCubePlateEnvCfg,
@@ -343,6 +514,8 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             isaac_env_cfg = PickPlaceCubePlateEnvCfg()
             isaac_env_cfg.seed = seed
             isaac_env_cfg.scene.num_envs = num_envs
+            if maple_usd.is_file():
+                isaac_env_cfg.scene.table.spawn.usd_path = str(maple_usd)
 
             if episode_length_s is not None:
                 isaac_env_cfg.episode_length_s = float(episode_length_s)
@@ -376,6 +549,7 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             env = gym.make(
                 env_id, cfg=isaac_env_cfg, render_mode="rgb_array"
             ).unwrapped
+            harden_isaac_scene(env)
             return env, sim_app
 
         return make_env_isaaclab
@@ -405,8 +579,34 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._reset_cri_filter_rows(env_ids)
         self._resample_exterior_camera(env_ids)
         obs, infos = super().reset(seed=seed, env_ids=env_ids)
+        self._clear_hold(env_ids)
+        if getattr(self, "_chunk_hold", None) is not None:
+            self._chunk_hold.zero_()
+            self._chunk_hold_actions = None
         self._remember_q(obs)
-        return obs, infos
+        self._hold_obs = clone_obs(obs)
+        return obs, self._attach_traj_info(infos, obs)
+
+    def _sync_after_isaac_reset(self, env_ids: torch.Tensor) -> None:
+        """Refresh CRI/camera after Isaac's in-step reset. Keep RLinf metrics."""
+        ids = torch.as_tensor(env_ids, device=self.device).reshape(-1)
+        if int(ids.numel()) == 0:
+            return
+        if self._cri_obs_cache is not None:
+            zero_rows(self._cri_obs_cache, ids)
+        if self._last_q is not None:
+            zero_rows(self._last_q, ids)
+        self._resample_exterior_camera(ids)
+
+    def _clear_hold(self, env_ids: torch.Tensor | None = None) -> None:
+        """Clear freeze-after-done state (full reset or selected env rows)."""
+        if env_ids is None:
+            self._frozen.zero_()
+            self._hold_actions = None
+            self._hold_obs = None
+            return
+        ids = torch.as_tensor(env_ids, device=self.device).reshape(-1)
+        self._frozen.index_fill_(0, ids, False)
 
     def _init_cri_buffers(self) -> None:
         from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.constants import (
@@ -428,8 +628,8 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         if self._cri_obs_cache is None:
             return
         self._last_task_success = None
-        self._last_cri_max = None
-        self._last_cri_ovf = None
+        self._last_cri_ovf_term = None
+        self._last_time_penalty = None
         if env_ids is None:
             self._cri_obs_cache.zero_()
             self._last_q.zero_()
@@ -487,6 +687,33 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         )
         return env_obs
 
+    def _attach_traj_info(
+        self,
+        infos: Any,
+        obs: dict[str, Any] | None,
+        actions: Any = None,
+        cri_pre: torch.Tensor | None = None,
+        ovf: torch.Tensor | None = None,
+    ) -> dict[str, Any]:
+        """Attach per-step ``traj`` arrays for RecordVideo dumps."""
+        payload = infos if isinstance(infos, dict) else {}
+        states = None
+        joint_vel = None
+        if isinstance(obs, dict):
+            states = obs.get("states")
+            joint_vel = obs.get("joint_vel")
+        cri = cri_pre
+        if cri is None and self._cri_obs_cache is not None:
+            cri = self._cri_obs_cache
+        payload["traj"] = build_traj_info(
+            states=states,
+            actions=actions,
+            cri=cri,
+            cri_ovf=ovf,
+            joint_vel=joint_vel,
+        )
+        return payload
+
     def _store_cri_pre(self, cri_pre: torch.Tensor) -> None:
         if self._cri_obs_cache is None:
             self._init_cri_buffers()
@@ -495,20 +722,12 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             cri = cri.unsqueeze(0)
         self._cri_obs_cache.copy_(cri[: self.num_envs])
 
-    def _solve_cri_for_action(self, actions: Any) -> torch.Tensor:
-        """One ``run_cri_filter(q, qd_nom)`` for this env.step."""
-        from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.filter import (
-            abs_joint_to_qd_nom,
-        )
-
-        act = torch.as_tensor(actions, device=self.device, dtype=torch.float32)
-        if act.dim() == 1:
-            act = act.unsqueeze(0)
-        q_tgt = act[..., :7]
-        qd_nom = abs_joint_to_qd_nom(q_tgt, self._last_q, self._cri_step_dt)
+    def _solve_cri_from_obs(self, obs: dict[str, Any]) -> torch.Tensor:
+        """One ``run_cri_filter(q, qd)`` from this-tick Isaac observations."""
+        q, qd = measured_arm_q_qd(obs, num_envs=self.num_envs, device=self.device)
         self._cri_step_count += 1
         self._cri_solve_count += 1
-        result = self._get_cri_solver().run_cri_filter(self._last_q, qd_nom)
+        result = self._get_cri_solver().run_cri_filter(q, qd)
         cri = torch.as_tensor(
             result["cri_pre"], device=self.device, dtype=torch.float32
         )
@@ -524,38 +743,73 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         else:
             task_hit = self._last_task_success
         self.success_once = self.success_once | task_hit
+        self._success_count = self._success_count + task_hit.to(
+            dtype=self._success_count.dtype
+        )
         episode_info["success_once"] = self.success_once.clone()
+        episode_info["success_count"] = self._success_count.clone()
         episode_info["return"] = self.returns.clone()
         episode_info["episode_len"] = self.elapsed_steps.clone()
         episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]
-        if self._last_cri_max is not None:
-            episode_info["cri_max"] = self._last_cri_max
-        if self._last_cri_ovf is not None:
-            episode_info["cri_ovf"] = self._last_cri_ovf
-        if self._cri_step_count > 0:
-            ratio = float(self._cri_solve_count) / float(self._cri_step_count)
-            if self._cri_obs_cache is not None:
-                episode_info["cri_solves_per_step"] = self._cri_obs_cache.new_full(
-                    (self.num_envs,), ratio
-                )
-            else:
-                episode_info["cri_solves_per_step"] = torch.full(
-                    (self.num_envs,),
-                    ratio,
-                    device=self.device,
-                    dtype=torch.float32,
-                )
+        if self._last_cri_ovf_term is not None:
+            episode_info["cri_ovf_term"] = self._last_cri_ovf_term
+            episode_info["cri_ovf_term_count"] = self._cri_ovf_term_count.clone()
+        if getattr(self, "_cri_penalty_sum", None) is not None:
+            from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.rewards import (
+                cri_episode_reward_logs,
+            )
+
+            episode_info.update(cri_episode_reward_logs(self._cri_penalty_sum))
+        if self._last_time_penalty is not None:
+            episode_info["time_penalty"] = self._last_time_penalty
+        if getattr(self, "_time_penalty_sum", None) is not None:
+            from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.rewards import (
+                time_episode_reward_logs,
+            )
+
+            episode_info.update(time_episode_reward_logs(self._time_penalty_sum))
         infos["episode"] = episode_info
         return infos
 
     def step(self, actions=None, auto_reset=True):
         from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.rewards import (
+            accumulate_cri_episode_reward,
+            accumulate_time_episode_reward,
             cri_ovf_exp,
+            cri_ovf_violated,
+            time_penalty_live_mask,
         )
 
-        cri_pre = None
-        if actions is not None and self._compute_cri:
-            cri_pre = self._solve_cri_for_action(actions)
+        was_frozen = self._frozen.clone()
+        hold_after_done = self._hold_after_done
+        isaac_reset_ids = torch.zeros(0, dtype=torch.long, device=self.device)
+        cri_reset_ids = torch.zeros(0, dtype=torch.long, device=self.device)
+        self._last_cri_ovf_term = None
+        if hold_after_done and actions is not None:
+            actions = apply_hold_actions(actions, self._hold_actions, was_frozen)
+        elif (
+            (not hold_after_done)
+            and actions is not None
+            and bool(self._chunk_hold.any())
+        ):
+            actions = apply_hold_actions(
+                actions, self._chunk_hold_actions, self._chunk_hold
+            )
+
+        if hold_after_done and bool(was_frozen.all()) and self._hold_obs is not None:
+            step_reward = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.float32
+            )
+            terminations = torch.ones(
+                self.num_envs, device=self.device, dtype=torch.bool
+            )
+            self._elapsed_steps += 1
+            truncations = self.elapsed_steps >= self.cfg.max_episode_steps
+            infos = self._record_metrics(step_reward, terminations, {})
+            infos = self._attach_traj_info(
+                infos, self._hold_obs, actions=actions
+            )
+            return self._hold_obs, step_reward, terminations, truncations, infos
 
         obs, step_reward, terminations, truncations, infos = self.env.step(actions)
 
@@ -572,26 +826,139 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
                     success_t = success_t.expand_as(terminations)
                 terminations = terminations | success_t.reshape_as(terminations)
 
+        # Isaac already reset these rows inside env.step. Do not reset RLinf
+        # elapsed/return/success_once so the 450-step cycle can succeed again.
+        isaac_reset_ids = isaac_reset_row_ids(terminations, truncations)
+        if (not hold_after_done) and int(isaac_reset_ids.numel()) > 0:
+            self._sync_after_isaac_reset(isaac_reset_ids)
+
+        obs = self._wrap_obs(obs)
+        if hold_after_done and bool(was_frozen.any()):
+            obs = overwrite_frozen_obs(obs, self._hold_obs, was_frozen)
+
+        cri_pre = None
         ovf = None
-        if cri_pre is not None and self._cri_penalty_weight != 0.0:
+        if self._compute_cri:
+            cri_pre = self._solve_cri_from_obs(obs)
             ovf = cri_ovf_exp(
                 cri_pre,
                 limit=self._cri_penalty_limit,
                 sigma=self._cri_penalty_sigma,
                 ovf_threshold=self._cri_ovf_threshold,
             )
-            step_reward = r_task + self._cri_penalty_weight * ovf.to(
-                device=r_task.device, dtype=r_task.dtype
-            )
+            if self._cri_penalty_weight != 0.0:
+                step_reward = r_task + self._cri_penalty_weight * ovf.to(
+                    device=r_task.device, dtype=r_task.dtype
+                )
+            cri_hit = cri_ovf_violated(
+                cri_pre, threshold=self._cri_ovf_term_threshold
+            ).reshape(-1)
+            self._last_cri_ovf_term = cri_hit.clone()
+            if self._cri_ovf_termination_enabled and bool(cri_hit.any()):
+                terminations = terminations | cri_hit.reshape_as(terminations)
+                step_reward = step_reward + self._cri_ovf_term_penalty * cri_hit.to(
+                    device=step_reward.device, dtype=step_reward.dtype
+                )
+                if not hold_after_done:
+                    already_reset = torch.zeros(
+                        self.num_envs, dtype=torch.bool, device=self.device
+                    )
+                    if int(isaac_reset_ids.numel()) > 0:
+                        already_reset[isaac_reset_ids] = True
+                    need_reset = cri_hit & ~already_reset
+                    if bool(need_reset.any()):
+                        cri_reset_ids = torch.nonzero(
+                            need_reset, as_tuple=False
+                        ).reshape(-1)
+                        reset_obs_raw, _ = self.env.reset(env_ids=cri_reset_ids)
+                        reset_obs = self._wrap_obs(reset_obs_raw)
+                        obs = overwrite_frozen_obs(obs, reset_obs, need_reset)
+                        self._sync_after_isaac_reset(cri_reset_ids)
+                        cri_pre = cri_pre.clone()
+                        cri_pre[cri_reset_ids] = 0.0
+
+        if hold_after_done and bool(was_frozen.any()):
+            r_task = r_task.clone()
+            step_reward = step_reward.clone()
+            frozen_r = was_frozen.to(device=r_task.device)
+            r_task[frozen_r] = 0
+            step_reward[frozen_r] = 0
+            terminations[was_frozen.to(device=terminations.device)] = True
+            if ovf is not None:
+                ovf = ovf.clone()
+                ovf[was_frozen.to(device=ovf.device)] = 0
+            if self._last_cri_ovf_term is not None:
+                self._last_cri_ovf_term = self._last_cri_ovf_term.clone()
+                self._last_cri_ovf_term[was_frozen.to(device=self.device)] = False
+
+        live_mask = time_penalty_live_mask(
+            self.num_envs,
+            hold_after_done=hold_after_done,
+            was_frozen=was_frozen,
+            success_once=getattr(self, "success_once", None),
+            device=self.device,
+        )
+        time_pen = None
+        if self._time_penalty_weight != 0.0:
+            time_pen = step_reward.new_zeros(self.num_envs)
+            time_pen[live_mask] = self._time_penalty_weight
+            step_reward = step_reward + time_pen
+            if getattr(self, "_time_penalty_sum", None) is not None:
+                accumulate_time_episode_reward(
+                    self._time_penalty_sum,
+                    self._time_penalty_weight,
+                    live_mask,
+                )
+        self._last_time_penalty = time_pen
 
         self._last_task_success = r_task > 0
-        self._last_cri_max = None if cri_pre is None else cri_pre.amax(dim=-1)
-        self._last_cri_ovf = ovf
+        if self._last_cri_ovf_term is not None:
+            self._cri_ovf_term_count = self._cri_ovf_term_count + (
+                self._last_cri_ovf_term.to(dtype=self._cri_ovf_term_count.dtype)
+            )
+        if ovf is not None and getattr(self, "_cri_penalty_sum", None) is not None:
+            accumulate_cri_episode_reward(
+                self._cri_ovf_sum,
+                self._cri_penalty_sum,
+                ovf,
+                self._cri_penalty_weight,
+            )
+            if (
+                self._cri_ovf_termination_enabled
+                and self._last_cri_ovf_term is not None
+            ):
+                self._cri_penalty_sum = self._cri_penalty_sum + (
+                    self._cri_ovf_term_penalty
+                    * self._last_cri_ovf_term.to(
+                        device=self._cri_penalty_sum.device,
+                        dtype=self._cri_penalty_sum.dtype,
+                    )
+                )
 
-        obs = self._wrap_obs(obs)
         self._remember_q(obs)
+        post_reset_ids = isaac_reset_ids
+        if int(cri_reset_ids.numel()) > 0:
+            if int(post_reset_ids.numel()) == 0:
+                post_reset_ids = cri_reset_ids
+            else:
+                post_reset_ids = torch.cat(
+                    [post_reset_ids, cri_reset_ids]
+                ).unique()
+        if (
+            (not hold_after_done)
+            and int(post_reset_ids.numel()) > 0
+            and obs.get("states") is not None
+        ):
+            self._chunk_hold, self._chunk_hold_actions = set_chunk_hold(
+                self._chunk_hold,
+                self._chunk_hold_actions,
+                obs["states"],
+                post_reset_ids,
+            )
         if cri_pre is not None:
             self._store_cri_pre(cri_pre)
+            if (not hold_after_done) and int(post_reset_ids.numel()) > 0:
+                zero_rows(self._cri_obs_cache, post_reset_ids)
         self._elapsed_steps += 1
         truncations = (self.elapsed_steps >= self.cfg.max_episode_steps) | truncations
         dones = terminations | truncations
@@ -601,8 +968,21 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             infos["episode"]["success_at_end"] = terminations
             terminations[:] = False
 
+        infos = self._attach_traj_info(
+            infos, obs, actions=actions, cri_pre=cri_pre, ovf=ovf
+        )
+
         _auto_reset = auto_reset and self.auto_reset
         if dones.any() and _auto_reset:
             obs, infos = self._handle_auto_reset(dones, obs, infos)
+            self._clear_hold(torch.arange(self.num_envs, device=self.device)[dones])
+
+        if hold_after_done:
+            if actions is not None:
+                self._hold_actions = update_hold_actions(
+                    self._hold_actions, actions, was_frozen
+                )
+            self._hold_obs = clone_obs(obs)
+            self._frozen = was_frozen | dones.to(device=was_frozen.device)
 
         return obs, step_reward, terminations, truncations, infos

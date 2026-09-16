@@ -193,11 +193,19 @@ class PickPlaceCubePlateSceneCfg(InteractiveSceneCfg):
         spawn=UsdFileCfg(usd_path=_FRANKA_TABLE_USD),
     )
 
-    # Arena maple work table. Materials resolve from ``.assets/.../Materials``.
+    # Arena maple work table. ``prepare_isaac_render`` rewrites MDL paths to
+    # absolute local files before spawn; nested rigid bodies are also pinned
+    # kinematic in ``harden_isaac_scene``.
     table: AssetBaseCfg = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/MapleTable",
         init_state=AssetBaseCfg.InitialStateCfg(pos=_MAPLE_TABLE_POS),
-        spawn=UsdFileCfg(usd_path=_MAPLE_TABLE_USD),
+        spawn=UsdFileCfg(
+            usd_path=_MAPLE_TABLE_USD,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True,
+                disable_gravity=True,
+            ),
+        ),
     )
 
     cube: RigidObjectCfg = RigidObjectCfg(

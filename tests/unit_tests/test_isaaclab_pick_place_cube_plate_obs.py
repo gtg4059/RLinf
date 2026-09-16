@@ -19,6 +19,10 @@ import torch
 from rlinf.data.embodied_io_struct import EnvOutput
 from rlinf.envs.action_utils import prepare_actions_for_isaaclab
 from rlinf.envs.isaaclab.tasks.pick_place_cube_plate import wrap_droid_obs
+from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.env import (
+    build_traj_info,
+    measured_arm_q_qd,
+)
 
 
 def test_wrap_droid_obs_joint_and_gripper_keys():
@@ -194,3 +198,46 @@ def test_prepare_actions_droid_abs_joint_pos_binarizes_gripper():
         env_cfg={"init_params": {"action_space": "droid_abs_joint_pos"}},
     )
     assert float(out_low[..., -1]) == 0.0
+
+
+def test_build_traj_info_splits_q_and_this_tick_cri():
+    states = torch.arange(8, dtype=torch.float32).unsqueeze(0)
+    cri = torch.linspace(0.1, 0.9, 9, dtype=torch.float32).unsqueeze(0)
+    actions = torch.ones((1, 8), dtype=torch.float32)
+    ovf = torch.tensor([0.25], dtype=torch.float32)
+    traj = build_traj_info(
+        states=states,
+        actions=actions,
+        cri=cri,
+        cri_ovf=ovf,
+        joint_vel=torch.zeros((1, 7), dtype=torch.float32),
+    )
+    assert traj["q"].shape == (1, 7)
+    assert torch.allclose(traj["q"], states[:, :7])
+    assert torch.allclose(traj["gripper"], states[:, 7:8])
+    assert torch.allclose(traj["cri"], cri)
+    assert "cri_max" not in traj
+    assert "cri_ovf" not in traj
+    assert traj["action"].shape == (1, 8)
+    assert traj["qd"].shape == (1, 7)
+
+
+def test_measured_arm_q_qd_uses_obs_joint_vel():
+    """CRI inputs are Isaac observations, not commanded qd_nom."""
+    q = torch.linspace(0.1, 0.7, 7, dtype=torch.float32).unsqueeze(0)
+    qd = torch.linspace(-0.2, 0.4, 7, dtype=torch.float32).unsqueeze(0)
+    obs = {
+        "states": torch.cat([q, torch.ones((1, 1), dtype=torch.float32)], dim=-1),
+        "joint_vel": qd,
+    }
+    q_out, qd_out = measured_arm_q_qd(obs, num_envs=1, device=torch.device("cpu"))
+    assert q_out.shape == (1, 7)
+    assert qd_out.shape == (1, 7)
+    assert torch.allclose(q_out, q)
+    assert torch.allclose(qd_out, qd)
+
+
+def test_measured_arm_q_qd_requires_joint_vel():
+    obs = {"states": torch.zeros((2, 8), dtype=torch.float32)}
+    with pytest.raises(RuntimeError, match="joint_vel"):
+        measured_arm_q_qd(obs, num_envs=2, device=torch.device("cpu"))

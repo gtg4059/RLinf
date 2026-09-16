@@ -18,7 +18,7 @@ from typing import ContextManager, Union
 
 import torch
 import torch.nn as nn
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
 from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
@@ -313,7 +313,8 @@ class FSDPModelManager:
             model=module, device_mesh=self._device_mesh
         )
         self.optimizer = self.build_optimizer(
-            model=self.model, enable_critic_warmup=self.critic_warmup_steps > 0
+            model=self.model,
+            enable_critic_warmup=self._should_freeze_actor_for_critic_warmup(),
         )
 
         self.lr_scheduler = self.build_lr_scheduler(
@@ -526,6 +527,23 @@ class FSDPModelManager:
             min_lr_rate=min_lr_rate,
             last_epoch=last_epoch,
         )
+
+    def _should_freeze_actor_for_critic_warmup(self) -> bool:
+        """Freeze the actor only when a critic loss will actually run.
+
+        Actor-only PPO (``algorithm.loss_type: actor``) has no value loss. Freezing
+        the policy then makes logprobs a leaf, so ``loss.backward()`` crashes.
+        """
+        if self.critic_warmup_steps <= 0:
+            return False
+        full_cfg = getattr(self, "cfg", None)
+        if full_cfg is not None:
+            loss_type = str(
+                OmegaConf.select(full_cfg, "algorithm.loss_type", default="actor_critic")
+            )
+            if loss_type in ("actor", "opd"):
+                return False
+        return True
 
     def build_optimizer(
         self,

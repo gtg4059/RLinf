@@ -122,7 +122,8 @@ def compute_decoupled_ppo_actor_loss(
 
     pg_loss = loss_agg_func(pg_loss * behav_weight, behav_mask, loss_mask_ratio)
     if critic_warmup:
-        pg_loss = torch.tensor(0.0, device=pg_loss.device)
+        # Keep grad_fn so actor-only PPO can backward; scale is 0 so actor grads vanish.
+        pg_loss = pg_loss * 0.0
 
     with torch.no_grad():
         clip_fraction = (pg_loss1 < pg_loss2).logical_and(
@@ -280,7 +281,8 @@ def compute_ppo_actor_loss(
     dual_cliped_ratio = torch.where(dual_clip_mask, ratio, 0)
 
     if critic_warmup:
-        policy_loss = torch.tensor(0.0, device=policy_loss.device)
+        # Keep grad_fn so actor-only PPO can backward; scale is 0 so actor grads vanish.
+        policy_loss = policy_loss * 0.0
 
     # Compile metrics for logging
     loss_mask_for_metrics = loss_mask

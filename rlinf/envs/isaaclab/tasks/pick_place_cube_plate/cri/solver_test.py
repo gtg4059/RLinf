@@ -6,22 +6,24 @@ from pathlib import Path
 
 import pytest
 
-from .constants import PACKAGE_DIR
-from .ipc import decode_payload_size
-from .ipc import pickle_recv
-from .ipc import pickle_send
 from . import solver as solver_mod
-from .solver import _REQUIRED_GLIBC
-from .solver import _REQUIRED_GLIBCXX
-from .solver import _clean_worker_env
-from .solver import _find_soname
-from .solver import _resolve_bundled_lib_dir
-from .solver import _safety_core_needs_isaac_c10
-from .solver import build_cri_worker_cmd
-from .solver import discover_glibc_loader
-from .solver import discover_isaac_torch_site
-from .solver import discover_libstdcxx_dir
-from .solver import discover_native_lib_dirs
+from .constants import NUM_CRI_POINTS, PACKAGE_DIR
+from .ipc import decode_payload_size, pickle_recv, pickle_send
+from .solver import (
+    _REQUIRED_GLIBC,
+    _REQUIRED_GLIBCXX,
+    CriSolver,
+    _clean_worker_env,
+    _find_soname,
+    _is_linalg_inv_failure,
+    _resolve_bundled_lib_dir,
+    _safety_core_needs_isaac_c10,
+    build_cri_worker_cmd,
+    discover_glibc_loader,
+    discover_isaac_torch_site,
+    discover_libstdcxx_dir,
+    discover_native_lib_dirs,
+)
 
 
 def _require_bundled_lib_dir() -> Path:
@@ -94,7 +96,9 @@ def test_clean_worker_env_prepends_isaac_torch(tmp_path, monkeypatch):
     (site / "torch" / "lib").mkdir(parents=True)
     (site / "torch" / "__init__.py").write_text("")
     monkeypatch.setattr(solver_mod, "discover_isaac_torch_site", lambda: site)
-    monkeypatch.setattr(solver_mod, "_safety_core_needs_isaac_c10", lambda analysis_dir=None: True)
+    monkeypatch.setattr(
+        solver_mod, "_safety_core_needs_isaac_c10", lambda analysis_dir=None: True
+    )
     monkeypatch.setenv("PYTHONPATH", "/opt/venv/openpi/lib/python3.11/site-packages")
     monkeypatch.setenv("LD_LIBRARY_PATH", "/usr/local/cuda/lib64")
     env = _clean_worker_env()
@@ -148,7 +152,9 @@ def test_clean_worker_env_prepends_libstdcxx(tmp_path, monkeypatch):
     so = tmp_path / "libstdc++.so.6"
     so.write_bytes(b"stub " + _REQUIRED_GLIBCXX.encode())
     monkeypatch.setenv("CRI_LIBSTDCXX_DIR", str(tmp_path))
-    monkeypatch.setattr(solver_mod, "discover_glibc_loader", lambda analysis_dir=None: None)
+    monkeypatch.setattr(
+        solver_mod, "discover_glibc_loader", lambda analysis_dir=None: None
+    )
     monkeypatch.setenv("LD_LIBRARY_PATH", "/usr/local/cuda/lib64")
     env = _clean_worker_env()
     first = env["LD_LIBRARY_PATH"].split(os.pathsep)[0]
@@ -205,7 +211,10 @@ def test_resolve_bundled_lib_prefers_versioned_tree():
         import sys
 
         if sys.version_info[:2] == (3, 11):
-            assert resolved == versioned.resolve() or resolved == (lib_dir / "3.11").resolve()
+            assert (
+                resolved == versioned.resolve()
+                or resolved == (lib_dir / "3.11").resolve()
+            )
 
 
 def test_pickle_roundtrip():
@@ -296,3 +305,70 @@ def test_discover_includes_versioned_lib_trees():
     versioned = lib_dir / "3.11"
     if versioned.is_dir():
         assert versioned.resolve() in dirs
+
+
+_LINALG_INV_ERROR = (
+    "RunSolver_CUDA_CRI_Filter returned empty CRI. Diagnostics:\n"
+    "linalg.inv: The diagonal element 1 is zero, the inversion could not "
+    "be completed because the input matrix is singular."
+)
+
+
+def test_is_linalg_inv_failure_detects_singular_matrix():
+    assert _is_linalg_inv_failure(RuntimeError(_LINALG_INV_ERROR))
+    assert not _is_linalg_inv_failure(RuntimeError("CUDA out of memory"))
+
+
+def _bare_cri_solver(*, batch_size: int = 2) -> CriSolver:
+    import torch
+
+    solver = object.__new__(CriSolver)
+    solver.device = torch.device("cpu")
+    solver.num_joints = 7
+    solver.num_cri_points = NUM_CRI_POINTS
+    solver.batch_size = batch_size
+    solver._remote = None
+    solver._cri_limit = 0.96
+    solver._cbf_alpha = 0.02
+    solver._approach_limit = 0.96 * 0.98
+    solver._filter_enabled = True
+    solver._cri_filter = True
+    return solver
+
+
+class _LinalgInvBoom:
+    def run_cri_filter(self, q, qd):
+        del q, qd
+        raise RuntimeError(_LINALG_INV_ERROR)
+
+
+class _OtherBoom:
+    def run_cri_filter(self, q, qd):
+        del q, qd
+        raise RuntimeError("CUDA out of memory")
+
+
+def test_run_cri_filter_warns_and_passthrough_on_linalg_inv(caplog):
+    import numpy as np
+
+    solver = _bare_cri_solver()
+    solver._solver = _LinalgInvBoom()
+    q = np.zeros((2, 7), dtype=np.float64)
+    qd = np.linspace(0.1, 0.7, 14, dtype=np.float64).reshape(2, 7)
+    with caplog.at_level("WARNING"):
+        result = solver.run_cri_filter(q, qd)
+    assert "linalg.inv failed" in caplog.text
+    np.testing.assert_allclose(result["cri_pre"], np.zeros((2, NUM_CRI_POINTS)))
+    np.testing.assert_allclose(result["qd_cmd"], qd.astype(np.float32))
+    np.testing.assert_allclose(result["delta"], np.zeros((2,), dtype=np.float32))
+
+
+def test_run_cri_filter_reraises_unrelated_native_errors():
+    import numpy as np
+
+    solver = _bare_cri_solver()
+    solver._solver = _OtherBoom()
+    q = np.zeros((1, 7), dtype=np.float64)
+    qd = np.ones((1, 7), dtype=np.float64)
+    with pytest.raises(RuntimeError, match="CUDA out of memory"):
+        solver.run_cri_filter(q, qd)

@@ -71,7 +71,10 @@ class RecordVideo(gym.Wrapper):
             ``max_envs_in_video`` (optional cap; takes first N envs when set),
             ``max_videos`` (optional cap on flushed MP4s; after this many
             writes, later rollouts are not recorded — use for early-train
-            clips without dumping every epoch).
+            clips without dumping every epoch),
+            ``save_trajectory`` (if True, write ``{idx}_traj.npz`` next to
+            the MP4 with per-frame robot / CRI arrays from ``info["traj"]``
+            or obs ``states`` / ``cri``).
         fps: Explicit FPS override. If ``None``, FPS is resolved from
             ``video_cfg.fps``, environment config/metadata, then fallback ``30``.
     """
@@ -111,6 +114,8 @@ class RecordVideo(gym.Wrapper):
         raw_max_videos = self._cfg_get("max_videos", None)
         self._max_videos = None if raw_max_videos is None else max(int(raw_max_videos), 0)
         self._save_camera_stills = bool(self._cfg_get("save_camera_stills", False))
+        self._save_trajectory = bool(self._cfg_get("save_trajectory", False))
+        self._traj_rows: list[dict[str, np.ndarray]] = []
         camera_keys = self._cfg_get("camera_image_keys", None)
         if camera_keys is None:
             self._camera_image_keys = list(self._DEFAULT_CAMERA_STILL_KEYS)
@@ -504,6 +509,81 @@ class RecordVideo(gym.Wrapper):
             if still is not None:
                 self._camera_stills[key] = still
 
+    def _filter_traj_array(self, value: np.ndarray) -> np.ndarray:
+        """Keep the recorded env subset on the batch axis."""
+        arr = np.asarray(value)
+        if self._record_env_ids is None or arr.ndim == 0:
+            return arr
+        env_ids = [i for i in self._record_env_ids if i < arr.shape[0]]
+        if not env_ids:
+            return arr[:1] if arr.shape[0] > 0 else arr
+        return arr[np.asarray(env_ids, dtype=np.int64)]
+
+    def _append_traj_row(self, obs: Any, infos: Any) -> None:
+        """Buffer one per-frame trajectory row for the recorded envs."""
+        if not self._save_trajectory:
+            return
+        row: dict[str, np.ndarray] = {}
+        traj = infos.get("traj") if isinstance(infos, dict) else None
+        if isinstance(traj, dict):
+            for key, value in traj.items():
+                if value is None:
+                    continue
+                row[str(key)] = self._filter_traj_array(self._to_numpy(value))
+        elif isinstance(obs, dict):
+            for key in ("states", "cri", "joint_vel"):
+                if obs.get(key) is None:
+                    continue
+                row[key] = self._filter_traj_array(self._to_numpy(obs[key]))
+        if row:
+            self._traj_rows.append(row)
+
+    def _capture_trajectory(self, obs: Any, infos: Any) -> None:
+        """Collect trajectory rows aligned with the frames extracted from obs."""
+        if not self._save_trajectory:
+            return
+        if isinstance(obs, (list, tuple)):
+            for time_idx, item in enumerate(obs):
+                if item is None:
+                    continue
+                step_info = None
+                if isinstance(infos, (list, tuple)):
+                    if time_idx < len(infos):
+                        step_info = infos[time_idx]
+                else:
+                    step_info = infos
+                self._append_traj_row(item, step_info)
+            return
+        self._append_traj_row(obs, infos)
+
+    def _save_trajectory_npz(self, output_dir: str, video_idx: int) -> None:
+        """Write buffered trajectory rows next to the MP4 (``{idx}_traj.npz``)."""
+        rows = self._traj_rows
+        self._traj_rows = []
+        if not self._save_trajectory or not rows:
+            return
+        payload: dict[str, np.ndarray] = {}
+        keys = sorted({key for row in rows for key in row})
+        for key in keys:
+            template = next(row[key] for row in rows if key in row)
+            fill = np.full_like(template, np.nan, dtype=np.float32)
+            stacked = []
+            for row in rows:
+                if key in row:
+                    stacked.append(np.asarray(row[key], dtype=np.float32))
+                else:
+                    stacked.append(fill)
+            payload[key] = np.stack(stacked, axis=0)
+        if self._record_env_ids is not None:
+            payload["env_ids"] = np.asarray(self._record_env_ids, dtype=np.int32)
+        payload["fps"] = np.int32(self._fps)
+        os.makedirs(output_dir, exist_ok=True)
+        npz_path = os.path.join(output_dir, f"{video_idx}_traj.npz")
+        try:
+            np.savez_compressed(npz_path, **payload)
+        except Exception as exc:
+            warnings.warn(f"Failed to save trajectory {npz_path}: {exc}")
+
     def _save_camera_still_images(self, output_dir: str, video_idx: int) -> None:
         """Write buffered camera stills next to the MP4 (``{idx}_{key}.png``)."""
         if not self._save_camera_stills or not self._camera_stills:
@@ -530,6 +610,7 @@ class RecordVideo(gym.Wrapper):
         if not self._recording_active():
             return
         self._capture_camera_stills(obs)
+        self._capture_trajectory(obs, infos)
         frames = self._extract_frame_batches(obs)
         if not frames:
             warnings.warn(
@@ -594,6 +675,7 @@ class RecordVideo(gym.Wrapper):
 
             final_obs = None
             last_info = None
+            final_info = None
             if isinstance(infos_list, (list, tuple)) and len(infos_list) > 0:
                 last_info = infos_list[-1]
                 if isinstance(last_info, dict):
@@ -601,6 +683,8 @@ class RecordVideo(gym.Wrapper):
                         final_obs = last_info["final_obs"]
                     elif last_info.get("final_observation") is not None:
                         final_obs = last_info["final_observation"]
+                    if last_info.get("final_info") is not None:
+                        final_info = last_info["final_info"]
 
             if (
                 final_obs is not None
@@ -615,8 +699,10 @@ class RecordVideo(gym.Wrapper):
                     if isinstance(infos_list, (list, tuple))
                     else infos_list
                 )
+                if final_info is not None and isinstance(infos_main, list):
+                    infos_main[-1] = final_info
                 self.add_new_frames(obs_main, infos_main, rewards, terminations)
-                self.add_new_frames(reset_obs, None)
+                self.add_new_frames(reset_obs, last_info if isinstance(last_info, dict) else None)
             else:
                 self.add_new_frames(obs_list, infos_list, rewards, terminations)
 
@@ -637,7 +723,11 @@ class RecordVideo(gym.Wrapper):
         handler is run under Ray actor shutdown either). Without this wait,
         eval videos end at ``mdat`` and no player can open them.
         """
-        if not self.render_images and not self._camera_stills:
+        if (
+            not self.render_images
+            and not self._camera_stills
+            and not self._traj_rows
+        ):
             return
 
         output_dir = os.path.join(
@@ -649,6 +739,7 @@ class RecordVideo(gym.Wrapper):
         os.makedirs(output_dir, exist_ok=True)
         video_idx = self.video_cnt
         self._save_camera_still_images(output_dir, video_idx)
+        self._save_trajectory_npz(output_dir, video_idx)
         if not self.render_images:
             self.video_cnt += 1
             return

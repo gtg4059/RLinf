@@ -104,6 +104,58 @@ def test_flush_video_writes_under_step_subdir(tmp_path, monkeypatch):
     assert "seed_0" in written[0]
 
 
+def test_flush_video_writes_traj_npz(tmp_path, monkeypatch):
+    written: list[str] = []
+
+    def _fake_save(self, frames, mp4_path):
+        written.append(mp4_path)
+
+    monkeypatch.setattr(RecordVideo, "_save_video", _fake_save)
+    cfg = _VideoCfg(str(tmp_path), max_videos=2)
+    cfg.save_trajectory = True
+    env = RecordVideo(_DummyEnv(), cfg, fps=5)
+    env.add_new_frames(
+        {"main_images": np.zeros((2, 8, 8, 3), dtype=np.uint8)},
+        {
+            "traj": {
+                "q": np.arange(14, dtype=np.float32).reshape(2, 7),
+                "cri": np.linspace(0.0, 1.0, 18, dtype=np.float32).reshape(2, 9),
+                "cri_max": np.array([0.4, 0.8], dtype=np.float32),
+            }
+        },
+    )
+    env.flush_video(video_sub_dir="step_20")
+    assert len(written) == 1
+    npz_path = tmp_path / "seed_0" / "step_20" / "0_traj.npz"
+    assert npz_path.is_file()
+    payload = np.load(npz_path)
+    assert payload["q"].shape == (1, 1, 7)
+    assert payload["cri"].shape == (1, 1, 9)
+    assert payload["cri_max"].shape == (1, 1)
+    assert payload["env_ids"].tolist() == [0]
+
+
+def test_max_videos_also_stops_trajectory(tmp_path, monkeypatch):
+    monkeypatch.setattr(RecordVideo, "_save_video", lambda *args, **kwargs: None)
+    cfg = _VideoCfg(str(tmp_path), max_videos=1)
+    cfg.save_trajectory = True
+    env = RecordVideo(_DummyEnv(), cfg, fps=5)
+    env.add_new_frames(
+        {"main_images": np.zeros((1, 8, 8, 3), dtype=np.uint8)},
+        {"traj": {"q": np.zeros((1, 7), dtype=np.float32)}},
+    )
+    env.flush_video()
+    env.add_new_frames(
+        {"main_images": np.full((1, 8, 8, 3), 9, dtype=np.uint8)},
+        {"traj": {"q": np.ones((1, 7), dtype=np.float32)}},
+    )
+    env.flush_video()
+    first = tmp_path / "seed_0" / "0_traj.npz"
+    second = tmp_path / "seed_0" / "1_traj.npz"
+    assert first.is_file()
+    assert not second.exists()
+
+
 def test_video_cfg_namespace_without_get(tmp_path):
     cfg = SimpleNamespace(
         video_base_dir=str(tmp_path),

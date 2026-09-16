@@ -48,6 +48,14 @@ ISAACLAB_DECIMATION: int = 4
 ISAACLAB_SIM_DT: float = DROID_CONTROL_DT / ISAACLAB_DECIMATION
 ISAACLAB_STEP_DT: float = ISAACLAB_SIM_DT * ISAACLAB_DECIMATION
 
+# Hard CRI OVF termination: one-shot penalty on violation step.
+# Matches success RewTerm(weight=1.0) * ISAACLAB_STEP_DT, scaled by 1/3.
+CRI_OVF_TERM_PENALTY: float = -ISAACLAB_STEP_DT / 3.0
+
+# Per-step living cost until the first RLinf-cycle success.
+# 30 steps saved ≈ success reward / 3.
+TIME_PENALTY_WEIGHT: float = -ISAACLAB_STEP_DT / 100.0
+
 # IsaacLab articulation_data._store_cri_output_buffers
 CRI_CLAMP_MIN: float = 0.0
 CRI_CLAMP_MAX: float = 2.0

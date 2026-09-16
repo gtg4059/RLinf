@@ -82,6 +82,7 @@ from rlinf.utils.utils import (
     compute_logprobs_from_logits,
     cpu_weight_swap,
     get_loss_agg_func,
+    mask_after_first_done,
     masked_mean,
     reshape_entropy,
     retrieve_model_state_dict_in_cpu,
@@ -1228,9 +1229,12 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         rollout_epoch = self.cfg.env.train.rollout_epoch
         rollout_batch = process_nested_dict_for_adv(rollout_batch, rollout_epoch)
 
-        if (
-            not self.cfg.env.train.auto_reset
-            and not self.cfg.env.train.ignore_terminations
+        if mask_after_first_done(
+            auto_reset=bool(self.cfg.env.train.auto_reset),
+            ignore_terminations=bool(self.cfg.env.train.ignore_terminations),
+            hold_after_done=bool(
+                self.cfg.env.train.get("init_params", {}).get("hold_after_done", False)
+            ),
         ):
             dones = rollout_batch[
                 "dones"
@@ -1704,8 +1708,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             loss = self._train_sft_epoch(metrics_data, loss)
 
         loss /= self.gradient_accumulation
+        if not loss.requires_grad:
+            # Critic-warmup freeze + actor-only loss: no graph. Attach a zero
+            # hook so FSDP backward still runs (value head gets a 0 grad).
+            for param in self.model.parameters():
+                if param.requires_grad:
+                    loss = loss + param.reshape(-1)[0] * 0.0
+                    break
         with backward_ctx:
-            self.grad_scaler.scale(loss).backward()
+            if loss.requires_grad:
+                self.grad_scaler.scale(loss).backward()
 
         metrics_data["actor/total_loss"] = loss.detach().item()
         append_to_dict(metrics, metrics_data)

@@ -1,0 +1,387 @@
+--- git commit ---
+4c5c41c173bf71e3cacdfe516e1d8e5ac6df6cab
+
+
+--- git status ---
+On branch CRI_Export
+Your branch is up to date with 'origin/CRI_Export'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/cri_reach_env_cfg.py
+	modified:   source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/mdp/curriculums.py
+	modified:   source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/mdp/rewards.py
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/cri_reach_env_cfg.py b/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/cri_reach_env_cfg.py
+index 807b5785b..90dd2e915 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/cri_reach_env_cfg.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/cri_reach_env_cfg.py
+@@ -29,12 +29,6 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
+ 
+ import isaaclab_tasks.manager_based.manipulation.reach.mdp as mdp
+ 
+-# CRI OVF curriculum schedule (env steps; 1 PPO iter = 48 steps).
+-# CRI_OVF_REWARD_START = 48 * 12000
+-# CRI_OVF_CROSSFADE_START = 48 * 20000
+-# REACH_SUCCESS_CRITERIA_START = 48 * 00000
+-# REACH_CRITERIA_RAMP_STEPS = 48 * 40000
+-
+ @configclass
+ class CRIReachSceneCfg(InteractiveSceneCfg):
+     """Scene for CRI reach training."""
+@@ -152,25 +146,29 @@ class CRIRewardsCfg:
+     )
+     end_effector_pos_orientation_tracking_fine_grained = RewTerm(
+         func=mdp.position_orientation_command_error_fine_grained,
+-        weight=0.5,
++        weight=1.0,
+         params={"asset_cfg": SceneEntityCfg("robot", body_names="ee_link"), "command_name": "ee_pose"},
+     )
+-    # 4 cm cutoff; pose 1/e at the 2 cm hold gate. Inside the cutoff, low
+-    # lin/ang vel (1/e at 2x the 0.02 m/s and 0.02 rad/s gates) raises the term.
+-    # still_mix=0.5 keeps a pose-only floor. No acceleration kernel.
+-    end_effector_pos_orientation_tracking_last_centimeter = RewTerm(
+-        func=mdp.position_orientation_command_error_last_centimeter,
+-        weight=2.0,
+-        params={
+-            "asset_cfg": SceneEntityCfg("robot", body_names="ee_link"),
+-            "command_name": "ee_pose",
+-            "pos_scale": 50.0,
+-            "pos_cutoff": 0.04,
+-            "lin_vel_scale": 25.0,
+-            "ang_vel_scale": 25.0,
+-            "still_mix": 0.5,
+-        },
+-    )
++    # 4 cm basin, 2 cm hold. Outside the hold, a small pose floor (0.15)
++    # pulls 3 cm parks inward; closing adds the rest. Inside the hold,
++    # 80% of the term needs stillness. Pose 1/e at 2 cm. Approach
++    # saturates at 3 cm/s. Vel 1/e at the 0.02 gates.
++    # end_effector_pos_orientation_tracking_last_centimeter = RewTerm(
++    #     func=mdp.position_orientation_command_error_last_centimeter,
++    #     weight=2.0,
++    #     params={
++    #         "asset_cfg": SceneEntityCfg("robot", body_names="ee_link"),
++    #         "command_name": "ee_pose",
++    #         "pos_scale": 50.0,
++    #         "pos_cutoff": 0.04,
++    #         "still_cutoff": 0.02,
++    #         "lin_vel_scale": 50.0,
++    #         "ang_vel_scale": 50.0,
++    #         "still_mix": 0.2,
++    #         "approach_vel": 0.03,
++    #         "approach_floor": 0.15,
++    #     },
++    # )
+     # OVF only (time_out is time_out=True; reach no longer terminates).
+     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-600.0)
+     action_rate = RewTerm(func=mdp.action_rate_l2_clamped, weight=-0.1)
+@@ -190,20 +188,18 @@ class CRIRewardsCfg:
+     is_alive = RewTerm(
+         func=mdp.is_alive_time_ramp,
+         weight=-1.0,
+-        params={"ramp_start_s": 8.0, "ramp_end_s": 16.0, "initial": 0.2, "final": 1.0},
++        params={"ramp_start_s": 8.0, "ramp_end_s": 16.0, "initial": 0.2, "final": 0.2},
+     )
+-    # Off until timeout_no_reach_weight @ iter 24000. time_out term only
+-    # (reach_success is time_out=True and is not penalized).
+-    timeout_no_reach = RewTerm(
+-        func=mdp.timeout_no_reach_penalty,
+-        weight=-200.0,
+-        params={"reward_term_name": "reach_success_bonus"},
+-    )
+-    # Square payments 1, 4, 9 on the first streak only (re-entry pays 0).
+-    # The 4th hold pays 4^2 = 16 once and ends the episode.
++    # time_out term only (reach_success is time_out=True and is not penalized).
++    # timeout_no_reach = RewTerm(
++    #     func=mdp.timeout_no_reach_penalty,
++    #     weight=-200.0,
++    #     params={"reward_term_name": "reach_success_bonus"},
++    # )
++    # 1-hold pays hold_step_bonus (0.1 → applied 4). 2-hold pays 1 (applied 40).
+     reach_success_bonus = RewTerm(
+         func=mdp.ReachSuccessCriteria,
+-        weight=30.0,
++        weight=600.0,
+         params={
+             "command_name": "ee_pose",
+             "asset_cfg": SceneEntityCfg("robot", body_names="ee_link"),
+@@ -213,24 +209,28 @@ class CRIRewardsCfg:
+             "max_angle_rad": 0.1,
+             "max_lin_vel": 0.02,
+             "max_ang_vel": 0.02,
+-            "hold_square_max": 4,
++            "hold_square_max": 2,
++            "hold_step_bonus": 0.1,
+         },
+     )
+ 
+ 
+ @configclass
+ class CRICurriculumCfg:
+-    # reach_success_criteria = CurrTerm(
+-    #     func=mdp.reach_success_criteria_curriculum,
+-    #     params={
+-    #         "ease_factor": 3.0,
+-    #         "start_step": REACH_SUCCESS_CRITERIA_START,
+-    #         "num_steps": REACH_CRITERIA_RAMP_STEPS,
+-    #         "reward_term_names": ["reach_success_bonus"],
+-    #         # Thresholds live on reward terms; terminations.reach_success reads them from there.
+-    #         "event_term_name": None,
+-    #     },
+-    # )
++    # Hold 4x pose/vel gates until 12000, then power cooling with alpha>1:
++    # steep early, shallow late (opposite of PCCL alpha=0.8).
++    # terminations.reach_success reads these params.
++    reach_success_criteria = CurrTerm(
++        func=mdp.reach_success_criteria_curriculum,
++        params={
++            "ease_factor": 4.0,
++            "decay_alpha": 2.0,
++            "start_step": 48 * 12000,
++            "num_steps": 48 * 6000,
++            "reward_term_names": ["reach_success_bonus"],
++            "event_term_name": None,
++        },
++    )
+     # Phase 1: fine-grained pulls into the 3 cm basin; timeout penalty stays 0 so
+     # the only sparse target is reach_success_bonus. Phase 2: drop the sit subsidy
+     # and turn on timeout (1/2 of OVF -600) so lingering at the goal is not free.
+@@ -355,7 +355,7 @@ class CRICurriculumCfg:
+     #         "address": "rewards.is_alive.weight",
+     #         "modify_fn": mdp.termination_penalty_weight_by_step,
+     #         "modify_params": {
+-    #             "switch_step": 48 * 18000,
++    #             "switch_step": 48 * 12000,
+     #             "initial_weight": -0.2,
+     #             "final_weight": -1.0,
+     #         },
+@@ -404,7 +404,7 @@ class CRICurriculumCfg:
+             "address": "terminations.OVF.params.threshold",
+             "modify_fn": mdp.cri_ovf_threshold_by_step,
+             "modify_params": {
+-                "crossfade_start": 48 * 8000,
++                "crossfade_start": 48 * 6000,
+                 "threshold_initial": 2.0,
+                 "threshold_final": 0.96,
+             },
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/mdp/curriculums.py b/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/mdp/curriculums.py
+index e2050a1fd..5c8d75c89 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/mdp/curriculums.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/mdp/curriculums.py
+@@ -42,7 +42,9 @@ class reach_success_criteria_curriculum(ManagerTermBase):
+     Reward/event term configs hold the **final** (strictest) thresholds. This curriculum starts from
+     relaxed values (``ease_factor`` times final).
+ 
+-    * Default: linear ``ease_factor → 1`` over ``num_steps`` after ``start_step``.
++    * Default: ``ease_factor → 1`` over ``num_steps`` after ``start_step``.
++      ``decay_alpha=1`` is linear; ``decay_alpha=0.8`` is PCCL power cooling
++      (slower at first, then faster toward the final gates).
+     * Piecewise (when ``mid_factor`` is set): ``ease_factor → mid_factor`` over ``num_steps``,
+       hold ``mid_factor`` for ``hold_steps``, then ``mid_factor → 1`` over ``num_steps_final``.
+ 
+@@ -67,7 +69,8 @@ class reach_success_criteria_curriculum(ManagerTermBase):
+         )
+ 
+         primary_cfg = self._reward_term_cfgs[self._reward_term_names[0]]
+-        self._final_params = {key: primary_cfg.params[key] for key in _REACH_CRITERIA_PARAM_KEYS}
++        self._param_keys = tuple(key for key in _REACH_CRITERIA_PARAM_KEYS if key in primary_cfg.params)
++        self._final_params = {key: primary_cfg.params[key] for key in self._param_keys}
+         self._ease_factor = cfg.params.get("ease_factor", 5.0)
+         self._mid_factor = cfg.params.get("mid_factor")
+         initial_override = cfg.params.get("initial_params")
+@@ -88,37 +91,38 @@ class reach_success_criteria_curriculum(ManagerTermBase):
+         self._num_steps = cfg.params["num_steps"]
+         self._hold_steps = cfg.params.get("hold_steps", 0)
+         self._num_steps_final = cfg.params.get("num_steps_final", self._num_steps)
++        self._decay_alpha = float(cfg.params.get("decay_alpha", 1.0))
+         self._last_params_key: tuple[float, ...] | None = None
+ 
+         self._apply_params(self._initial_params)
+ 
+-    def _lerp(self, start: dict[str, float], end: dict[str, float], progress: float) -> dict[str, float]:
+-        return {key: start[key] + progress * (end[key] - start[key]) for key in _REACH_CRITERIA_PARAM_KEYS}
++    def _blend(self, start: dict[str, float], end: dict[str, float], k: int, span: int) -> dict[str, float]:
++        """PCCL cooling: ``end + ((span-k)/span)**alpha * (start-end)``. ``alpha=1`` is linear."""
++        remaining = max(span - max(k, 0), 0) / max(span, 1)
++        weight = remaining ** self._decay_alpha
++        return {key: end[key] + weight * (start[key] - end[key]) for key in self._param_keys}
+ 
+     def _interpolate_params(self, step: int) -> dict[str, float]:
+         if step < self._start_step:
+             return dict(self._initial_params)
+ 
+         if self._mid_params is None:
+-            progress = min(1.0, (step - self._start_step) / max(self._num_steps, 1))
+-            return self._lerp(self._initial_params, self._final_params, progress)
++            return self._blend(self._initial_params, self._final_params, step - self._start_step, self._num_steps)
+ 
+         first_end = self._start_step + self._num_steps
+         hold_end = first_end + self._hold_steps
+         second_end = hold_end + self._num_steps_final
+ 
+         if step < first_end:
+-            progress = min(1.0, (step - self._start_step) / max(self._num_steps, 1))
+-            return self._lerp(self._initial_params, self._mid_params, progress)
++            return self._blend(self._initial_params, self._mid_params, step - self._start_step, self._num_steps)
+         if step < hold_end:
+             return dict(self._mid_params)
+         if step < second_end:
+-            progress = min(1.0, (step - hold_end) / max(self._num_steps_final, 1))
+-            return self._lerp(self._mid_params, self._final_params, progress)
++            return self._blend(self._mid_params, self._final_params, step - hold_end, self._num_steps_final)
+         return dict(self._final_params)
+ 
+     def _apply_params(self, params: dict[str, float]) -> None:
+-        params_key = tuple(round(params[key], 8) for key in _REACH_CRITERIA_PARAM_KEYS)
++        params_key = tuple(round(params[key], 8) for key in self._param_keys)
+         if params_key == self._last_params_key:
+             return
+ 
+@@ -148,6 +152,7 @@ class reach_success_criteria_curriculum(ManagerTermBase):
+         mid_factor: float | None = None,
+         hold_steps: int = 0,
+         num_steps_final: int | None = None,
++        decay_alpha: float = 1.0,
+     ) -> dict[str, float]:
+         params = self._interpolate_params(env.common_step_counter)
+         self._apply_params(params)
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/mdp/rewards.py b/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/mdp/rewards.py
+index 54f569d0c..4a10fcaf3 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/mdp/rewards.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/mdp/rewards.py
+@@ -87,12 +87,8 @@ class ReachSuccessCriteria(ManagerTermBase):
+     ``max_distance`` over ``pos_ramp_steps``. Until ``vel_switch_step``,
+     velocity/acceleration are ignored.
+ 
+-    Each in-gate step before success pays ``count^2`` (1, 4, 9) on the
+-    **first streak only**. Leaving the gate ends increment pay for the
+-    rest of the episode, so 1-4-9 cannot be farmed by re-entering.
+-
+-    The success step pays ``hold^2`` once (4 → 16), even if the first
+-    streak already ended. Timeout keeps only the increments already paid.
++    Intermediate holds pay ``hold_step_bonus``. The success step returns 1
++    so the applied bonus is ``weight * dt``. Timeout pays 0.
+ 
+     :meth:`compute_success` is True when the consecutive count reaches
+     ``hold_steps``, or ``hold_square_max`` if ``hold_steps`` is 0.
+@@ -102,7 +98,6 @@ class ReachSuccessCriteria(ManagerTermBase):
+     def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+         super().__init__(cfg, env)
+         self._hold_count = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+-        self._left_after_hold = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+         self._last_success = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+         self._last_shaped = torch.zeros(env.num_envs, dtype=torch.float, device=env.device)
+         self._updated_step = -1
+@@ -111,12 +106,10 @@ class ReachSuccessCriteria(ManagerTermBase):
+     def reset(self, env_ids: Sequence[int] | None = None) -> None:
+         if env_ids is None or isinstance(env_ids, slice):
+             self._hold_count.zero_()
+-            self._left_after_hold.zero_()
+             self._last_success.zero_()
+             self._last_shaped.zero_()
+             return
+         self._hold_count[env_ids] = 0
+-        self._left_after_hold[env_ids] = False
+         self._last_success[env_ids] = False
+         self._last_shaped[env_ids] = 0.0
+ 
+@@ -197,8 +190,6 @@ class ReachSuccessCriteria(ManagerTermBase):
+             max_ang_acc=ang_acc,
+             command_b=command_b,
+         )
+-        left = (~instant) & (self._hold_count > 0)
+-        self._left_after_hold |= left
+         self._hold_count[:] = torch.where(instant, self._hold_count + 1, torch.zeros_like(self._hold_count))
+         if hold > 0:
+             self._last_success[:] = self._hold_count >= hold
+@@ -223,6 +214,7 @@ class ReachSuccessCriteria(ManagerTermBase):
+         pos_ease_factor: float = 3.0,
+         hold_steps: int = 0,
+         hold_square_max: int = 10,
++        hold_step_bonus: float = 0.1,
+     ) -> torch.Tensor:
+         self.compute_success(
+             env,
+@@ -247,14 +239,12 @@ class ReachSuccessCriteria(ManagerTermBase):
+         hold = max(int(hold_steps), 0)
+         if hold <= 0:
+             hold = max(int(hold_square_max), 1)
+-        # 1, 4, 9 on the first streak; hold^2 once on the success step.
+-        squares = count.to(dtype=self._last_shaped.dtype).square()
+         increment = torch.where(
+-            (count > 0) & (count < hold) & ~self._left_after_hold,
+-            squares,
++            (count > 0) & (count < hold),
++            torch.full_like(self._last_shaped, float(hold_step_bonus)),
+             torch.zeros_like(self._last_shaped),
+         )
+-        success = torch.where(count == hold, squares, torch.zeros_like(self._last_shaped))
++        success = torch.where(count == hold, torch.ones_like(self._last_shaped), torch.zeros_like(self._last_shaped))
+         self._last_shaped[:] = increment + success
+         self._rewarded_step = env.common_step_counter
+         return self._last_shaped
+@@ -433,16 +423,20 @@ def position_orientation_command_error_last_centimeter(
+     pos_scale: float = 50.0,
+     ori_scale: float = 8.0,
+     pos_cutoff: float = 0.04,
++    still_cutoff: float = 0.02,
+     lin_vel_scale: float = 25.0,
+     ang_vel_scale: float = 25.0,
+     still_mix: float = 0.5,
++    approach_vel: float = 0.05,
++    approach_floor: float = 0.15,
+ ) -> torch.Tensor:
+-    """Last-centimeter basin with a near-target still bonus. Zero outside ``pos_cutoff``.
++    """Last-centimeter basin: pull into the hold, still inside it.
+ 
+-    Pose kernel: ``pos_scale=50`` is 1/e at the 2 cm hold gate. Cutoff is 4 cm.
+-    Linear and angular velocity kernels are 1/e at 2x the hold gates (0.04 m/s,
+-    0.04 rad/s). ``still_mix`` keeps a pose-only floor so a fast approach still
+-    gets last-cm pull; 1.0 is fully settled. No acceleration term.
++    Zero outside ``pos_cutoff``. Between ``still_cutoff`` and ``pos_cutoff``
++    the kernel is ``pose * (approach_floor + (1-floor)*approach)`` so a parked
++    pose at 3 cm still has a small gradient into 2 cm, while closing pays more.
++    Inside ``still_cutoff`` it is ``pose * (still_mix + (1-still_mix)*still)``.
++    ``pos_scale=50`` is 1/e at 2 cm. Vel scales of 50 are 1/e at the 0.02 gates.
+     """
+     asset: RigidObject = env.scene[asset_cfg.name]
+     command = env.command_manager.get_command(command_name)
+@@ -452,17 +446,29 @@ def position_orientation_command_error_last_centimeter(
+     des_pos_w, _ = combine_frame_transforms(origin_pos_w, origin_quat_w, des_pos_b)
+     bid = _body_idx_single(env, asset_cfg)
+     curr_pos_w = asset.data.body_pos_w[:, bid]
+-    distance = torch.norm(curr_pos_w - des_pos_w, dim=1)
++    offset = curr_pos_w - des_pos_w
++    distance = torch.norm(offset, dim=1)
+ 
+     des_quat_b = command[:, 3:7]
+     des_quat_w = quat_mul(origin_quat_w, des_quat_b)
+     curr_quat_w = asset.data.body_quat_w[:, bid]
+     pose = torch.exp(-pos_scale * distance) * torch.exp(-ori_scale * quat_error_magnitude(curr_quat_w, des_quat_w))
+-    lin_spd = torch.norm(asset.data.body_lin_vel_w[:, bid, :], dim=-1)
++    lin_vel = asset.data.body_lin_vel_w[:, bid, :]
++    lin_spd = torch.norm(lin_vel, dim=-1)
+     ang_spd = torch.norm(asset.data.body_ang_vel_w[:, bid, :], dim=-1)
+     still = torch.exp(-lin_vel_scale * lin_spd) * torch.exp(-ang_vel_scale * ang_spd)
+     mix = min(max(float(still_mix), 0.0), 1.0)
+-    kernel = pose * (mix + (1.0 - mix) * still)
++    still_kernel = pose * (mix + (1.0 - mix) * still)
++
++    radial = offset / distance.clamp(min=1e-6).unsqueeze(-1)
++    closing = -(lin_vel * radial).sum(dim=-1)
++    ref = max(float(approach_vel), 1e-6)
++    approach = (closing / ref).clamp(min=0.0, max=1.0)
++    floor = min(max(float(approach_floor), 0.0), 1.0)
++    approach_kernel = pose * (floor + (1.0 - floor) * approach)
++
++    in_hold = distance < still_cutoff
++    kernel = torch.where(in_hold, still_kernel, approach_kernel)
+     return torch.where(distance < pos_cutoff, kernel, torch.zeros_like(kernel))
+ 
+ 

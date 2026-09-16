@@ -1453,6 +1453,9 @@ class EnvWorker(Worker):
             group_size=self.cfg.algorithm.group_size,
             rewards_lower_bound=self.cfg.algorithm.get("rewards_lower_bound", None),
             rewards_upper_bound=self.cfg.algorithm.get("rewards_upper_bound", None),
+            hold_after_done=bool(
+                self.cfg.env.train.get("init_params", {}).get("hold_after_done", False)
+            ),
         )
         return self.compute_advantages_and_returns(batch)
 

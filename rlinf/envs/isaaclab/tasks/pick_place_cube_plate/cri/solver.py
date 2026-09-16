@@ -41,6 +41,12 @@ from .postprocess import apply_cri_zero_vel_filter, clamp_cri
 
 logger = logging.getLogger(__name__)
 
+
+def _is_linalg_inv_failure(exc: BaseException) -> bool:
+    """True when SafetyCore ``CalculateLoop_T`` hits a singular ``linalg.inv``."""
+    text = f"{exc}"
+    return "linalg.inv" in text or "input matrix is singular" in text.lower()
+
 # Native deps that ``import`` cannot see unless they are already mapped.
 # Changing ``LD_LIBRARY_PATH`` after process start does not help on Linux.
 _PRELOAD_SONAMES = (
@@ -966,6 +972,27 @@ class CriSolver:
             return cri
         return cri.detach().cpu().numpy().astype(np.float32, copy=False)
 
+    def _passthrough_cri_filter(
+        self, qd: np.ndarray | torch.Tensor, batch: int
+    ) -> dict[str, Any]:
+        """Return zero CRI and the requested ``qd`` when the native filter fails."""
+        qd_rl = np.asarray(
+            qd.detach().cpu() if isinstance(qd, torch.Tensor) else qd,
+            dtype=np.float32,
+        )
+        if qd_rl.ndim == 1:
+            qd_rl = qd_rl[None, :]
+        qd_rl = qd_rl[:batch]
+        return {
+            "cri_pre": np.zeros((batch, self.num_cri_points), dtype=np.float32),
+            "qd_cmd": qd_rl,
+            "delta": np.zeros((batch,), dtype=np.float32),
+            "cri_limit": self._cri_limit,
+            "cbf_alpha": self._cbf_alpha,
+            "approach_limit": self._approach_limit,
+            "enabled": self._filter_enabled,
+        }
+
     def run_cri_filter(
         self,
         q: np.ndarray | torch.Tensor,
@@ -980,11 +1007,31 @@ class CriSolver:
             qd_np = np.asarray(
                 qd.detach().cpu() if isinstance(qd, torch.Tensor) else qd, dtype=np.float64
             )
-            return self._remote.run_cri_filter(q_np, qd_np)
+            try:
+                return self._remote.run_cri_filter(q_np, qd_np)
+            except Exception as exc:
+                if not _is_linalg_inv_failure(exc):
+                    raise
+                logger.warning(
+                    "linalg.inv failed because the input matrix is singular; "
+                    "skipping CRI filter this step."
+                )
+                qd_arr = np.asarray(qd_np)
+                batch = 1 if qd_arr.ndim == 1 else int(qd_arr.shape[0])
+                return self._passthrough_cri_filter(qd_np, batch)
 
         q_in, qd_in, batch = self._pad_batch(q, qd)
-        result = self._solver.run_cri_filter(q_in.contiguous(), qd_in.contiguous())
-        torch.cuda.synchronize(self.device)
+        try:
+            result = self._solver.run_cri_filter(q_in.contiguous(), qd_in.contiguous())
+            torch.cuda.synchronize(self.device)
+        except Exception as exc:
+            if not _is_linalg_inv_failure(exc):
+                raise
+            logger.warning(
+                "linalg.inv failed because the input matrix is singular; "
+                "skipping CRI filter this step."
+            )
+            return self._passthrough_cri_filter(qd_in[:batch], batch)
         if result is None:
             raise RuntimeError("run_cri_filter returned None")
         cri_pre = result.get("cri_pre") if isinstance(result, dict) else None

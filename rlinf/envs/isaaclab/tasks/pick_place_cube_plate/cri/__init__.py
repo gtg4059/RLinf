@@ -28,6 +28,7 @@ from .constants import (
     CRI_CLAMP_MIN,
     CRI_FILTER_LIMIT,
     CRI_OVF_SIGMA,
+    CRI_OVF_TERM_PENALTY,
     CRI_OVF_THRESHOLD,
     CRI_PENALTY_WEIGHT,
     DEFAULT_NUM_JOINTS,
@@ -39,11 +40,25 @@ from .constants import (
     NUM_CRI_OBS_DIM,
     NUM_CRI_POINTS,
     PACKAGE_DIR,
+    TIME_PENALTY_WEIGHT,
 )
 from .filter import abs_joint_to_qd_nom
 from .filter import compute_episode_cri_f
 from .postprocess import apply_cri_zero_vel_filter, clamp_cri
-from .rewards import cri_ovf_exp
+from .rewards import (
+    CRI_OVF_REWARD_KEY,
+    TIME_PENALTY_REWARD_KEY,
+    accumulate_cri_episode_reward,
+    accumulate_time_episode_reward,
+    cri_episode_reward_logs,
+    cri_ovf_exp,
+    cri_ovf_reward,
+    cri_ovf_termination_step_penalty,
+    cri_ovf_violated,
+    time_episode_reward_logs,
+    time_penalty_live_mask,
+    time_step_penalty,
+)
 from .solver import CriSolver, resolve_analysis_dir
 from .velocity import joint_velocity_from_positions
 
@@ -53,6 +68,7 @@ __all__ = [
     "CRI_CLAMP_MIN",
     "CRI_FILTER_LIMIT",
     "CRI_OVF_SIGMA",
+    "CRI_OVF_TERM_PENALTY",
     "CRI_OVF_THRESHOLD",
     "CRI_PENALTY_WEIGHT",
     "DEFAULT_NUM_JOINTS",
@@ -64,13 +80,25 @@ __all__ = [
     "NUM_CRI_OBS_DIM",
     "NUM_CRI_POINTS",
     "PACKAGE_DIR",
+    "TIME_PENALTY_WEIGHT",
+    "TIME_PENALTY_REWARD_KEY",
     "CriSolver",
     "abs_joint_to_qd_nom",
     "apply_cri_zero_vel_filter",
     "clamp_cri",
     "compute_cri",
     "compute_episode_cri_f",
+    "CRI_OVF_REWARD_KEY",
+    "accumulate_cri_episode_reward",
+    "accumulate_time_episode_reward",
+    "cri_episode_reward_logs",
     "cri_ovf_exp",
+    "cri_ovf_reward",
+    "cri_ovf_termination_step_penalty",
+    "cri_ovf_violated",
     "joint_velocity_from_positions",
+    "time_episode_reward_logs",
+    "time_penalty_live_mask",
+    "time_step_penalty",
     "resolve_analysis_dir",
 ]

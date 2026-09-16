@@ -1,0 +1,452 @@
+--- git commit ---
+c4c50cdc342a97f8083d0b9bcadc934edaf719a2
+
+
+--- git status ---
+On branch CRI_Export
+Your branch is up to date with 'origin/CRI_Export'.
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   scripts/reinforcement_learning/rsl_rl/play_reach_csv.py
+	modified:   scripts/reinforcement_learning/rsl_rl/reach_traj_csv_utils.py
+	modified:   source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/cri_reach_env_cfg.py
+	modified:   source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/mdp/rewards.py
+
+no changes added to commit (use "git add" and/or "git commit -a") 
+
+
+--- git diff ---
+diff --git a/scripts/reinforcement_learning/rsl_rl/play_reach_csv.py b/scripts/reinforcement_learning/rsl_rl/play_reach_csv.py
+index 7daa8d086..012002208 100644
+--- a/scripts/reinforcement_learning/rsl_rl/play_reach_csv.py
++++ b/scripts/reinforcement_learning/rsl_rl/play_reach_csv.py
+@@ -163,6 +163,13 @@ parser.add_argument(
+     default=False,
+     help="Disable OVF termination so attempts can run to timeout (PLAY defaults to CRI 0.96).",
+ )
++parser.add_argument(
++    "--hold_square_max",
++    type=int,
++    default=None,
++    help="Override reach_success_bonus hold_square_max (e.g. 1 = first in-gate step is success). "
++    "Default keeps the env cfg value.",
++)
+ cli_args.add_rsl_rl_args(parser)
+ AppLauncher.add_app_launcher_args(parser)
+ args_cli, hydra_args = parser.parse_known_args()
+@@ -189,9 +196,13 @@ from isaaclab.envs import (
+     ManagerBasedRLEnvCfg,
+     multi_agent_to_single_agent,
+ )
++from isaaclab.managers import SceneEntityCfg
+ from isaaclab.utils.assets import retrieve_file_path
+ from isaaclab.utils.dict import print_dict
++from isaaclab.utils.math import combine_frame_transforms, quat_error_magnitude, quat_mul
+ from isaaclab.utils.seed import configure_seed
++from isaaclab_tasks.manager_based.manipulation.reach.mdp.observations import command_origin_pose_w
++from isaaclab_tasks.manager_based.manipulation.reach.mdp.rewards import _body_idx_single
+ 
+ 
+ def _configure_eval_rng(seed: int) -> None:
+@@ -215,6 +226,36 @@ import reach_traj_csv_utils as csv_utils
+ installed_version = metadata.version("rsl-rl-lib")
+ 
+ 
++def _ee_tracking(base_env: ManagerBasedRLEnv, command: torch.Tensor) -> tuple[torch.Tensor, ...]:
++    asset_cfg = SceneEntityCfg("robot", body_names="ee_link")
++    asset_cfg.resolve(base_env.scene)
++    asset = base_env.scene[asset_cfg.name]
++    bid = _body_idx_single(base_env, asset_cfg)
++    origin_pos_w, origin_quat_w = command_origin_pose_w(base_env, "ee_pose", asset)
++    des_pos_w, _ = combine_frame_transforms(origin_pos_w, origin_quat_w, command[:, :3])
++    pos_err = torch.norm(asset.data.body_pos_w[:, bid] - des_pos_w, dim=1)
++    des_quat_w = quat_mul(origin_quat_w, command[:, 3:7])
++    ang_err = quat_error_magnitude(asset.data.body_quat_w[:, bid], des_quat_w)
++    lin_vel = torch.norm(asset.data.body_lin_vel_w[:, bid, :], dim=-1)
++    ang_vel = torch.norm(asset.data.body_ang_vel_w[:, bid, :], dim=-1)
++    cri = torch.max(asset.data.CRI, dim=1).values
++    return pos_err, ang_err, lin_vel, ang_vel, cri
++
++
++def _attempt_extras(i: int, *bufs: torch.Tensor) -> dict[str, float]:
++    keys = (
++        "min_pos_err",
++        "min_ang_err",
++        "last_pos_err",
++        "last_ang_err",
++        "last_lin_vel",
++        "last_ang_vel",
++        "max_cri",
++        "last_cri",
++    )
++    return {key: float(buf[i].item()) for key, buf in zip(keys, bufs)}
++
++
+ def _parse_eval_seeds(default_seed: int) -> list[int]:
+     if args_cli.seeds is not None:
+         parts = [p.strip() for p in args_cli.seeds.split(",") if p.strip() != ""]
+@@ -302,6 +343,14 @@ def _run_one_shot_eval(
+                     log_active = torch.ones(base_env.num_envs, device=base_env.device, dtype=torch.bool)
+                     attempt_active = torch.ones(base_env.num_envs, device=base_env.device, dtype=torch.bool)
+                     episode_ids = torch.zeros(base_env.num_envs, device=base_env.device, dtype=torch.long)
++                    min_pos_err = torch.full((base_env.num_envs,), float("inf"), device=base_env.device)
++                    min_ang_err = torch.full((base_env.num_envs,), float("inf"), device=base_env.device)
++                    max_cri = torch.zeros(base_env.num_envs, device=base_env.device)
++                    last_pos_err = torch.zeros(base_env.num_envs, device=base_env.device)
++                    last_ang_err = torch.zeros(base_env.num_envs, device=base_env.device)
++                    last_lin_vel = torch.zeros(base_env.num_envs, device=base_env.device)
++                    last_ang_vel = torch.zeros(base_env.num_envs, device=base_env.device)
++                    last_cri = torch.zeros(base_env.num_envs, device=base_env.device)
+ 
+                 assert (
+                     attempt_active is not None
+@@ -313,6 +362,16 @@ def _run_one_shot_eval(
+ 
+                 reach_ev = csv_utils.resolve_reach_event(base_env, reach_cmd_snapshot, strict_reach_params)
+                 done_mask = dones.detach().bool().view(-1)
++                pos_err, ang_err, lin_vel, ang_vel, cri = _ee_tracking(base_env, reach_cmd_snapshot)
++                live = attempt_active
++                min_pos_err[live] = torch.minimum(min_pos_err[live], pos_err[live])
++                min_ang_err[live] = torch.minimum(min_ang_err[live], ang_err[live])
++                max_cri[live] = torch.maximum(max_cri[live], cri[live])
++                last_pos_err[live] = pos_err[live]
++                last_ang_err[live] = ang_err[live]
++                last_lin_vel[live] = lin_vel[live]
++                last_ang_vel[live] = ang_vel[live]
++                last_cri[live] = cri[live]
+ 
+                 if write_traj and csv_writers is not None:
+                     csv_utils.append_traj_rows(
+@@ -341,6 +400,17 @@ def _run_one_shot_eval(
+                             reached=True,
+                             outcome="success",
+                             command_pose=reach_cmd_snapshot[int(env_idx)],
++                            extras=_attempt_extras(
++                                int(env_idx),
++                                min_pos_err,
++                                min_ang_err,
++                                last_pos_err,
++                                last_ang_err,
++                                last_lin_vel,
++                                last_ang_vel,
++                                max_cri,
++                                last_cri,
++                            ),
+                         )
+                     total_episodes += int(newly_success.sum().item())
+                     total_reached_episodes += int(newly_success.sum().item())
+@@ -362,6 +432,17 @@ def _run_one_shot_eval(
+                             reached=False,
+                             outcome=outcome,
+                             command_pose=reach_cmd_snapshot[int(env_idx)],
++                            extras=_attempt_extras(
++                                int(env_idx),
++                                min_pos_err,
++                                min_ang_err,
++                                last_pos_err,
++                                last_ang_err,
++                                last_lin_vel,
++                                last_ang_vel,
++                                max_cri,
++                                last_cri,
++                            ),
+                         )
+                     total_episodes += int(newly_fail.sum().item())
+                     episode_ids[newly_fail] += 1
+@@ -459,6 +540,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
+     export_csv_root = args_cli.export_csv_dir or os.path.join(log_dir, "joint_trajectory")
+     env_cfg.log_dir = log_dir
+ 
++    if args_cli.hold_square_max is not None:
++        bonus = getattr(getattr(env_cfg, "rewards", None), "reach_success_bonus", None)
++        if bonus is None or getattr(bonus, "params", None) is None:
++            raise ValueError("--hold_square_max requires rewards.reach_success_bonus.params")
++        bonus.params["hold_square_max"] = int(args_cli.hold_square_max)
++        # hold_steps==0 means use hold_square_max; keep that so 1-hold is first in-gate step.
++        if int(bonus.params.get("hold_steps", 0) or 0) > 0:
++            bonus.params["hold_steps"] = int(args_cli.hold_square_max)
++
+     strict_reach_params = csv_utils.strict_reach_params_from_env_cfg(env_cfg)
+     if strict_reach_params is None:
+         raise ValueError(
+@@ -554,7 +644,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
+         f"max_lin_vel={strict_reach_params['max_lin_vel']}, "
+         f"max_ang_vel={strict_reach_params['max_ang_vel']}, "
+         f"max_lin_acc={strict_reach_params.get('max_lin_acc', float('inf'))}, "
+-        f"max_ang_acc={strict_reach_params.get('max_ang_acc', float('inf'))}"
++        f"max_ang_acc={strict_reach_params.get('max_ang_acc', float('inf'))}, "
++        f"hold_square_max={strict_reach_params.get('hold_square_max', 'cfg')}"
+     )
+     if args_cli.export_csv_always:
+         print("[INFO] export_csv_always: keep traj rows after reach (outcome still one-shot).")
+diff --git a/scripts/reinforcement_learning/rsl_rl/reach_traj_csv_utils.py b/scripts/reinforcement_learning/rsl_rl/reach_traj_csv_utils.py
+index 64d512220..167bc64fd 100644
+--- a/scripts/reinforcement_learning/rsl_rl/reach_traj_csv_utils.py
++++ b/scripts/reinforcement_learning/rsl_rl/reach_traj_csv_utils.py
+@@ -204,6 +204,10 @@ def freeze_finished_env_controls(
+ def apply_strict_reach_params_to_env(env: ManagerBasedRLEnv, strict_params: dict[str, Any]) -> None:
+     """Force reward/event reach thresholds to the captured strict finals."""
+     criteria = {key: strict_params[key] for key in _REACH_CRITERIA_PARAM_KEYS if key in strict_params}
++    if "hold_square_max" in strict_params:
++        criteria["hold_square_max"] = int(strict_params["hold_square_max"])
++    if "hold_steps" in strict_params:
++        criteria["hold_steps"] = int(strict_params["hold_steps"])
+     if not criteria:
+         return
+ 
+@@ -252,7 +256,22 @@ def open_episode_reach_csv(csv_dir: str) -> tuple[IO[str], csv.DictWriter]:
+     handle = open(path, "w", newline="", encoding="utf-8")
+     writer = csv.DictWriter(
+         handle,
+-        fieldnames=["env_idx", "episode_id", "ended_at_s", "reached", "outcome", *_CMD_POSE_FIELDS],
++        fieldnames=[
++            "env_idx",
++            "episode_id",
++            "ended_at_s",
++            "reached",
++            "outcome",
++            *_CMD_POSE_FIELDS,
++            "min_pos_err",
++            "min_ang_err",
++            "last_pos_err",
++            "last_ang_err",
++            "last_lin_vel",
++            "last_ang_vel",
++            "max_cri",
++            "last_cri",
++        ],
+     )
+     writer.writeheader()
+     handle.flush()
+@@ -439,6 +458,7 @@ def record_attempt(
+     reached: bool,
+     outcome: str,
+     command_pose: Any | None = None,
++    extras: dict[str, Any] | None = None,
+ ) -> None:
+     row: dict[str, Any] = {
+         "env_idx": env_idx,
+@@ -448,6 +468,19 @@ def record_attempt(
+         "outcome": outcome,
+     }
+     row.update(command_pose_row(command_pose))
++    extra_keys = (
++        "min_pos_err",
++        "min_ang_err",
++        "last_pos_err",
++        "last_ang_err",
++        "last_lin_vel",
++        "last_ang_vel",
++        "max_cri",
++        "last_cri",
++    )
++    extra_vals = extras or {}
++    for key in extra_keys:
++        row[key] = extra_vals.get(key, "")
+     writer.writerow(row)
+     handle.flush()
+ 
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/cri_reach_env_cfg.py b/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/cri_reach_env_cfg.py
+index c29e2fc7d..a262e98d1 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/cri_reach_env_cfg.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/cri_reach_env_cfg.py
+@@ -149,26 +149,28 @@ class CRIRewardsCfg:
+         weight=1.0,
+         params={"asset_cfg": SceneEntityCfg("robot", body_names="ee_link"), "command_name": "ee_pose"},
+     )
+-    # 4 cm basin, 2 cm hold. Outside the hold, a small pose floor (0.15)
+-    # pulls 3 cm parks inward; closing adds the rest. Inside the hold,
+-    # 80% of the term needs stillness. Pose 1/e at 2 cm. Approach
+-    # saturates at 3 cm/s. Vel 1/e at the 0.02 gates.
+-    # end_effector_pos_orientation_tracking_last_centimeter = RewTerm(
+-    #     func=mdp.position_orientation_command_error_last_centimeter,
+-    #     weight=2.0,
+-    #     params={
+-    #         "asset_cfg": SceneEntityCfg("robot", body_names="ee_link"),
+-    #         "command_name": "ee_pose",
+-    #         "pos_scale": 50.0,
+-    #         "pos_cutoff": 0.04,
+-    #         "still_cutoff": 0.02,
+-    #         "lin_vel_scale": 50.0,
+-    #         "ang_vel_scale": 50.0,
+-    #         "still_mix": 0.2,
+-    #         "approach_vel": 0.03,
+-    #         "approach_floor": 0.15,
+-    #     },
+-    # )
++    # 1.5x support (3 cm / 0.15 rad). Strong pose 1/e at the gates
++    # (2 cm) and half-gate ori (0.05 rad) so 0.105 vs 0.100 has slope.
++    # Still kernels 1/e at 1.5x twist. Hold stays at the gates.
++    end_effector_pos_orientation_tracking_last_centimeter = RewTerm(
++        func=mdp.position_orientation_command_error_last_centimeter,
++        weight=0.0,
++        params={
++            "asset_cfg": SceneEntityCfg("robot", body_names="ee_link"),
++            "command_name": "ee_pose",
++            "pos_cutoff": 0.03,
++            "ori_cutoff_basin": 0.15,
++            "pos_scale": 50.0,
++            "ori_scale": 20.0,
++            "still_cutoff": 0.02,
++            "ori_cutoff": 0.1,
++            "lin_vel_scale": 1.0 / 0.03,
++            "ang_vel_scale": 1.0 / 0.03,
++            "still_mix": 0.2,
++            "approach_vel": 0.03,
++            "approach_floor": 0.15,
++        },
++    )
+     # OVF only (time_out is time_out=True; reach no longer terminates).
+     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-600.0)
+     action_rate = RewTerm(func=mdp.action_rate_l2_clamped, weight=-0.1)
+@@ -191,11 +193,11 @@ class CRIRewardsCfg:
+         params={"ramp_start_s": 8.0, "ramp_end_s": 16.0, "initial": 0.2, "final": 0.2},
+     )
+     # time_out term only (reach_success is time_out=True and is not penalized).
+-    timeout_no_reach = RewTerm(
+-        func=mdp.timeout_no_reach_penalty,
+-        weight=0.0,
+-        params={"reward_term_name": "reach_success_bonus"},
+-    )
++    # timeout_no_reach = RewTerm(
++    #     func=mdp.timeout_no_reach_penalty,
++    #     weight=0.0,
++    #     params={"reward_term_name": "reach_success_bonus"},
++    # )
+     # 1-hold pays hold_step_bonus (0.1 → applied 4). 2-hold pays 1 (applied 40).
+     reach_success_bonus = RewTerm(
+         func=mdp.ReachSuccessCriteria,
+@@ -271,37 +273,37 @@ class CRICurriculumCfg:
+     #         },
+     #     },
+     # )
+-    # # Same switch as is_alive_ramp_final. Pulls 8 cm → 3 cm after living
+-    # # pressure turns on; FG alone is flat at the current ~20 cm plateau.
+-    # last_centimeter_weight = CurrTerm(
+-    #     func=mdp.modify_term_cfg,
+-    #     params={
+-    #         "address": "rewards.end_effector_pos_orientation_tracking_last_centimeter.weight",
+-    #         "modify_fn": mdp.reward_weight_step_by_step,
+-    #         "modify_params": {
+-    #             "switch_step": 48 * 24000,
+-    #             "initial_weight": 0.0,
+-    #             "final_weight": 2.0,
+-    #         },
+-    #     },
+-    # )
+-    # # Same switch as is_alive_ramp_final. After 10 s, sitting burns 1.2/step
+-    # # so park loss is front-loaded; -400 is only the 48 s backstop.
+-    # # Park ~-1156 vs explore-OVF through ~37 s. Reach +1200 still dominates.
+-    # # Early suicide (~-609) is the cheap give-up; CRI_OVF -10 and tracking
+-    # # keep that from being the default.
+-    timeout_no_reach_weight = CurrTerm(
++    # Off until gates are tight. Then weight 2 so the 1.5x last-cm box
++    # (3 cm / 0.15 rad / 0.03 m/s / 0.03 rad/s) gets a pose/twist gradient.
++    last_centimeter_weight = CurrTerm(
+         func=mdp.modify_term_cfg,
+         params={
+-            "address": "rewards.timeout_no_reach.weight",
++            "address": "rewards.end_effector_pos_orientation_tracking_last_centimeter.weight",
+             "modify_fn": mdp.reward_weight_step_by_step,
+             "modify_params": {
+-                "switch_step": 48 * 36000,
++                "switch_step": 48 * 24000,
+                 "initial_weight": 0.0,
+-                "final_weight": -300.0,
++                "final_weight": 2.0,
+             },
+         },
+     )
++    # # Same switch as is_alive_ramp_final. After 10 s, sitting burns 1.2/step
++    # # so park loss is front-loaded; -400 is only the 48 s backstop.
++    # # Park ~-1156 vs explore-OVF through ~37 s. Reach +1200 still dominates.
++    # # Early suicide (~-609) is the cheap give-up; CRI_OVF -10 and tracking
++    # # keep that from being the default.
++    # timeout_no_reach_weight = CurrTerm(
++    #     func=mdp.modify_term_cfg,
++    #     params={
++    #         "address": "rewards.timeout_no_reach.weight",
++    #         "modify_fn": mdp.reward_weight_step_by_step,
++    #         "modify_params": {
++    #             "switch_step": 48 * 36000,
++    #             "initial_weight": 0.0,
++    #             "final_weight": -300.0,
++    #         },
++    #     },
++    # )
+     # Hold length is not a curriculum. Reward already scales with episode-max
+     # consecutive hold and in-gate total; no interval / hold_steps schedule.
+     # reach_settle_hold = CurrTerm(
+diff --git a/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/mdp/rewards.py b/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/mdp/rewards.py
+index 4a10fcaf3..dd33f36fc 100644
+--- a/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/mdp/rewards.py
++++ b/source/isaaclab_tasks/isaaclab_tasks/manager_based/manipulation/reach/mdp/rewards.py
+@@ -421,22 +421,25 @@ def position_orientation_command_error_last_centimeter(
+     command_name: str,
+     asset_cfg: SceneEntityCfg,
+     pos_scale: float = 50.0,
+-    ori_scale: float = 8.0,
+-    pos_cutoff: float = 0.04,
++    ori_scale: float = 20.0,
++    pos_cutoff: float = 0.03,
++    ori_cutoff_basin: float = 0.15,
+     still_cutoff: float = 0.02,
+-    lin_vel_scale: float = 25.0,
+-    ang_vel_scale: float = 25.0,
+-    still_mix: float = 0.5,
+-    approach_vel: float = 0.05,
++    ori_cutoff: float = 0.1,
++    lin_vel_scale: float = 1.0 / 0.03,
++    ang_vel_scale: float = 1.0 / 0.03,
++    still_mix: float = 0.2,
++    approach_vel: float = 0.03,
+     approach_floor: float = 0.15,
+ ) -> torch.Tensor:
+-    """Last-centimeter basin: pull into the hold, still inside it.
+-
+-    Zero outside ``pos_cutoff``. Between ``still_cutoff`` and ``pos_cutoff``
+-    the kernel is ``pose * (approach_floor + (1-floor)*approach)`` so a parked
+-    pose at 3 cm still has a small gradient into 2 cm, while closing pays more.
+-    Inside ``still_cutoff`` it is ``pose * (still_mix + (1-still_mix)*still)``.
+-    ``pos_scale=50`` is 1/e at 2 cm. Vel scales of 50 are 1/e at the 0.02 gates.
++    """Last-centimeter basin at 1.5x support, strong pose kernels at the gates.
++
++    Zero outside the 1.5x pose box (``pos_cutoff`` / ``ori_cutoff_basin``).
++    Pose 1/e is at the hold gates (2 cm) and half-gate ori (0.05 rad) so
++    0.10–0.11 rad still has slope. Still kernels 1/e at 1.5x twist
++    (0.03 m/s / 0.03 rad/s). Still is only paid inside the hold gates
++    ``still_cutoff`` / ``ori_cutoff``; elsewhere the approach kernel
++    (closing speed vs ``approach_vel``) is used.
+     """
+     asset: RigidObject = env.scene[asset_cfg.name]
+     command = env.command_manager.get_command(command_name)
+@@ -452,10 +455,13 @@ def position_orientation_command_error_last_centimeter(
+     des_quat_b = command[:, 3:7]
+     des_quat_w = quat_mul(origin_quat_w, des_quat_b)
+     curr_quat_w = asset.data.body_quat_w[:, bid]
+-    pose = torch.exp(-pos_scale * distance) * torch.exp(-ori_scale * quat_error_magnitude(curr_quat_w, des_quat_w))
++    ang_err = quat_error_magnitude(curr_quat_w, des_quat_w)
++
+     lin_vel = asset.data.body_lin_vel_w[:, bid, :]
+     lin_spd = torch.norm(lin_vel, dim=-1)
+     ang_spd = torch.norm(asset.data.body_ang_vel_w[:, bid, :], dim=-1)
++
++    pose = torch.exp(-pos_scale * distance) * torch.exp(-ori_scale * ang_err)
+     still = torch.exp(-lin_vel_scale * lin_spd) * torch.exp(-ang_vel_scale * ang_spd)
+     mix = min(max(float(still_mix), 0.0), 1.0)
+     still_kernel = pose * (mix + (1.0 - mix) * still)
+@@ -467,9 +473,10 @@ def position_orientation_command_error_last_centimeter(
+     floor = min(max(float(approach_floor), 0.0), 1.0)
+     approach_kernel = pose * (floor + (1.0 - floor) * approach)
+ 
+-    in_hold = distance < still_cutoff
++    in_hold = (distance < still_cutoff) & (ang_err < ori_cutoff)
+     kernel = torch.where(in_hold, still_kernel, approach_kernel)
+-    return torch.where(distance < pos_cutoff, kernel, torch.zeros_like(kernel))
++    in_basin = (distance < pos_cutoff) & (ang_err < ori_cutoff_basin)
++    return torch.where(in_basin, kernel, torch.zeros_like(kernel))
+ 
+ 
+ def position_command_error_tanh(
