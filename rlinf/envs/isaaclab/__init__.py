@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .tasks.open_fridge_kitchen import IsaaclabOpenFridgeKitchenEnv
 from .tasks.pick_place_cube_plate import IsaaclabPickPlaceCubePlateEnv
 from .tasks.stack_cube import IsaaclabStackCubeEnv
 
@@ -19,6 +20,8 @@ REGISTER_ISAACLAB_ENVS = {
     "Isaac-Stack-Cube-Franka-IK-Rel-Visuomotor-Rewarded-v0": IsaaclabStackCubeEnv,
     # DROID abs-joint-pos cube→plate (Arena specs as built-in Isaac Lab task).
     "Isaac-PickPlace-Cube-Plate-Droid-AbsJointPos-v0": IsaaclabPickPlaceCubePlateEnv,
+    # DROID abs-joint-pos kitchen fridge open-door (Arena kitchen_bench spec).
+    "Isaac-OpenFridge-Kitchen-Droid-AbsJointPos-v0": IsaaclabOpenFridgeKitchenEnv,
 }
 
 __all__ = [list(REGISTER_ISAACLAB_ENVS.keys())]

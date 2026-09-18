@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Download Isaac Lab Arena assets used by pick_place_cube_plate into
-# ${REPO_PATH}/.assets/isaaclab_arena (local paths only — not remote URL roots).
+# Download Isaac Lab Arena assets into ${REPO_PATH}/.assets/isaaclab_arena
+# (local paths only — not remote URL roots).
 #
-# Also fetches the NVIDIA Base Materials referenced by fixtures/table_maple
-# (Oak / Walnut / RustedMetal, …) into .assets/isaaclab_arena/Materials and
-# rewrites table_maple.usda MDL paths so they resolve under that tree — matching
-# the Isaac Lab Arena maple work table appearance offline.
+# Default set is kitchen_bench (DROID + Lightwheel one-wall coastal kitchen)
+# for kitchen_bench_lightwheel_open_fridge. The previous maple-table pick-place
+# set is opt-in via ARENA_ASSET_SET=maple_table.
 #
 # Usage:
 #   bash examples/embodiment/scripts/download_isaaclab_arena_assets.sh
 #   DEST_DIR=/path/to/.assets/isaaclab_arena bash .../download_isaaclab_arena_assets.sh
+#   ARENA_ASSET_SET=maple_table bash .../download_isaaclab_arena_assets.sh
 
 set -euo pipefail
 
@@ -20,9 +20,19 @@ DEST_DIR="${DEST_DIR:-${REPO_PATH}/.assets/isaaclab_arena}"
 ARENA_S3_BASE="${ARENA_S3_BASE:-https://omniverse-content-staging.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/Isaac/IsaacLab/Arena/assets}"
 # NVIDIA Materials live under the Isaac/5.1/NVIDIA prefix on production.
 MATERIALS_S3_BASE="${MATERIALS_S3_BASE:-https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials}"
+LIGHTWHEEL_CACHE="${LIGHTWHEEL_CACHE:-${HOME}/.cache/lightwheel_sdk}"
+ARENA_ASSET_SET="${ARENA_ASSET_SET:-kitchen_bench}"
+
+# DROID embodiment used by kitchen_bench_lightwheel_open_fridge.
+KITCHEN_S3_PATHS=(
+  "robot_library/droid/franka_robotiq_2f_85_flattened.usd"
+  "object_library/srl_robolab_assets/robots/franka_stand_grey.usda"
+  "object_library/srl_robolab_assets/robots/franka_robotiq_2f_85_flattened.usd"
+  "object_library/srl_robolab_assets/fixtures/stand_instanceable.usd"
+)
 
 # Arena USD/HDR used by the DROID maple-table pick-place task.
-ASSET_PATHS=(
+MAPLE_S3_PATHS=(
   "robot_library/droid/franka_robotiq_2f_85_flattened.usd"
   "object_library/srl_robolab_assets/fixtures/stand_instanceable.usd"
   "object_library/srl_robolab_assets/fixtures/franka_table.usd"
@@ -63,6 +73,8 @@ MATERIAL_PATHS=(
 WRAPPER_REL="object_library/srl_robolab_assets/fixtures/table_maple_arena.usda"
 WRAPPER_SRC="${REPO_PATH}/rlinf/envs/isaaclab/tasks/pick_place_cube_plate/assets/table_maple_arena.usda"
 TABLE_USDA_REL="object_library/srl_robolab_assets/fixtures/table_maple.usda"
+KITCHEN_NAMED_REL="background_library/lightwheel_kitchen_one_wall_coastal"
+KITCHEN_SDK_REL="lightwheel_sdk/floorplan/robocasa-robocasakitchen-1-1"
 
 download_url() {
   local url="$1"
@@ -123,14 +135,71 @@ install_wrapper() {
   fi
 }
 
-main() {
-  echo "[arena-assets] DEST_DIR=${DEST_DIR}"
-  echo "[arena-assets] ARENA_S3_BASE=${ARENA_S3_BASE}"
-  echo "[arena-assets] MATERIALS_S3_BASE=${MATERIALS_S3_BASE}"
-  mkdir -p "${DEST_DIR}"
+# Lightwheel kitchen (layout=1 one-wall, style=1 coastal). Copied from the
+# Lightwheel SDK cache when present; also written in SDK layout so setup can
+# seed ~/.cache/lightwheel_sdk without a network fetch.
+install_lightwheel_kitchen() {
+  local src="${LIGHTWHEEL_CACHE}/floorplan/robocasa-robocasakitchen-1-1"
+  local dest_named="${DEST_DIR}/${KITCHEN_NAMED_REL}"
+  local dest_sdk="${DEST_DIR}/${KITCHEN_SDK_REL}"
 
+  if [ ! -f "${src}/scene.usd" ]; then
+    if [ -f "${dest_named}/scene.usd" ]; then
+      src="${dest_named}"
+    elif [ -f "${dest_sdk}/scene.usd" ]; then
+      src="${dest_sdk}"
+    else
+      echo "[arena-assets] ERROR: Lightwheel kitchen missing at ${src}" >&2
+      echo "[arena-assets] Acquire it once with Isaac Lab Arena / lightwheel_sdk" >&2
+      echo "[arena-assets] (layout_id=1, style_id=1 → robocasa-robocasakitchen-1-1)," >&2
+      echo "[arena-assets] then re-run this script." >&2
+      return 1
+    fi
+  fi
+
+  mkdir -p "${dest_named}" "${dest_sdk}" "$(dirname "${DEST_DIR}/lightwheel_sdk/floorplan/usd_version.json")"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --delete "${src}/" "${dest_named}/"
+    rsync -a --delete "${src}/" "${dest_sdk}/"
+  else
+    rm -rf "${dest_named}" "${dest_sdk}"
+    mkdir -p "${dest_named}" "${dest_sdk}"
+    cp -a "${src}/." "${dest_named}/"
+    cp -a "${src}/." "${dest_sdk}/"
+  fi
+  if [ -f "${LIGHTWHEEL_CACHE}/floorplan/usd_version.json" ]; then
+    cp -f "${LIGHTWHEEL_CACHE}/floorplan/usd_version.json" \
+      "${DEST_DIR}/lightwheel_sdk/floorplan/usd_version.json"
+  fi
+  echo "[arena-assets] installed Lightwheel kitchen one_wall coastal → ${KITCHEN_NAMED_REL}"
+}
+
+seed_lightwheel_cache() {
+  local dest_sdk="${DEST_DIR}/${KITCHEN_SDK_REL}"
+  local cache_dir="${LIGHTWHEEL_CACHE}/floorplan/robocasa-robocasakitchen-1-1"
+  if [ -f "${cache_dir}/scene.usd" ]; then
+    return 0
+  fi
+  if [ ! -f "${dest_sdk}/scene.usd" ]; then
+    return 0
+  fi
+  mkdir -p "${cache_dir}"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a "${dest_sdk}/" "${cache_dir}/"
+  else
+    cp -a "${dest_sdk}/." "${cache_dir}/"
+  fi
+  if [ -f "${DEST_DIR}/lightwheel_sdk/floorplan/usd_version.json" ]; then
+    mkdir -p "${LIGHTWHEEL_CACHE}/floorplan"
+    cp -f "${DEST_DIR}/lightwheel_sdk/floorplan/usd_version.json" \
+      "${LIGHTWHEEL_CACHE}/floorplan/usd_version.json"
+  fi
+  echo "[arena-assets] seeded Lightwheel cache: ${cache_dir}"
+}
+
+install_maple_table_set() {
   local rel
-  for rel in "${ASSET_PATHS[@]}"; do
+  for rel in "${MAPLE_S3_PATHS[@]}"; do
     download_arena_one "${rel}"
   done
   for rel in "${MATERIAL_PATHS[@]}"; do
@@ -138,23 +207,58 @@ main() {
       echo "[arena-assets] WARNING: optional material missing: ${rel}" >&2
     }
   done
-
   patch_table_maple_mdl_paths
   install_wrapper
+}
+
+main() {
+  echo "[arena-assets] DEST_DIR=${DEST_DIR}"
+  echo "[arena-assets] ARENA_S3_BASE=${ARENA_S3_BASE}"
+  echo "[arena-assets] ARENA_ASSET_SET=${ARENA_ASSET_SET}"
+  mkdir -p "${DEST_DIR}"
+
+  local rel
+  for rel in "${KITCHEN_S3_PATHS[@]}"; do
+    download_arena_one "${rel}" || {
+      echo "[arena-assets] WARNING: optional S3 asset missing: ${rel}" >&2
+    }
+  done
+
+  case "${ARENA_ASSET_SET}" in
+    maple_table|all)
+      install_maple_table_set
+      ;;
+    kitchen_bench)
+      ;;
+    *)
+      echo "[arena-assets] unknown ARENA_ASSET_SET=${ARENA_ASSET_SET} (use kitchen_bench|maple_table|all)" >&2
+      exit 1
+      ;;
+  esac
+
+  install_lightwheel_kitchen
+  seed_lightwheel_cache
 
   local missing=0
   local required=(
     "robot_library/droid/franka_robotiq_2f_85_flattened.usd"
-    "object_library/srl_robolab_assets/fixtures/stand_instanceable.usd"
-    "object_library/srl_robolab_assets/fixtures/franka_table.usd"
-    "object_library/srl_robolab_assets/fixtures/table_maple.usda"
-    "object_library/srl_robolab_assets/objects/hot3d/rubiks_cube.usd"
-    "object_library/srl_robolab_assets/objects/ycb/bowl.usd"
-    "object_library/srl_robolab_assets/backgrounds/default/home_office.exr"
-    "Materials/Base/Wood/Oak.mdl"
-    "Materials/Base/Wood/Oak/Oak_BaseColor.png"
-    "${WRAPPER_REL}"
+    "object_library/srl_robolab_assets/robots/franka_stand_grey.usda"
+    "${KITCHEN_NAMED_REL}/scene.usd"
+    "${KITCHEN_SDK_REL}/scene.usd"
   )
+  if [ "${ARENA_ASSET_SET}" = "maple_table" ] || [ "${ARENA_ASSET_SET}" = "all" ]; then
+    required+=(
+      "object_library/srl_robolab_assets/fixtures/stand_instanceable.usd"
+      "object_library/srl_robolab_assets/fixtures/franka_table.usd"
+      "object_library/srl_robolab_assets/fixtures/table_maple.usda"
+      "object_library/srl_robolab_assets/objects/hot3d/rubiks_cube.usd"
+      "object_library/srl_robolab_assets/objects/ycb/bowl.usd"
+      "object_library/srl_robolab_assets/backgrounds/default/home_office.exr"
+      "Materials/Base/Wood/Oak.mdl"
+      "Materials/Base/Wood/Oak/Oak_BaseColor.png"
+      "${WRAPPER_REL}"
+    )
+  fi
   for rel in "${required[@]}"; do
     if [ ! -f "${DEST_DIR}/${rel}" ]; then
       echo "[arena-assets] MISSING: ${DEST_DIR}/${rel}" >&2

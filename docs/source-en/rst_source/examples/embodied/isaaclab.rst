@@ -58,6 +58,8 @@ Tasks
      - Description
    * - ``Isaac-Stack-Cube-Franka-IK-Rel-Visuomotor-Rewarded-v0``
      - Stack the red block on the blue block, then stack the green block on the red block.
+   * - ``Isaac-OpenFridge-Kitchen-Droid-AbsJointPos-v0``
+     - Open the Lightwheel kitchen fridge door past 0.2 openness (Arena ``kitchen_bench_lightwheel_open_fridge``).
 
 Observation and Action
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -262,6 +264,9 @@ Pick one config and launch training:
    * - OpenPI π₀.₅ CRI (DROID joint-pos, cube→plate)
      - ``examples/embodiment/config/isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri.yaml``
      - ``isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri``
+   * - OpenPI π₀.₅ PolarIS (DROID joint-pos, kitchen fridge)
+     - ``examples/embodiment/config/isaaclab_kitchen_open_fridge_ppo_openpi_pi05.yaml``
+     - ``isaaclab_kitchen_open_fridge_ppo_openpi_pi05``
 
 .. code:: bash
 
@@ -290,6 +295,20 @@ Pick one config and launch training:
    # equivalent:
    # bash examples/embodiment/run_embodiment.sh isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri
 
+   # OpenPI π₀.₅ PolarIS (DROID 8-D, kitchen fridge open-door)
+   # Assets: .assets/isaaclab_arena Lightwheel one-wall coastal + DROID
+   #   (bash examples/embodiment/scripts/download_isaaclab_arena_assets.sh).
+   # Weights: set POLARIS_OPENPI_CKPT to an RLinf-loadable PolarIS dir
+   #   (config_name=pi05_droid_jointpos_polaris). CRI conversion is separate.
+   # Gym id Isaac-OpenFridge-Kitchen-Droid-AbsJointPos-v0. 15 Hz.
+   # Online CRI-F + time-penalty rewards match the cube→plate CRI train
+   # knobs (cri_penalty_weight -0.01, time_penalty_weight -0.0001).
+   # PolarIS weights stay pi05_droid_jointpos_polaris (no CRI tokens).
+   # GPU e2e needs Isaac Sim; CI skips that path.
+   POLARIS_OPENPI_CKPT=/path/to/model/RLinf-Pi05-Polaris-droid_jointpos \
+     bash examples/embodiment/run_embodiment.sh isaaclab_kitchen_open_fridge_ppo_openpi_pi05
+   # Eval: bash evaluations/run_eval.sh isaaclab isaaclab_kitchen_open_fridge_openpi_pi05_eval
+
 What this does:
 
 1. Starts the embodied training entrypoint with the selected Hydra config.
@@ -298,8 +317,9 @@ What this does:
 
 For standalone evaluation, use the unified :doc:`Evaluation CLI
 <../../evaluations/reference/cli>` with config fallback and the same suffixes:
-``isaaclab_franka_stack_cube_ppo_gr00t`` and
-``isaaclab_franka_stack_cube_ppo_openpi_pi05``.
+``isaaclab_franka_stack_cube_ppo_gr00t``,
+``isaaclab_franka_stack_cube_ppo_openpi_pi05``, and
+``isaaclab_kitchen_open_fridge_ppo_openpi_pi05``.
 
 .. note::
 

@@ -581,6 +581,21 @@ _CONFIGS = [
         ),
         pytorch_weight_path="checkpoints/torch/pi05_droid_polaris",
     ),
+    # OpenPI PolaRiS TrainConfig name (same DROID joint-pos transforms, no CRI).
+    TrainConfig(
+        name="pi05_droid_jointpos_polaris",
+        model=pi0_config.Pi0Config(
+            action_horizon=15,
+            pi05=True,
+            max_token_len=200,
+        ),
+        data=LeRobotPolarisDroidDataConfig(
+            repo_id="physical-intelligence/droid",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="assets/droid"),
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_droid_polaris",
+    ),
     # CRI DROID LoRA finetune (same DROID joint-pos transforms as polaris).
     TrainConfig(
         name="pi05_droid_cri",
@@ -596,6 +611,23 @@ _CONFIGS = [
             use_cri=True,
         ),
         pytorch_weight_path="checkpoints/torch/pi05_droid_cri",
+    ),
+    # PolaRiS joint-pos + delayed CRI-F LoRA (merged dense). OpenPI
+    # ``pi05_droid_jointpos_polaris_cri`` 10k; CRI tokens need 220.
+    TrainConfig(
+        name="pi05_droid_jointpos_polaris_cri",
+        model=pi0_config.Pi0Config(
+            action_horizon=15,
+            pi05=True,
+            max_token_len=220,
+        ),
+        data=LeRobotPolarisDroidDataConfig(
+            repo_id="physical-intelligence/droid",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="assets/droid"),
+            use_cri=True,
+        ),
+        pytorch_weight_path="checkpoint/pi05_droid_jointpos_polaris_cri_rlinf_10000",
     ),
 ]
 

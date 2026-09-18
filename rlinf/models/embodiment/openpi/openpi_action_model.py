@@ -41,6 +41,44 @@ from rlinf.utils.logging import get_logger
 from rlinf.utils.nested_dict_process import copy_dict_tensor
 from rlinf.utils.pytree import register_pytree_dataclasses
 
+_IMAGE_TOKENS_PER_SLOT = 256
+_OPENPI_IMAGE_SLOTS = 3
+
+
+def vlm_value_prefix_mask(
+    seq_len: int,
+    num_images_in_input: int,
+    value_vlm_mode: str,
+) -> list[bool]:
+    """Boolean index for ``prefix_output[:, mask, :]`` in ``get_value_from_vlm``.
+
+    Length must match the actual prefix (``max_token_len``), not a hardcoded
+    pi05 default of 200. PolarIS CRI uses 220 language tokens.
+    """
+    if value_vlm_mode == "mean_token":
+        unused_slots = _OPENPI_IMAGE_SLOTS - num_images_in_input
+        if unused_slots < 0:
+            raise ValueError(
+                f"num_images_in_input={num_images_in_input} exceeds "
+                f"{_OPENPI_IMAGE_SLOTS} image slots"
+            )
+        lang_token_len = seq_len - _IMAGE_TOKENS_PER_SLOT * _OPENPI_IMAGE_SLOTS
+        if lang_token_len < 0:
+            raise ValueError(
+                f"prefix seq_len {seq_len} is shorter than "
+                f"{_IMAGE_TOKENS_PER_SLOT * _OPENPI_IMAGE_SLOTS} image tokens"
+            )
+        return (
+            [True] * (_IMAGE_TOKENS_PER_SLOT * num_images_in_input)
+            + [False] * (_IMAGE_TOKENS_PER_SLOT * unused_slots)
+            + [True] * lang_token_len
+        )
+    if value_vlm_mode == "last_token":
+        return [False] * (seq_len - 1) + [True]
+    if value_vlm_mode == "first_token":
+        return [True] + [False] * (seq_len - 1)
+    raise ValueError(f"Unknown value_vlm_mode: {value_vlm_mode}")
+
 
 def _to_numpy(x):
     """Detach tensor and convert to NumPy (bf16/fp16 need float32 first)."""
@@ -190,6 +228,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 "pi05_maniskill",
                 "pi05_libero",
                 "pi05_droid_polaris",
+                "pi05_droid_jointpos_polaris",
+                "pi05_droid_jointpos_polaris_cri",
             ]:
                 value_head_hidden_sizes = (1024, 512, 256)
             else:
@@ -1378,27 +1418,13 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return chains_log_probs, chains_values, chains_entropy
 
     def get_value_from_vlm(self, prefix_output):
-        # prefix_output:
-        # pi05: [bs, (256 * 3 + 200) = 968, 2048]
-        # pi0: [bs, (256 * 3 + 48) = 816, 1024]
-        # token length
-        if "pi05_" in self.config.config_name:
-            lang_token_len = 200
-            all_token_length = 968
-        elif "pi0_" in self.config.config_name:
-            lang_token_len = 48
-            all_token_length = 816
-
-        if self.config.value_vlm_mode == "mean_token":
-            prefix_mask = (
-                [True] * 256 * self.config.num_images_in_input
-                + [False] * 256 * (3 - self.config.num_images_in_input)
-                + [True] * lang_token_len
-            )
-        elif self.config.value_vlm_mode == "last_token":
-            prefix_mask = [False] * (all_token_length - 1) + [True] * 1
-        elif self.config.value_vlm_mode == "first_token":
-            prefix_mask = [True] * 1 + [False] * (all_token_length - 1)
+        # OpenPI prefix is always 3 image slots of 256 plus language tokens.
+        # pi05 default: 256 * 3 + 200 = 968. PolarIS CRI: 256 * 3 + 220 = 988.
+        prefix_mask = vlm_value_prefix_mask(
+            prefix_output.shape[1],
+            self.config.num_images_in_input,
+            self.config.value_vlm_mode,
+        )
         prefix_out_value = prefix_output[:, prefix_mask, :]
         prefix_out_value = prefix_out_value.mean(dim=1, keepdim=False)
         prefix_out_value = prefix_out_value.to(dtype=torch.float32)

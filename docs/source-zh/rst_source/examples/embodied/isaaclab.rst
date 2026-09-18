@@ -57,6 +57,8 @@
      - 描述
    * - ``Isaac-Stack-Cube-Franka-IK-Rel-Visuomotor-Rewarded-v0``
      - 将红色方块堆到蓝色方块上，再将绿色方块堆到红色方块上。
+   * - ``Isaac-OpenFridge-Kitchen-Droid-AbsJointPos-v0``
+     - 将 Lightwheel 厨房冰箱门开到 openness 0.2 以上（Arena ``kitchen_bench_lightwheel_open_fridge``）。
 
 观测与动作
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -256,6 +258,9 @@ Docker 镜像只提供 venv（``/opt/venv``）。把当前 checkout 绑定到
    * - OpenPI π₀.₅ CRI（DROID joint-pos，立方体→盘子）
      - ``examples/embodiment/config/isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri.yaml``
      - ``isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri``
+   * - OpenPI π₀.₅ PolarIS（DROID joint-pos，厨房冰箱）
+     - ``examples/embodiment/config/isaaclab_kitchen_open_fridge_ppo_openpi_pi05.yaml``
+     - ``isaaclab_kitchen_open_fridge_ppo_openpi_pi05``
 
 .. code:: bash
 
@@ -285,6 +290,20 @@ Docker 镜像只提供 venv（``/opt/venv``）。把当前 checkout 绑定到
    # 等价写法：
    # bash examples/embodiment/run_embodiment.sh isaaclab_pick_place_cube_plate_ppo_openpi_pi05_cri
 
+   # OpenPI π₀.₅ PolarIS（DROID 8-D，厨房开冰箱门）
+   # 资产：.assets/isaaclab_arena 的 Lightwheel one-wall coastal + DROID
+   #   （bash examples/embodiment/scripts/download_isaaclab_arena_assets.sh）。
+   # 权重：把 POLARIS_OPENPI_CKPT 指到 RLinf 可加载的 PolarIS 目录
+   #   （config_name=pi05_droid_jointpos_polaris）。CRI 转换为另一步。
+   # Gym id Isaac-OpenFridge-Kitchen-Droid-AbsJointPos-v0。15 Hz。
+   # 在线 CRI-F 与 time-penalty 奖励与 cube→plate CRI 训练旋钮一致
+   # （cri_penalty_weight -0.01，time_penalty_weight -0.0001）。
+   # PolarIS 权重仍为 pi05_droid_jointpos_polaris（不含 CRI token）。
+   # GPU e2e 需要 Isaac Sim；CI 跳过该路径。
+   POLARIS_OPENPI_CKPT=/path/to/model/RLinf-Pi05-Polaris-droid_jointpos \
+     bash examples/embodiment/run_embodiment.sh isaaclab_kitchen_open_fridge_ppo_openpi_pi05
+   # 评测：bash evaluations/run_eval.sh isaaclab isaaclab_kitchen_open_fridge_openpi_pi05_eval
+
 这条命令会：
 
 1. 使用选定的 Hydra 配置启动 embodied 训练入口。
@@ -292,8 +311,9 @@ Docker 镜像只提供 venv（``/opt/venv``）。把当前 checkout 绑定到
 3. 运行 PPO rollout，计算稀疏任务奖励，并更新 VLA 策略。
 
 独立评测请使用统一的 :doc:`Evaluation CLI <../../evaluations/reference/cli>`，
-通过配置回退机制复用相同后缀：``isaaclab_franka_stack_cube_ppo_gr00t`` 和
-``isaaclab_franka_stack_cube_ppo_openpi_pi05``。
+通过配置回退机制复用相同后缀：``isaaclab_franka_stack_cube_ppo_gr00t``、
+``isaaclab_franka_stack_cube_ppo_openpi_pi05``、
+``isaaclab_kitchen_open_fridge_ppo_openpi_pi05``。
 
 .. note::
 
