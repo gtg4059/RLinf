@@ -36,3 +36,12 @@ def compute_door_openness(
     """
     span = (upper - lower).clamp(min=1e-6)
     return ((joint_pos - lower) / span).clamp(0.0, 1.0)
+
+
+def door_reached_from_rest(
+    openness: torch.Tensor,
+    rest_openness: float = 0.0,
+    min_openness_change: float = 0.05,
+) -> torch.Tensor:
+    """Arena reach: door moved away from rest by ``min_openness_change``."""
+    return (openness - rest_openness).abs() > min_openness_change

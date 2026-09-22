@@ -74,6 +74,13 @@ from rlinf.models.embodiment.openpi.dataconfig.robotwin_aloha_dataconfig import 
     LeRobotAlohaDataConfig,
 )
 
+
+def _pi0_config(**kwargs):
+    """Build Pi0Config, dropping kwargs the installed openpi does not know."""
+    fields = getattr(pi0_config.Pi0Config, "__dataclass_fields__", {})
+    return pi0_config.Pi0Config(**{k: v for k, v in kwargs.items() if k in fields})
+
+
 _CONFIGS = [
     TrainConfig(
         name="pi0_libero",
@@ -628,6 +635,25 @@ _CONFIGS = [
             use_cri=True,
         ),
         pytorch_weight_path="checkpoint/pi05_droid_jointpos_polaris_cri_rlinf_10000",
+    ),
+    # Official polaris + TacVLA CRI prefix adapter (encoder-only, no LoRA).
+    # CRI is a 9-token prefix stream, not language bins. Prompt stays Task/State.
+    TrainConfig(
+        name="pi05_droid_jointpos_polaris_cri_adapter",
+        model=_pi0_config(
+            action_horizon=15,
+            pi05=True,
+            max_token_len=200,
+            use_cri_prefix=True,
+        ),
+        data=LeRobotPolarisDroidDataConfig(
+            repo_id="physical-intelligence/droid",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(asset_id="assets/droid"),
+            use_cri=True,
+            use_cri_prefix=True,
+        ),
+        pytorch_weight_path="checkpoint/pi05_droid_jointpos_polaris_cri_adapter_rlinf_19999",
     ),
 ]
 

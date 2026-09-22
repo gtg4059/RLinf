@@ -14,7 +14,7 @@
 
 """DROID abs-joint-pos kitchen fridge open-door task (Isaac Lab gym + RLinf)."""
 
-from .door import compute_door_openness
+from .door import compute_door_openness, door_reached_from_rest
 from .env import (
     GYM_ID,
     IsaaclabOpenFridgeKitchenEnv,
@@ -25,5 +25,6 @@ __all__ = [
     "GYM_ID",
     "IsaaclabOpenFridgeKitchenEnv",
     "compute_door_openness",
+    "door_reached_from_rest",
     "register_open_fridge_kitchen_env",
 ]

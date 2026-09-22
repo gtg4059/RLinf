@@ -20,6 +20,31 @@ import torch
 from omegaconf import DictConfig
 
 
+def cast_cri_prefix_params_to_bfloat16(model: torch.nn.Module) -> None:
+    """Keep the CRI positional table on the PaliGemma leftover dtype.
+
+    OpenPI ``embed_prefix`` casts CRI tokens to float32 before ``cri_in_proj``,
+    so the prefix linears must stay float32. Those modules are isolated via
+    ``_no_split_names``. ``cri_pos`` is added with
+    ``cri_pos.to(dtype=cri_tokens.dtype)``, so storing it as bfloat16 is safe.
+    """
+    from rlinf.models.embodiment.openpi.cri_prefix import (
+        CRIPositionalEmbedding,
+        cri_pos_weight,
+    )
+
+    pos = getattr(model, "cri_pos", None)
+    if pos is None:
+        return
+    if isinstance(pos, CRIPositionalEmbedding):
+        weight = cri_pos_weight(pos)
+        if weight.dtype != torch.bfloat16:
+            weight.data = weight.data.to(dtype=torch.bfloat16)
+        return
+    if isinstance(pos, torch.nn.Parameter) and pos.dtype != torch.bfloat16:
+        pos.data = pos.data.to(dtype=torch.bfloat16)
+
+
 def get_model(cfg: DictConfig, torch_dtype=None):
     import glob
 
@@ -54,6 +79,9 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     if override_model_config_kwargs is not None:
         for key, val in override_model_config_kwargs.items():
             actor_model_config.__dict__[key] = val
+    if getattr(actor_train_config.data, "use_cri_prefix", False):
+        actor_model_config.__dict__["use_cri_prefix"] = True
+        actor_model_config.__dict__.setdefault("num_cri_tokens", 9)
 
     # load model
     checkpoint_dir = download.maybe_download(str(cfg.model_path))
@@ -95,6 +123,7 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         model.load_state_dict(all_state_dict, strict=False)
 
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+    cast_cri_prefix_params_to_bfloat16(model)
     # fsdp replace
     # model.paligemma_with_expert.replace_gemma_decoder_layers()
     # load data stats

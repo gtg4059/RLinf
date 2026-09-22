@@ -187,7 +187,55 @@ def merge_lora_into_params(params: dict) -> dict:
     return params
 
 
-def convert(input_dir: Path, output_dir: Path, action_horizon: int = 15) -> Path:
+def _params_have_lora(params: dict) -> bool:
+    found = False
+
+    def _walk(node):
+        nonlocal found
+        if found or not isinstance(node, dict):
+            return
+        for k, v in node.items():
+            if "lora" in k.lower():
+                found = True
+                return
+            _walk(v)
+
+    _walk(params)
+    return found
+
+
+def convert_cri_encoder(params: dict) -> dict[str, torch.Tensor]:
+    """JAX ``cri_encoder`` MLP → PI0Pytorch ``cri_*`` keys."""
+    enc = params.get("cri_encoder")
+    if not enc:
+        return {}
+
+    def _linear(linear: dict) -> tuple[np.ndarray, np.ndarray]:
+        kernel, bias = linear["kernel"], linear["bias"]
+        if isinstance(kernel, dict):
+            kernel, bias = kernel["value"], bias["value"]
+        return np.asarray(kernel), np.asarray(bias)
+
+    in_k, in_b = _linear(enc["in_proj"])
+    out_k, out_b = _linear(enc["out_proj"])
+    pos = enc["pos"]
+    if isinstance(pos, dict):
+        pos = pos["value"]
+    return {
+        "cri_in_proj.weight": torch.from_numpy(np.array(in_k).T).contiguous().float(),
+        "cri_in_proj.bias": torch.from_numpy(np.array(in_b)).contiguous().float(),
+        "cri_out_proj.weight": torch.from_numpy(np.array(out_k).T).contiguous().float(),
+        "cri_out_proj.bias": torch.from_numpy(np.array(out_b)).contiguous().float(),
+        "cri_pos": torch.from_numpy(np.asarray(pos)).contiguous().float(),
+    }
+
+
+def convert(
+    input_dir: Path,
+    output_dir: Path,
+    action_horizon: int = 15,
+    max_token_len: int = 200,
+) -> Path:
     import orbax.checkpoint as ocp
 
     from rlinf.utils.ckpt_convertor.openpi._core import (
@@ -213,8 +261,11 @@ def convert(input_dir: Path, output_dir: Path, action_horizon: int = 15) -> Path
     params = restored["params"] if "params" in restored and "PaliGemma" not in restored else restored
     params = _unwrap(params)
 
-    print("[2/5] Merging LoRA adapters into base weights")
-    params = merge_lora_into_params(params)
+    if _params_have_lora(params):
+        print("[2/5] Merging LoRA adapters into base weights")
+        params = merge_lora_into_params(params)
+    else:
+        print("[2/5] No LoRA adapters; converting dense polaris + cri_encoder")
 
     print("[3/5] Converting JAX -> new PyTorch layout")
     new_sd: dict[str, torch.Tensor] = {}
@@ -222,6 +273,7 @@ def convert(input_dir: Path, output_dir: Path, action_horizon: int = 15) -> Path
         convert_siglip(params),
         convert_llm(params, pi05=True),
         convert_projections(params, pi05=True),
+        convert_cri_encoder(params),
     ):
         for k, v in part.items():
             new_sd[k] = v.contiguous().float()
@@ -252,10 +304,12 @@ def convert(input_dir: Path, output_dir: Path, action_horizon: int = 15) -> Path
         {
             "action_dim": 32,
             "action_horizon": action_horizon,
-            "max_token_len": 200,
+            "max_token_len": max_token_len,
             "paligemma_variant": "gemma_2b",
             "action_expert_variant": "gemma_300m",
             "pi05": True,
+            "use_cri_prefix": bool(params.get("cri_encoder")),
+            "num_cri_tokens": 9,
             "dtype": "float32",
         },
         output_dir,
@@ -299,8 +353,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Output directory for RLinf-loadable safetensors",
     )
     parser.add_argument("--action-horizon", type=int, default=15)
+    parser.add_argument("--max-token-len", type=int, default=200)
     args = parser.parse_args(argv)
-    convert(args.input_dir, args.output_dir, action_horizon=args.action_horizon)
+    convert(
+        args.input_dir,
+        args.output_dir,
+        action_horizon=args.action_horizon,
+        max_token_len=args.max_token_len,
+    )
     return 0
 
 

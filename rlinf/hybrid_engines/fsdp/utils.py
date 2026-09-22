@@ -54,6 +54,7 @@ from rlinf.hybrid_engines.fsdp import (
     ShardingStrategy,
     fully_shard,
 )
+from rlinf.hybrid_engines.fsdp.state_dict_utils import clean_fsdp_state_dict_key
 from rlinf.scheduler import Worker
 
 
@@ -489,6 +490,36 @@ def apply_fsdp2_to_model(
         )
 
     return fully_shard(module, **root_kwargs)
+
+
+def _iter_named_model_tensors(model: torch.nn.Module):
+    yield from model.named_parameters()
+    yield from model.named_buffers()
+
+
+def overlay_fsdp1_summoned_tensors(
+    model: torch.nn.Module,
+    state_dict: dict,
+    offload_to_cpu: bool = False,
+) -> dict:
+    """Replace sharded FSDP1 values with `summon_full_params` tensors.
+
+    ``use_orig_params=True`` makes ``state_dict()`` / DCP return original
+    names whose values are still 1-D local FlatParameter views. Summoning
+    restores the unwrapped shapes without changing the key set.
+    """
+    with FSDP.summon_full_params(model, writeback=False, rank0_only=False):
+        for name, tensor in _iter_named_model_tensors(model):
+            key = clean_fsdp_state_dict_key(name)
+            if key not in state_dict:
+                continue
+            if tuple(tensor.shape) == tuple(state_dict[key].shape):
+                continue
+            value = tensor.detach().clone()
+            if offload_to_cpu:
+                value = value.to("cpu")
+            state_dict[key] = value
+    return state_dict
 
 
 def get_fsdp2_full_state_dict_all_ranks(

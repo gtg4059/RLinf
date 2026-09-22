@@ -2,6 +2,7 @@ defaults:
   - env/isaaclab_kitchen_open_fridge@env.train
   - env/isaaclab_kitchen_open_fridge@env.eval
   - model/pi0_5@actor.model
+  - model/pi0_5@rollout.model
   - hybrid_engines/fsdp@actor.fsdp_config
   - weight_syncer/patch_syncer@weight_syncer
   - override hydra/job_logging: stdout
@@ -13,21 +14,24 @@ hydra:
   searchpath:
     - file://${oc.env:EMBODIED_PATH}/config/
 
-# Official polaris + TacVLA CRI prefix adapter 30000 (model.safetensors).
-# Override at launch with POLARIS_OPENPI_CKPT=/path/to/pytorch/dir
+# Arena-matched fridge eval of polaris_cri_adapter 30000.
+# Pins kitchen_bench_lightwheel_open_fridge_cri: 70s/1050, exterior_1,
+# 720x1280 letterbox, cri_pre, flow_ode, yawed NextTo pose, wxyz +90 yaw,
+# USD fridge drives (no door PD). 8-env eval on GPU 0.
+#   bash examples/embodiment/run_embodiment.sh isaaclab_kitchen_open_fridge_openpi_pi05_arena_eval
 polaris_openpi_ckpt: ${oc.env:POLARIS_OPENPI_CKPT,${oc.env:REPO_PATH,/workspace/RLinf}/checkpoint/pi05_droid_jointpos_polaris_cri_adapter_rlinf_30000}
 
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: all
+    actor,env,rollout: 1-1
 
 runner:
   task_type: embodied
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "isaaclab_kitchen_open_fridge_openpi_pi05_eval"
+    experiment_name: "isaaclab_kitchen_open_fridge_openpi_pi05_arena_eval"
     logger_backends: ["tensorboard"]
 
   max_epochs: 1
@@ -43,17 +47,13 @@ runner:
   ckpt_path: null
 
 algorithm:
-  # Sparse +1 success: do not z-score a 1–2/128 batch, and do not
-  # let a value head invent advantages on failed trajectories.
   normalize_advantages: False
   kl_penalty: kl
   group_size: 1
   reward_coef: 1.0
-
   reward_type: chunk_level
   logprob_type: chunk_level
   entropy_type: token_level
-
   update_epoch: 1
   adv_type: gae
   loss_type: actor
@@ -65,10 +65,8 @@ algorithm:
   clip_ratio_c: 3.0
   value_clip: 0.2
   huber_delta: 10.0
-
   gamma: 1.0
   gae_lambda: 1.0
-
   filter_rewards: False
   rewards_lower_bound: 0.1
   rewards_upper_bound: 0.9
@@ -78,7 +76,7 @@ env:
 
   train:
     rollout_epoch: 1
-    total_num_envs: 6
+    total_num_envs: 8
     max_episode_steps: 1050
     max_steps_per_rollout_epoch: 1050
     auto_reset: False
@@ -89,6 +87,9 @@ env:
       hold_after_done: False
       episode_length_s: 70.0
       stand_height_m: 0.8
+      # Arena NextTo on the yawed DROID AABB (fridge-centered X).
+      robot_pos: [4.603651840801024, -1.4710035928444452, 0.8]
+      robot_rot: [0.70710678, 0.0, 0.0, 0.70710678]
       task_description: "open the fridge door"
       sample_exterior_camera: False
       sample_exterior_camera_prob: 0.0
@@ -108,41 +109,23 @@ env:
         height: 720
         width: 1280
     video_cfg:
-      save_video: True
-      info_on_video: True
-      fps: 15
-      max_envs_in_video: 1
-      max_videos: 2
-      extra_info_on_video:
-        - episode.success_once
-        - episode.success_count
-        - episode.Episode_Reward/cri_ovf
-        - episode.cri_ovf_term_count
-        - episode.Episode_Reward/time_penalty
-      video_image_keys:
-        - main_images
-        - exterior2_images
-        - wrist_images
-      save_camera_stills: True
-      camera_image_keys:
-        - main_images
-        - exterior2_images
-        - wrist_images
-      video_base_dir: ${runner.logger.log_path}/video/train
+      save_video: False
 
   eval:
-    # Local smoke: 6 episodes, target 5/6. Arena 70s / exterior_1 / 720p.
     rollout_epoch: 1
-    total_num_envs: 6
+    total_num_envs: 8
     max_episode_steps: 1050
     max_steps_per_rollout_epoch: 1050
     auto_reset: False
     ignore_terminations: False
     use_fixed_reset_state_ids: True
+    seed: 42
     init_params:
       hold_after_done: False
       episode_length_s: 70.0
       stand_height_m: 0.8
+      robot_pos: [4.603651840801024, -1.4710035928444452, 0.8]
+      robot_rot: [0.70710678, 0.0, 0.0, 0.70710678]
       task_description: "open the fridge door"
       sample_exterior_camera: False
       sample_exterior_camera_prob: 0.0
@@ -165,13 +148,10 @@ env:
       info_on_video: True
       fps: 15
       max_envs_in_video: 1
-      max_videos: null
+      max_videos: 6
       extra_info_on_video:
         - episode.success_once
         - episode.success_count
-        - episode.Episode_Reward/cri_ovf
-        - episode.cri_ovf_term_count
-        - episode.Episode_Reward/time_penalty
       video_image_keys:
         - main_images
         - exterior2_images
@@ -182,7 +162,6 @@ env:
         - exterior2_images
         - wrist_images
       video_base_dir: ${runner.logger.log_path}/video/eval
-    seed: 42
 
 rollout:
   group_name: "RolloutGroup"
@@ -213,8 +192,9 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 15
-  global_batch_size: 420
+  # 1 GPU (rank 0): 8*1*(1050/15)=560. 560 % 8 == 0.
+  micro_batch_size: 8
+  global_batch_size: 560
   seed: 42
   enable_offload: False
 
@@ -250,6 +230,9 @@ actor:
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "no_shard"
+    # CRI prefix (cri_pos) is a root Parameter; FlatParameter rejects
+    # mixed float32/bfloat16 leftovers without orig params.
+    use_orig_params: True
     gradient_checkpointing: False
     mixed_precision:
       param_dtype: ${actor.model.precision}

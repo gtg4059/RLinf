@@ -43,24 +43,17 @@ from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg, UsdF
 from isaaclab.utils import configclass
 
 from . import mdp
-from .materials import (
-    patch_fridge_material_terminals,
-    prepare_kitchen_fridge_materials,
-)
-from .placement import (
-    arena_open_fridge_fridge_root_pos,
-    arena_open_fridge_robot_pos,
-    placed_fridge_aabb,
-)
+from .materials import prepare_kitchen_fridge_materials
+from .placement import arena_open_fridge_fridge_root_pos, arena_open_fridge_robot_pos
 
 # Repo root: rlinf/envs/isaaclab/tasks/open_fridge_kitchen/env_cfg.py → parents[5]
 _REPO_ROOT = Path(__file__).resolve().parents[5]
 _DEFAULT_ARENA_ASSETS = str(_REPO_ROOT / ".assets" / "isaaclab_arena")
 
-# OpenPI DROID 15 Hz with Isaac Lab decimation 4 (same as pick_place).
+# Arena DROID control: sim.dt (1/120 s) x decimation (8) = 15 Hz.
 _DROID_CONTROL_HZ = 15.0
-_ISAACLAB_DECIMATION = 4
-_ISAACLAB_SIM_DT = (1.0 / _DROID_CONTROL_HZ) / _ISAACLAB_DECIMATION
+_ISAACLAB_DECIMATION = 8
+_ISAACLAB_SIM_DT = 1.0 / 120.0
 
 
 def _resolve_arena_assets_root() -> str:
@@ -83,37 +76,18 @@ _KITCHEN_USD = prepare_kitchen_fridge_materials(
 )
 _DROID_ROBOT_USD = f"{_ARENA}/robot_library/droid/franka_robotiq_2f_85_flattened.usd"
 
-# Arena kitchen_bench_lightwheel_open_fridge:
-# stand_height_m=0.8, stand_footprint_xy_m=(1.08, 0.91032),
-# translate=(-0.05, 0, 0), On(floor), NextTo(fridge, negative_y, 0.1),
-# yaw_rad=1.57 in place. Fridge is_anchor.
+# Arena kitchen_bench_lightwheel_open_fridge: ObjectPlacer yaws the DROID
+# AABB (+90°) then solves NextTo fridge side=negative_y, distance_m=0.1.
+# Un-yawed NextTo (~4.80, -1.44) sits 20 cm off the fridge center.
 _STAND_HEIGHT_M = 0.8
 _ROBOT_POS = arena_open_fridge_robot_pos()
-_ROBOT_ROT = (0.70710678, 0.0, 0.0, 0.70710678)  # +90 deg yaw, wxyz
-_FRIDGE_ROOT_POS = arena_open_fridge_fridge_root_pos()
-_FRIDGE_MIN, _FRIDGE_MAX = placed_fridge_aabb(fridge_root=_FRIDGE_ROOT_POS)
-_FRIDGE_CX = 0.5 * (_FRIDGE_MIN[0] + _FRIDGE_MAX[0])
-_FRIDGE_CY = 0.5 * (_FRIDGE_MIN[1] + _FRIDGE_MAX[1])
-# Same +Y look vector as the Arena Lightwheel viewer, aimed at the kitchen fridge.
-_EVAL_CAM_POS = (_FRIDGE_CX, -4.5, 1.5)
-_EVAL_CAM_LOOKAT = (_FRIDGE_CX, _FRIDGE_CY, 0.9)
+_FRIDGE_POS = arena_open_fridge_fridge_root_pos()
+# Isaac Lab InitialStateCfg.rot is (w, x, y, z). Converted DROID cams look
+# [+X, −Y] in the parent; +90 deg yaw turns that to [+X, +Y] (fridge door).
+_ROBOT_ROT = (0.70710678, 0.0, 0.0, 0.70710678)
 _FRIDGE_DOOR_JOINT = "fridge_door_joint"
 _OPENNESS_THRESHOLD = 0.2
 _RESET_OPENNESS = 0.0
-
-
-def _spawn_kitchen_with_visible_fridge(prim_path, cfg, *args, **kwargs):
-    """Spawn the kitchen USD, then drop failing fridge MDL surface terminals."""
-    from isaaclab.sim.spawners.from_files.from_files import spawn_from_usd
-
-    prim = spawn_from_usd(prim_path, cfg, *args, **kwargs)
-    albedo = str(
-        Path(cfg.usd_path).resolve().parent / "textures" / "T_Refrigerator032_BC001_0.png"
-    )
-    patch_fridge_material_terminals(
-        prim.GetStage(), str(prim.GetPath()), albedo_path=albedo
-    )
-    return prim
 
 
 @configclass
@@ -172,7 +146,7 @@ class OpenFridgeKitchenSceneCfg(InteractiveSceneCfg):
                 joint_names_expr=["finger_joint"],
                 stiffness=None,
                 damping=None,
-                velocity_limit=1.0,
+                velocity_limit=5.0,
             ),
         },
     )
@@ -181,34 +155,29 @@ class OpenFridgeKitchenSceneCfg(InteractiveSceneCfg):
     kitchen: AssetBaseCfg = AssetBaseCfg(
         prim_path="{ENV_REGEX_NS}/Kitchen",
         init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, 0.0)),
-        spawn=UsdFileCfg(
-            usd_path=_KITCHEN_USD,
-            func=_spawn_kitchen_with_visible_fridge,
-        ),
+        spawn=UsdFileCfg(usd_path=_KITCHEN_USD),
     )
 
     # Nested fridge articulation already present in the kitchen USD.
-    # init_state.pos translates the USD-origin root so the body is in front
-    # of the robot after the EE-forward base shift.
     fridge: ArticulationCfg = ArticulationCfg(
         prim_path="{ENV_REGEX_NS}/Kitchen/fridge_main_group",
         spawn=None,
         init_state=ArticulationCfg.InitialStateCfg(
-            pos=_FRIDGE_ROOT_POS,
+            pos=_FRIDGE_POS,
             joint_pos={_FRIDGE_DOOR_JOINT: 0.0},
         ),
-        actuators={
-            "fridge_door": ImplicitActuatorCfg(
-                joint_names_expr=[".*door.*"],
-                stiffness=80.0,
-                damping=20.0,
-            ),
-        },
+        # Arena ObjectReference articulations use empty actuators so the USD
+        # drive stays in charge. A PD hold (stiffness/damping) fights the
+        # policy and keeps the door closed.
+        actuators={},
     )
 
-    # Arena ``DroidCameraCfg`` offsets, Isaac Lab wxyz (source tuples are xyzw).
+    # Arena ``DroidCameraCfg`` mounts. Isaac Lab 2.x OffsetCfg.rot is wxyz;
+    # Arena 3.0 stores xyzw, so convert (x, y, z, w) → (w, x, y, z).
+    # Tiled 224 matches pick-place PPO (64 envs/GPU). Wrapper may raise
+    # height/width; 1280×720 CameraCfg exhausted RTX descriptors at 64/GPU.
     external_camera: TiledCameraCfg = TiledCameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/external_camera",
+        prim_path="{ENV_REGEX_NS}/Robot/panda_link0/external_camera",
         height=224,
         width=224,
         data_types=["rgb"],
@@ -226,7 +195,7 @@ class OpenFridgeKitchenSceneCfg(InteractiveSceneCfg):
     )
 
     external_camera_2: TiledCameraCfg = TiledCameraCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/external_camera_2",
+        prim_path="{ENV_REGEX_NS}/Robot/panda_link0/external_camera_2",
         height=224,
         width=224,
         data_types=["rgb"],
@@ -272,9 +241,9 @@ class OpenFridgeKitchenSceneCfg(InteractiveSceneCfg):
             horizontal_aperture=20.955,
             vertical_aperture=15.2908,
         ),
-        # Same +Y 3/4 look as Arena's Lightwheel viewer, aimed at the fridge.
+        # Face the fridge (x≈4.60), not the sink/coffee run at x≈2.75.
         offset=CameraCfg.OffsetCfg(
-            pos=_EVAL_CAM_POS,
+            pos=(4.60, -5.5, 1.5),
             rot=(0.8660, 0.3536, 0.1768, 0.3030),
             convention="opengl",
         ),
@@ -289,9 +258,8 @@ class OpenFridgeKitchenSceneCfg(InteractiveSceneCfg):
     light: AssetBaseCfg = AssetBaseCfg(
         prim_path="/World/light",
         spawn=sim_utils.DomeLightCfg(
-            color=(1.0, 1.0, 1.0),
-            # Black fridge face needs more than the maple-table default (500).
-            intensity=2000.0,
+            color=(0.75, 0.75, 0.75),
+            intensity=1500.0,
         ),
     )
 
@@ -357,6 +325,7 @@ class ObservationsCfg:
                 "normalize": False,
             },
         )
+        door_openness = ObsTerm(func=mdp.fridge_door_openness)
 
         def __post_init__(self):
             self.enable_corruption = False
@@ -370,11 +339,6 @@ class EventCfg:
     """Reset robot / kitchen and close the fridge door."""
 
     reset_all = EventTerm(func=mdp.reset_scene_to_default, mode="reset")
-    reset_fridge_root = EventTerm(
-        func=mdp.reset_fridge_root_pose,
-        mode="reset",
-        params={"asset_cfg": SceneEntityCfg("fridge")},
-    )
     reset_fridge_door = EventTerm(
         func=mdp.reset_fridge_door,
         mode="reset",
@@ -430,5 +394,6 @@ class OpenFridgeKitchenEnvCfg(ManagerBasedRLEnvCfg):
         self.episode_length_s = 10.0
         self.sim.dt = _ISAACLAB_SIM_DT
         self.sim.render_interval = self.decimation
-        self.viewer.eye = _EVAL_CAM_POS
-        self.viewer.lookat = _EVAL_CAM_LOOKAT
+        # Look at the fridge, not the default one-wall kitchen midpoint.
+        self.viewer.eye = (4.60, -5.5, 1.5)
+        self.viewer.lookat = (4.60, -1.4, 0.9)

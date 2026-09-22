@@ -41,44 +41,6 @@ from rlinf.utils.logging import get_logger
 from rlinf.utils.nested_dict_process import copy_dict_tensor
 from rlinf.utils.pytree import register_pytree_dataclasses
 
-_IMAGE_TOKENS_PER_SLOT = 256
-_OPENPI_IMAGE_SLOTS = 3
-
-
-def vlm_value_prefix_mask(
-    seq_len: int,
-    num_images_in_input: int,
-    value_vlm_mode: str,
-) -> list[bool]:
-    """Boolean index for ``prefix_output[:, mask, :]`` in ``get_value_from_vlm``.
-
-    Length must match the actual prefix (``max_token_len``), not a hardcoded
-    pi05 default of 200. PolarIS CRI uses 220 language tokens.
-    """
-    if value_vlm_mode == "mean_token":
-        unused_slots = _OPENPI_IMAGE_SLOTS - num_images_in_input
-        if unused_slots < 0:
-            raise ValueError(
-                f"num_images_in_input={num_images_in_input} exceeds "
-                f"{_OPENPI_IMAGE_SLOTS} image slots"
-            )
-        lang_token_len = seq_len - _IMAGE_TOKENS_PER_SLOT * _OPENPI_IMAGE_SLOTS
-        if lang_token_len < 0:
-            raise ValueError(
-                f"prefix seq_len {seq_len} is shorter than "
-                f"{_IMAGE_TOKENS_PER_SLOT * _OPENPI_IMAGE_SLOTS} image tokens"
-            )
-        return (
-            [True] * (_IMAGE_TOKENS_PER_SLOT * num_images_in_input)
-            + [False] * (_IMAGE_TOKENS_PER_SLOT * unused_slots)
-            + [True] * lang_token_len
-        )
-    if value_vlm_mode == "last_token":
-        return [False] * (seq_len - 1) + [True]
-    if value_vlm_mode == "first_token":
-        return [True] + [False] * (seq_len - 1)
-    raise ValueError(f"Unknown value_vlm_mode: {value_vlm_mode}")
-
 
 def _to_numpy(x):
     """Detach tensor and convert to NumPy (bf16/fp16 need float32 first)."""
@@ -200,6 +162,13 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             # --pi05 only--
             "time_mlp_in",
             "time_mlp_out",
+            # CRI prefix adapters stay float32 after
+            # paligemma_with_expert.to_bfloat16_for_selected_params.
+            # Isolate them so FSDP does not flatten them with leftover
+            # bfloat16 PaliGemma weights (uniform-dtype FlatParameter).
+            "cri_in_proj",
+            "cri_out_proj",
+            "cri_pos",
         ]
 
     def __init__(
@@ -230,6 +199,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 "pi05_droid_polaris",
                 "pi05_droid_jointpos_polaris",
                 "pi05_droid_jointpos_polaris_cri",
+                "pi05_droid_jointpos_polaris_cri_adapter",
             ]:
                 value_head_hidden_sizes = (1024, 512, 256)
             else:
@@ -473,8 +443,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         }
 
     def _sft_forward_with_rlt_prefix(self, observation, actions):
-        images, img_masks, lang_tokens, lang_masks, state = (
-            self._preprocess_observation(observation, train=True)
+        images, img_masks, lang_tokens, lang_masks, state, cri = (
+            self._split_processed_obs(
+                self._preprocess_observation(observation, train=True)
+            )
         )
 
         noise = self.sample_noise(actions.shape, actions.device)
@@ -484,9 +456,14 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
-        )
+        try:
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+                images, img_masks, lang_tokens, lang_masks, cri
+            )
+        except TypeError:
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+                images, img_masks, lang_tokens, lang_masks
+            )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
             self.embed_suffix(state, x_t, time)
         )
@@ -541,8 +518,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return loss, prefix_output, prefix_pad_masks
 
     def _build_rlt_prefix_cache(self, observation, *, train: bool):
-        images, img_masks, lang_tokens, lang_masks, state = (
-            self._preprocess_observation(observation, train=train)
+        images, img_masks, lang_tokens, lang_masks, state, cri = (
+            self._split_processed_obs(
+                self._preprocess_observation(observation, train=train)
+            )
         )
         device = next(self.parameters()).device
         images = [img.to(device) for img in images]
@@ -554,7 +533,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         state = state.to(device)
 
         prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
-            images, img_masks, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks, cri
         )
         return prefix_output, prefix_pad_masks, past_key_values, lang_tokens, state
 
@@ -774,8 +753,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         # input transform
         observation = self.input_transform(forward_inputs, transpose=False)
         observation = _model.Observation.from_dict(observation)
-        images, img_masks, lang_tokens, lang_masks, state = (
-            self._preprocess_observation(observation, train=False)
+        images, img_masks, lang_tokens, lang_masks, state, cri = (
+            self._split_processed_obs(
+                self._preprocess_observation(observation, train=False)
+            )
         )
         # transfer to device
         device = chains.device
@@ -792,6 +773,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             chains,
             denoise_inds,
             compute_values,
+            cri=cri,
         )
         log_probs = log_probs[
             :, :, : self.config.action_chunk, : self.config.action_env_dim
@@ -820,8 +802,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         # obs process
         observation = self.input_transform(forward_inputs, transpose=False)
         observation = _model.Observation.from_dict(observation)
-        images, img_masks, lang_tokens, lang_masks, state = (
-            self._preprocess_observation(observation, train=False)
+        images, img_masks, lang_tokens, lang_masks, state, cri = (
+            self._split_processed_obs(
+                self._preprocess_observation(observation, train=False)
+            )
         )
         # move device
         device = next(self.parameters()).device
@@ -834,7 +818,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         t = nft_inputs["timesteps"].to(device)
         # get v_theta
         _, prefix_pad_masks, past_key_values = self._build_prefix_cache(
-            images, img_masks, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks, cri
         )
         compute_values = kwargs.get("compute_values", False)
         v_theta, suffix_out = self.get_velocity(
@@ -1034,12 +1018,14 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             # DSRL: SAC provides noise, convert dtype to match action_in_proj
             noise = noise.to(self.action_in_proj.weight.dtype)
 
-        images, img_masks, lang_tokens, lang_masks, state = (
-            self._preprocess_observation(observation, train=False)
+        images, img_masks, lang_tokens, lang_masks, state, cri = (
+            self._split_processed_obs(
+                self._preprocess_observation(observation, train=False)
+            )
         )
 
         prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
-            images, img_masks, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks, cri
         )
 
         return self._sample_actions_with_prefix_cache(
@@ -1303,11 +1289,45 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         v_t = self.action_out_proj(suffix_out)
         return v_t, suffix_out
 
-    def _build_prefix_cache(self, images, img_masks, lang_tokens, lang_masks):
-        """Embed prefix tokens and compute KV cache for efficient suffix generation."""
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
+    def _split_processed_obs(self, processed):
+        """Accept both stock 5-tuple and CRI-prefix 6-tuple preprocess output."""
+        if len(processed) >= 6:
+            images, img_masks, lang_tokens, lang_masks, state, cri = processed[:6]
+        else:
+            images, img_masks, lang_tokens, lang_masks, state = processed
+            cri = None
+        return (
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            self._cast_cri_to_proj_dtype(cri),
         )
+
+    def _cast_cri_to_proj_dtype(self, cri):
+        """Match CRI tokens to ``cri_in_proj`` (bfloat16 after FSDP-safe cast)."""
+        if cri is None:
+            return None
+        if not torch.is_tensor(cri):
+            cri = torch.as_tensor(cri)
+        proj = getattr(self, "cri_in_proj", None)
+        weight = getattr(proj, "weight", None)
+        if weight is None:
+            return cri
+        return cri.to(device=weight.device, dtype=weight.dtype)
+
+    def _build_prefix_cache(self, images, img_masks, lang_tokens, lang_masks, cri=None):
+        """Embed prefix tokens and compute KV cache for efficient suffix generation."""
+        cri = self._cast_cri_to_proj_dtype(cri)
+        try:
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+                images, img_masks, lang_tokens, lang_masks, cri
+            )
+        except TypeError:
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+                images, img_masks, lang_tokens, lang_masks
+            )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
@@ -1362,11 +1382,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         chains,
         denoise_inds,
         compute_values=False,
+        cri=None,
     ):
         bsize = state.shape[0]
         batch_indices = torch.arange(bsize)
         prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
-            images, img_masks, lang_tokens, lang_masks
+            images, img_masks, lang_tokens, lang_masks, cri
         )
         chains_log_probs = []
         chains_values = []
@@ -1418,13 +1439,27 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return chains_log_probs, chains_values, chains_entropy
 
     def get_value_from_vlm(self, prefix_output):
-        # OpenPI prefix is always 3 image slots of 256 plus language tokens.
-        # pi05 default: 256 * 3 + 200 = 968. PolarIS CRI: 256 * 3 + 220 = 988.
-        prefix_mask = vlm_value_prefix_mask(
-            prefix_output.shape[1],
-            self.config.num_images_in_input,
-            self.config.value_vlm_mode,
-        )
+        # prefix_output:
+        # pi05: [bs, (256 * 3 + 200) = 968, 2048]
+        # pi0: [bs, (256 * 3 + 48) = 816, 1024]
+        # token length
+        if "pi05_" in self.config.config_name:
+            lang_token_len = 200
+            all_token_length = 968
+        elif "pi0_" in self.config.config_name:
+            lang_token_len = 48
+            all_token_length = 816
+
+        if self.config.value_vlm_mode == "mean_token":
+            prefix_mask = (
+                [True] * 256 * self.config.num_images_in_input
+                + [False] * 256 * (3 - self.config.num_images_in_input)
+                + [True] * lang_token_len
+            )
+        elif self.config.value_vlm_mode == "last_token":
+            prefix_mask = [False] * (all_token_length - 1) + [True] * 1
+        elif self.config.value_vlm_mode == "first_token":
+            prefix_mask = [True] * 1 + [False] * (all_token_length - 1)
         prefix_out_value = prefix_output[:, prefix_mask, :]
         prefix_out_value = prefix_out_value.mean(dim=1, keepdim=False)
         prefix_out_value = prefix_out_value.to(dtype=torch.float32)

@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Compose DROID robot + Arena franka_stand_grey pedestal (matches Isaac Lab Arena).
-
-Faithful port of ``isaaclab_arena.embodiments.robot_on_stand_utils.compose_on_stand_usd``
-for local ``.assets/isaaclab_arena`` paths. Requires ``pxr`` (available after
-Isaac Sim ``AppLauncher``).
-"""
+"""Compose DROID + Arena stand footprint for kitchen fridge-open."""
 
 from __future__ import annotations
 
@@ -28,12 +23,11 @@ from pathlib import Path
 
 from pxr import Gf, Usd, UsdGeom
 
-# Arena height/scale; footprint shifted +X vs Arena (−0.05) so the grey
-# ``franka_table`` seat stays under ``panda_link0`` toward the maple table.
-_STAND_DEFAULT_HEIGHT_M = 1.35
-_FOOTPRINT_TRANSLATE_XYZ = (0.08, 0.0, 0.0)
-_FOOTPRINT_SCALE_XY = (1.2, 1.2)
+# Arena ``StandPrimSpec`` for DROID: translate (−0.05, 0, 0), 1.08 x 0.91032 m.
+_ARENA_FOOTPRINT_TRANSLATE_XYZ = (-0.05, 0.0, 0.0)
+_ARENA_FOOTPRINT_XY_M = (1.08, 0.91032)
 _HEIGHT_ATOL = 1e-3
+_FOOTPRINT_ATOL = 1e-3
 _ALIGN_ATOL = 5e-2
 
 
@@ -53,32 +47,13 @@ class _RobotPrimSpec:
         return f"{self.robot_base_prim_path}/{self.stand_prim_name}"
 
 
-@dataclass(frozen=True)
-class _StandPrimSpec:
-    stand_usd_path: str
-    ref_prim_path: str = "/World/franka_table"
-    payload_child_name: str = "franka_table"
-    footprint_translate_xyz: tuple[float, float, float] = _FOOTPRINT_TRANSLATE_XYZ
-    footprint_scale_xy: tuple[float, float] = _FOOTPRINT_SCALE_XY
-    stand_default_height: float = _STAND_DEFAULT_HEIGHT_M
-
-
-def compose_droid_on_stand(
+def compose_droid_on_stand_arena(
     arena_assets_root: str | Path,
     *,
-    stand_height_m: float = _STAND_DEFAULT_HEIGHT_M,
+    stand_height_m: float,
     output_dir: str | Path | None = None,
 ) -> str:
-    """Return a local robot+stand USD path (cached under ``robot_library/droid``).
-
-    Args:
-        arena_assets_root: ``.assets/isaaclab_arena`` root.
-        stand_height_m: Absolute stand height after align (Arena default 1.35).
-        output_dir: Optional override for the composed USD directory.
-
-    Returns:
-        Filesystem path to the composed USD.
-    """
+    """Return a cached robot+stand USD with Arena fridge footprint."""
     arena = Path(arena_assets_root)
     robot_usd = arena / "robot_library/droid/franka_robotiq_2f_85_flattened.usd"
     stand_usd = (
@@ -91,15 +66,11 @@ def compose_droid_on_stand(
 
     out_dir = Path(output_dir) if output_dir else robot_usd.parent
     out_dir.mkdir(parents=True, exist_ok=True)
-    # Include footprint in the cache name so translate/scale tweaks bust stale USDs.
-    fx, fy, fz = _FOOTPRINT_TRANSLATE_XYZ
-    sx, sy = _FOOTPRINT_SCALE_XY
-    out_path = (
-        out_dir
-        / (
-            f"franka_robotiq_2f_85_on_stand_{stand_height_m:.3f}"
-            f"_t{fx:.3f}_{fy:.3f}_{fz:.3f}_s{sx:.2f}_{sy:.2f}.usd"
-        )
+    tx, ty, tz = _ARENA_FOOTPRINT_TRANSLATE_XYZ
+    fx, fy = _ARENA_FOOTPRINT_XY_M
+    out_path = out_dir / (
+        f"franka_robotiq_2f_85_on_stand_{stand_height_m:.3f}"
+        f"_t{tx:.3f}_{ty:.3f}_{tz:.3f}_f{fx:.3f}x{fy:.3f}.usd"
     )
     if out_path.is_file() and out_path.stat().st_mtime >= max(
         robot_usd.stat().st_mtime, stand_usd.stat().st_mtime
@@ -107,82 +78,74 @@ def compose_droid_on_stand(
         return str(out_path)
 
     robot = _RobotPrimSpec(robot_usd_path=str(robot_usd))
-    stand = _StandPrimSpec(stand_usd_path=str(stand_usd))
-
     with tempfile.NamedTemporaryFile(
         suffix=".usd", dir=out_dir, delete=False
     ) as tmp_file:
         tmp_path = Path(tmp_file.name)
-
     try:
         stage = Usd.Stage.CreateNew(str(tmp_path))
         root = stage.DefinePrim(robot.root_prim_path, "Xform")
         root.GetReferences().AddReference(robot.robot_usd_path, robot.root_prim_path)
         stage.SetDefaultPrim(root)
-        _mount_stand_normalized(stage, robot, stand, stand_height_m)
+        _mount_arena_stand(stage, robot, str(stand_usd), stand_height_m)
         if not stage.GetRootLayer().Save():
             raise RuntimeError(f"failed to save composed on-stand USD to {tmp_path}")
         os.replace(tmp_path, out_path)
     except Exception:
         tmp_path.unlink(missing_ok=True)
         raise
-
     return str(out_path)
 
 
-def _mount_stand_normalized(
+def _mount_arena_stand(
     stage: Usd.Stage,
     robot: _RobotPrimSpec,
-    stand: _StandPrimSpec,
+    stand_usd_path: str,
     stand_height_m: float,
 ) -> None:
-    """Parent Arena ``franka_table`` under ``panda_link0`` and scale to height."""
     robot_base = stage.GetPrimAtPath(robot.robot_base_prim_path)
     if not robot_base.IsValid():
         raise RuntimeError(
             f"On-stand USD missing robot base prim at {robot.robot_base_prim_path!r}"
         )
-
     pre_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
     robot_range = pre_cache.ComputeWorldBound(robot_base).ComputeAlignedRange()
     if robot_range.IsEmpty():
         raise RuntimeError(f"empty robot base bounds at {robot_base.GetPath()}")
     robot_min_z = float(robot_range.GetMin()[2])
 
-    tx, ty, _tz = stand.footprint_translate_xyz
-    sx, sy = stand.footprint_scale_xy
-    stand_prim_path = robot.stand_prim_path
-
-    stand_xf = UsdGeom.Xform.Define(stage, stand_prim_path)
+    tx, ty, _tz = _ARENA_FOOTPRINT_TRANSLATE_XYZ
+    stand_xf = UsdGeom.Xform.Define(stage, robot.stand_prim_path)
     translate_op = stand_xf.AddTranslateOp()
     translate_op.Set(Gf.Vec3d(tx, ty, _tz))
     scale_op = stand_xf.AddScaleOp()
-    scale_op.Set(Gf.Vec3d(sx, sy, 1.0))
+    scale_op.Set(Gf.Vec3d(1.0, 1.0, 1.0))
 
-    payload_prim = stage.DefinePrim(f"{stand_prim_path}/{stand.payload_child_name}")
-    payload_prim.GetReferences().AddReference(
-        stand.stand_usd_path, stand.ref_prim_path
-    )
+    payload_prim = stage.DefinePrim(f"{robot.stand_prim_path}/franka_table")
+    payload_prim.GetReferences().AddReference(stand_usd_path, "/World/franka_table")
 
     stand_prim = stand_xf.GetPrim()
     bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
     stand_range = bbox_cache.ComputeWorldBound(stand_prim).ComputeAlignedRange()
     if stand_range.IsEmpty():
         raise RuntimeError(f"empty stand bounds at {stand_prim.GetPath()}")
-    native_height = float(stand_range.GetSize()[2])
-    if native_height <= 0.0:
-        raise RuntimeError(f"non-positive stand height at {stand_prim.GetPath()}")
-    scale_op.Set(Gf.Vec3d(sx, sy, stand_height_m / native_height))
+    native_x, native_y, native_height = (float(v) for v in stand_range.GetSize())
+    if native_x <= 0.0 or native_y <= 0.0 or native_height <= 0.0:
+        raise RuntimeError(f"non-positive stand size at {stand_prim.GetPath()}")
+    fx, fy = _ARENA_FOOTPRINT_XY_M
+    scale_op.Set(Gf.Vec3d(fx / native_x, fy / native_y, stand_height_m / native_height))
     translate_op.Set(Gf.Vec3d(tx, ty, robot_min_z))
 
-    verify_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
-    stand_range = verify_cache.ComputeWorldBound(stand_prim).ComputeAlignedRange()
-    stand_height = float(stand_range.GetSize()[2])
+    verify = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
+    stand_range = verify.ComputeWorldBound(stand_prim).ComputeAlignedRange()
+    stand_x_m, stand_y_m, stand_height = (float(v) for v in stand_range.GetSize())
     stand_max_z = float(stand_range.GetMax()[2])
     if abs(stand_height - stand_height_m) >= _HEIGHT_ATOL:
-        raise RuntimeError(
-            f"stand height {stand_height} != requested {stand_height_m}"
-        )
+        raise RuntimeError(f"stand height {stand_height} != requested {stand_height_m}")
+    if abs(stand_x_m - fx) >= _FOOTPRINT_ATOL:
+        raise RuntimeError(f"stand x {stand_x_m} != requested {fx}")
+    if abs(stand_y_m - fy) >= _FOOTPRINT_ATOL:
+        raise RuntimeError(f"stand y {stand_y_m} != requested {fy}")
     if abs(stand_max_z - robot_min_z) >= _ALIGN_ATOL:
         raise RuntimeError(
             f"stand/robot align failed: stand_max_z={stand_max_z}, "

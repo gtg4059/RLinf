@@ -88,7 +88,7 @@ env:
     # Collocated actor+env+rollout on all visible GPUs.
     # Per-GPU envs = total_num_envs / actor_world_size. Must divide evenly.
     # This host currently exposes 8 GPUs → 64 envs/GPU.
-    total_num_envs: 128
+    total_num_envs: 512
     # 10 s at OpenPI DROID 15 Hz (1/3 of the 30 s / 450-step horizon).
     max_episode_steps: 150
     max_steps_per_rollout_epoch: 150
@@ -115,7 +115,7 @@ env:
       cri_ovf_termination_enabled: False
       # Living cost until the first cycle success (leftover Isaac
       # episodes do not keep paying). 30 steps saved ≈ success/3.
-      time_penalty_weight: -0.00005
+      time_penalty_weight: -0.0001
     # First two train rollouts only (env 0). Later epochs skip encoding.
     video_cfg:
       save_video: True
@@ -143,7 +143,7 @@ env:
   eval:
     rollout_epoch: 1
     # Must be divisible by env world size. 8 GPUs → 32 envs/GPU.
-    total_num_envs: 64
+    total_num_envs: 256
     max_episode_steps: 150  # 10 s at OpenPI DROID 15 Hz
     max_steps_per_rollout_epoch: 150
     auto_reset: True

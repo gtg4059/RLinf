@@ -34,6 +34,12 @@ from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_ba
 from rlinf.data.io_struct import BatchResizingIterator, RolloutResult
 from rlinf.data.lerobot_paths import resolve_lerobot_repo_id
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
+from rlinf.hybrid_engines.fsdp.state_dict_utils import (
+    all_gather_local_shard_to_shape,
+    clean_fsdp_state_dict_key,
+    collect_cleaned_named_tensors,
+    fill_missing_named_tensors,
+)
 from rlinf.hybrid_engines.fsdp.utils import (
     pack_fsdp_input,
     prepare_pack_fsdp,
@@ -1139,7 +1145,70 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         return model
 
     def get_rollout_state_dict(self) -> dict:
-        return self.get_model_state_dict(cpu_offload=False, full_state_dict=False)
+        """Return unsharded tensors for PatchWeightSyncer ``copy_``.
+
+        ``full_state_dict=False`` is correct for ``no_shard`` (avoids the
+        FSDP NO_SHARD warning). Under ``shard_grad_op`` / ``full_shard`` it
+        yields 1-D FlatParameter shards under the original key names, while
+        rollout HF params stay full-shaped, so ``target.copy_(value)`` fails
+        (e.g. dim 1 of 2048 vs 263323648).
+        """
+        sharding = str(
+            self._cfg.fsdp_config.get("sharding_strategy", "no_shard")
+        ).lower()
+        if sharding == "no_shard":
+            # DCP/FSDP full-state-dict hooks require every managed name in
+            # module.state_dict(). A root ``cri_pos`` Parameter is tracked
+            # but omitted there. After the first train step, FSDP
+            # named_parameters can also drop frozen VLM weights.
+            state_dict = collect_cleaned_named_tensors(self.model)
+        else:
+            state_dict = self.get_model_state_dict(
+                cpu_offload=False, full_state_dict=True
+            )
+            state_dict = {
+                clean_fsdp_state_dict_key(name): tensor
+                for name, tensor in state_dict.items()
+            }
+        fill_missing_named_tensors(
+            self.model,
+            state_dict,
+            getattr(self, "param_names_need_sync", ()) or (),
+        )
+        orig_shapes = getattr(self, "_unwrapped_tensor_shapes", {})
+        mismatched_names = [
+            name
+            for name, shape in orig_shapes.items()
+            if name in state_dict and tuple(state_dict[name].shape) != shape
+        ]
+        if mismatched_names:
+            group = self._dp_group
+            for name in mismatched_names:
+                # Clone so all_gather / reshape never alias live FSDP views.
+                state_dict[name] = all_gather_local_shard_to_shape(
+                    state_dict[name].detach().clone(),
+                    orig_shapes[name],
+                    group=group,
+                )
+        mismatched = [
+            f"{name}: got {tuple(state_dict[name].shape)} expected {shape}"
+            for name, shape in orig_shapes.items()
+            if name in state_dict and tuple(state_dict[name].shape) != shape
+        ]
+        if mismatched:
+            raise RuntimeError(
+                "Rollout state dict still has FSDP shards after gather: "
+                + "; ".join(mismatched[:8])
+            )
+        # After the first sync, drop FSDP/tied extras the rollout never had.
+        # Init already did this in-place; later get_rollout_state_dict() rebuilds
+        # them and PatchBuilder used to reject the second sync after eval.
+        ordered = getattr(getattr(self, "weight_syncer", None), "ordered_keys", None)
+        if ordered:
+            extra_keys = [key for key in list(state_dict) if key not in set(ordered)]
+            for key in extra_keys:
+                del state_dict[key]
+        return state_dict
 
     @Worker.timer("actor/sync_model_to_rollout")
     async def sync_model_to_rollout(self) -> None:

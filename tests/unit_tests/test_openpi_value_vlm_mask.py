@@ -14,12 +14,9 @@
 
 """VLM value prefix mask must match OpenPI prefix length (incl. PolarIS CRI 220)."""
 
-import pytest
 import torch
 
-pytest.importorskip("openpi")
-
-from rlinf.models.embodiment.openpi.openpi_action_model import vlm_value_prefix_mask
+from rlinf.models.embodiment.openpi.cri_prefix import vlm_value_prefix_mask
 
 
 def test_mean_token_mask_matches_polaris_cri_prefix():
@@ -37,6 +34,13 @@ def test_mean_token_mask_keeps_pi05_default_200():
     mask = vlm_value_prefix_mask(seq_len, num_images_in_input=2, value_vlm_mode="mean_token")
     assert len(mask) == 968
     assert sum(mask) == 256 * 2 + 200
+
+
+def test_mean_token_mask_keeps_adapter_cri_prefix():
+    seq_len = 256 * 3 + 200 + 9
+    mask = vlm_value_prefix_mask(seq_len, num_images_in_input=2, value_vlm_mode="mean_token")
+    assert len(mask) == 977
+    assert sum(mask) == 256 * 2 + 209
 
 
 def test_last_and_first_token_use_actual_seq_len():

@@ -14,8 +14,6 @@
 
 """Unit tests for kitchen fridge open-door MDP + registration (no Isaac Sim)."""
 
-from pathlib import Path
-
 import numpy as np
 import pytest
 import torch
@@ -25,24 +23,12 @@ from rlinf.envs.isaaclab.tasks.open_fridge_kitchen import (
     GYM_ID,
     IsaaclabOpenFridgeKitchenEnv,
 )
-from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.door import compute_door_openness
-from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.materials import (
-    kitchen_fridge_overlay_usda,
-    prepare_kitchen_fridge_materials,
+from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.door import (
+    compute_door_openness,
+    door_reached_from_rest,
 )
 from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.placement import (
-    FRIDGE_AABB_MAX,
-    FRIDGE_AABB_MIN,
-    NEXT_TO_DISTANCE_M,
-    ROBOT_LOCAL_AABB_MAX,
-    ROBOT_LOCAL_AABB_MIN,
-    STAND_LOCAL_MAX_X,
-    FRIDGE_VISUAL_POS,
-    arena_open_fridge_fridge_root_pos,
     arena_open_fridge_robot_pos,
-    next_to_root_xy,
-    on_root_z,
-    placed_fridge_aabb,
 )
 from rlinf.envs.isaaclab.tasks.pick_place_cube_plate import wrap_droid_obs
 from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.env import (
@@ -58,8 +44,21 @@ def test_compute_door_openness_closed_and_threshold():
     assert openness[0].item() == pytest.approx(0.0)
     assert openness[1].item() == pytest.approx(0.2)
     assert openness[2].item() == pytest.approx(1.0)
-    assert bool((openness >= 0.2)[1])
-    assert not bool((openness >= 0.2)[0])
+    # Arena Openable.is_open is strict: openness > threshold.
+    assert bool((openness > 0.2)[2])
+    assert not bool((openness > 0.2)[1])
+    assert not bool((openness > 0.2)[0])
+
+
+def test_door_reached_from_rest_matches_arena():
+    """Reach is Arena is_away_from_rest_openness (min change 0.05)."""
+    openness = torch.tensor([0.0, 0.04, 0.05, 0.06, 0.2])
+    reached = door_reached_from_rest(openness)
+    assert not bool(reached[0])
+    assert not bool(reached[1])
+    assert not bool(reached[2])
+    assert bool(reached[3])
+    assert bool(reached[4])
 
 
 def test_compute_door_openness_clamps_and_zero_span():
@@ -94,11 +93,82 @@ def test_wrap_droid_obs_fridge_prompt():
     assert wrapped["wrist_images"] is not None
 
 
+def test_arena_open_fridge_robot_pos_is_next_to_solver():
+    """Eval pose must use the yawed AABB Arena ObjectPlacer feeds to NextTo."""
+    pos = arena_open_fridge_robot_pos()
+    assert pos[0] == pytest.approx(4.603651840801024, abs=1e-6)
+    assert pos[1] == pytest.approx(-1.4710035928444452, abs=1e-6)
+    assert pos[2] == pytest.approx(0.8, abs=1e-6)
+    unyawed = arena_open_fridge_robot_pos(yaw_rad=0.0)
+    assert unyawed[0] == pytest.approx(4.804942045915199, abs=1e-6)
+
+
+def test_open_fridge_eval_yaml_uses_wxyz_plus90_for_fridge_view():
+    """Converted DROID cams look [+X, −Y]; +90 yaw aims them at the fridge door."""
+    from pathlib import Path
+
+    import yaml
+
+    repo = Path(__file__).resolve().parents[2]
+    eval_yaml = (
+        repo
+        / "examples/embodiment/config/isaaclab_kitchen_open_fridge_openpi_pi05_arena_eval.yaml"
+    )
+    text = eval_yaml.read_text()
+    assert "robot_rot: [0.70710678, 0.0, 0.0, 0.70710678]" in text
+    env_yaml = yaml.safe_load(
+        (repo / "examples/embodiment/config/env/isaaclab_kitchen_open_fridge.yaml").read_text()
+    )
+    assert env_yaml["init_params"]["robot_rot"] == [
+        0.70710678,
+        0.0,
+        0.0,
+        0.70710678,
+    ]
+    assert env_yaml["init_params"]["robot_pos"] == [
+        4.603651840801024,
+        -1.4710035928444452,
+        0.8,
+    ]
+
+
 def test_open_fridge_kitchen_registered():
     assert GYM_ID == "Isaac-OpenFridge-Kitchen-Droid-AbsJointPos-v0"
     assert GYM_ID in REGISTER_ISAACLAB_ENVS
     assert REGISTER_ISAACLAB_ENVS[GYM_ID] is IsaaclabOpenFridgeKitchenEnv
     assert issubclass(IsaaclabOpenFridgeKitchenEnv, IsaaclabPickPlaceCubePlateEnv)
+
+
+def test_open_fridge_env_cfg_matches_arena():
+    """Ported scene must keep Arena NextTo pose and USD fridge drives."""
+    pytest.importorskip("isaaclab")
+    pytest.importorskip("pxr")
+    from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.env_cfg import (
+        OpenFridgeKitchenSceneCfg,
+        _FRIDGE_POS,
+        _ROBOT_POS,
+        _ROBOT_ROT,
+    )
+
+    expected = arena_open_fridge_robot_pos()
+    assert _ROBOT_POS[0] == pytest.approx(expected[0], abs=1e-6)
+    assert _ROBOT_POS[1] == pytest.approx(expected[1], abs=1e-6)
+    assert _ROBOT_POS[2] == pytest.approx(expected[2], abs=1e-6)
+    assert _ROBOT_ROT == (0.70710678, 0.0, 0.0, 0.70710678)
+    scene = OpenFridgeKitchenSceneCfg()
+    assert scene.fridge.actuators == {}
+    assert tuple(scene.fridge.init_state.pos) == pytest.approx(_FRIDGE_POS, abs=1e-6)
+    from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.env_cfg import _KITCHEN_USD
+
+    assert "scene_fridge_visible.usda" in _KITCHEN_USD
+    # Isaac Lab 2.x camera OffsetCfg.rot is wxyz (Arena DroidCameraCfg is xyzw).
+    from isaaclab.sensors import TiledCameraCfg
+
+    assert isinstance(scene.external_camera, TiledCameraCfg)
+    assert scene.external_camera.height == 224
+    assert scene.external_camera.offset.rot == (-0.393, -0.195, 0.399, 0.805)
+    assert scene.external_camera_2.offset.rot == (0.805, 0.399, -0.195, -0.393)
+    assert scene.wrist_camera.offset.rot == (-0.420, 0.570, 0.576, -0.409)
 
 
 def test_pi05_droid_jointpos_polaris_config_name():
@@ -118,59 +188,8 @@ def test_pi05_droid_jointpos_polaris_config_name():
     assert cri.model.max_token_len == 220
     assert getattr(cri.data, "use_cri", False) is True
 
-
-def test_kitchen_fridge_overlay_sets_omnipbr_id(tmp_path):
-    text = kitchen_fridge_overlay_usda()
-    assert 'uniform token info:id = "OmniPBR"' in text
-    assert 'uniform token info:id = "UsdPreviewSurface"' in text
-    assert "./textures/T_Refrigerator032_BC001_0.png" in text
-    assert "subLayers = [@./scene.usd@]" in text
-    fake = tmp_path / "scene.usd"
-    fake.write_text("#usda 1.0\n", encoding="utf-8")
-    out = Path(prepare_kitchen_fridge_materials(fake))
-    assert out.name == "scene_fridge_visible.usda"
-    assert out.read_text(encoding="utf-8") == text
-
-
-def test_arena_open_fridge_next_to_negative_y():
-    x, y = next_to_root_xy(
-        FRIDGE_AABB_MIN,
-        FRIDGE_AABB_MAX,
-        ROBOT_LOCAL_AABB_MIN,
-        ROBOT_LOCAL_AABB_MAX,
-        side="negative_y",
-        distance_m=NEXT_TO_DISTANCE_M,
-    )
-    # Child +Y face sits 0.1 m in front of the fridge −Y face.
-    assert (y + ROBOT_LOCAL_AABB_MAX[1]) == pytest.approx(
-        FRIDGE_AABB_MIN[1] - NEXT_TO_DISTANCE_M
-    )
-    fridge_cx = 0.5 * (FRIDGE_AABB_MIN[0] + FRIDGE_AABB_MAX[0])
-    # Arena stand 1.08×0.91 makes the child wider than the fridge, so NextTo
-    # parks the root toward the +X wall (not fridge center).
-    assert x == pytest.approx(
-        0.5
-        * (
-            (FRIDGE_AABB_MIN[0] - ROBOT_LOCAL_AABB_MIN[0])
-            + (FRIDGE_AABB_MAX[0] - ROBOT_LOCAL_AABB_MAX[0])
-        )
-    )
-    assert y == pytest.approx(
-        FRIDGE_AABB_MIN[1] - NEXT_TO_DISTANCE_M - ROBOT_LOCAL_AABB_MAX[1]
-    )
-    pos = arena_open_fridge_robot_pos()
-    assert pos[0] == pytest.approx(x)
-    assert pos[0] != pytest.approx(fridge_cx)
-    assert pos[1] == pytest.approx(y)
-    assert pos[2] == pytest.approx(on_root_z(ROBOT_LOCAL_AABB_MIN[2]))
-    assert pos[2] == pytest.approx(0.8, abs=1e-6)
-    fridge_root = arena_open_fridge_fridge_root_pos(robot_pos=pos)
-    assert fridge_root == pytest.approx(FRIDGE_VISUAL_POS)
-    placed_min, placed_max = placed_fridge_aabb(fridge_root=fridge_root)
-    assert placed_min == pytest.approx(FRIDGE_AABB_MIN)
-    assert placed_max == pytest.approx(FRIDGE_AABB_MAX)
-    raw = arena_open_fridge_robot_pos(
-        center_on_fridge_x=False, yawed_stand_front=False
-    )
-    assert raw[0] == pytest.approx(x)
-    assert raw[1] == pytest.approx(y)
+    adapter = _CONFIGS_DICT["pi05_droid_jointpos_polaris_cri_adapter"]
+    assert adapter.model.action_horizon == 15
+    assert adapter.model.max_token_len == 200
+    assert getattr(adapter.data, "use_cri", False) is True
+    assert getattr(adapter.data, "use_cri_prefix", False) is True

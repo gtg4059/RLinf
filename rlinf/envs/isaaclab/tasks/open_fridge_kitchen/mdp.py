@@ -27,7 +27,10 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.envs.mdp import *  # noqa: F401,F403
 from isaaclab.managers import SceneEntityCfg
 
-from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.door import compute_door_openness
+from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.door import (
+    compute_door_openness,
+    door_reached_from_rest,
+)
 from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.mdp import (  # noqa: F401
     BinaryJointPositionZeroToOneAction,
     BinaryJointPositionZeroToOneActionCfg,
@@ -69,35 +72,29 @@ def fridge_door_openness(
     return compute_door_openness(pos, lower, upper)
 
 
+def fridge_door_reached(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("fridge"),
+    joint_name: str = _FRIDGE_DOOR_JOINT,
+    rest_openness: float = 0.0,
+    min_openness_change: float = 0.05,
+) -> torch.Tensor:
+    """Arena reach: fridge door moved from rest (``min_openness_change``)."""
+    return door_reached_from_rest(
+        fridge_door_openness(env, asset_cfg, joint_name),
+        rest_openness=rest_openness,
+        min_openness_change=min_openness_change,
+    )
+
+
 def fridge_door_is_open(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("fridge"),
     joint_name: str = _FRIDGE_DOOR_JOINT,
     openness_threshold: float = 0.2,
 ) -> torch.Tensor:
-    """Arena ``OpenDoorTask`` success: openness >= ``openness_threshold``."""
-    return fridge_door_openness(env, asset_cfg, joint_name) >= openness_threshold
-
-
-def reset_fridge_root_pose(
-    env: ManagerBasedRLEnv,
-    env_ids: Sequence[int],
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("fridge"),
-) -> None:
-    """Write the configured fridge root (in front of the robot) on reset.
-
-    Nested ``spawn=None`` articulations can keep the USD origin; this reapplies
-    ``init_state.pos`` plus the env origin.
-    """
-    fridge = env.scene[asset_cfg.name]
-    ids = torch.as_tensor(env_ids, device=fridge.data.joint_pos.device, dtype=torch.long)
-    if int(ids.numel()) == 0:
-        return
-    pose = fridge.data.default_root_state[ids, :7].clone()
-    pose[:, 0:3] += env.scene.env_origins[ids]
-    vel = torch.zeros(int(ids.numel()), 6, device=pose.device)
-    fridge.write_root_pose_to_sim(pose, env_ids=ids)
-    fridge.write_root_velocity_to_sim(vel, env_ids=ids)
+    """Arena ``OpenDoorTask`` success: openness > ``openness_threshold``."""
+    return fridge_door_openness(env, asset_cfg, joint_name) > openness_threshold
 
 
 def reset_fridge_door(

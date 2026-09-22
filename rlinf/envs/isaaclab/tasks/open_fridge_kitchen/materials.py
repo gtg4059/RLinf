@@ -169,14 +169,39 @@ def patch_fridge_material_terminals(
         diffuse.ConnectToSource(tex.ConnectableAPI(), "rgb")
     mat.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
 
+    from pxr import Usd
+
+    root_prim = stage.GetPrimAtPath(root)
+    if root_prim.IsValid() and root_prim.IsInstanceable():
+        root_prim.SetInstanceable(False)
     n = 0
-    for prim in stage.Traverse():
+    if root_prim.IsValid():
+        predicate = Usd.TraverseInstanceProxies(Usd.PrimAllPrimsPredicate)
+        prims = Usd.PrimRange(root_prim, predicate)
+    else:
+        prims = stage.Traverse()
+    for prim in prims:
         path = str(prim.GetPath())
-        if not path.startswith(root) or prim.GetTypeName() != "Mesh":
+        if not path.startswith(root):
+            continue
+        if prim.IsInstanceable():
+            prim.SetInstanceable(False)
+        if prim.GetTypeName() not in ("Mesh", "Cube", "Sphere", "Capsule", "Cone"):
             continue
         if "Clear" in path or "/Collisions/" in path or "/Sites/" in path:
             continue
-        UsdGeom.Mesh(prim).CreateDoubleSidedAttr(True)
+        if prim.IsA(UsdGeom.Mesh):
+            UsdGeom.Mesh(prim).CreateDoubleSidedAttr(True)
+        UsdGeom.Imageable(prim).MakeVisible()
         UsdShade.MaterialBindingAPI(prim).Bind(mat)
         n += 1
+    debug = Path("/workspace/RLinf/logs/fridge_material_patch.txt")
+    try:
+        debug.parent.mkdir(parents=True, exist_ok=True)
+        debug.write_text(
+            f"kitchen={kitchen_prim_path}\nroot={root}\nvalid={root_prim.IsValid()}\nrebound={n}\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
     return n

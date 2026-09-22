@@ -208,6 +208,9 @@ def new_to_old_state_dict(new_sd: dict[str, torch.Tensor]) -> dict[str, torch.Te
                 "state_proj",
                 "action_time_mlp_",
                 "pointnet.",
+                "cri_in_proj",
+                "cri_out_proj",
+                "cri_pos",
             )
         ):
             old_sd[k] = new_sd[k]

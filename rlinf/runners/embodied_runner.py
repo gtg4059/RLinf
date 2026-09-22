@@ -313,6 +313,7 @@ class EmbodiedRunner:
         if not should_eval_at_start(self.cfg, self.global_step):
             return {}
         self.logger.info("Evaluating the initial policy at step 0.")
+        start_time = time.time()
         self.actor.set_global_step(self.global_step)
         self.rollout.set_global_step(self.global_step)
         self.env.set_global_step(self.global_step).wait()
@@ -320,6 +321,23 @@ class EmbodiedRunner:
         eval_metrics = self.evaluate()
         eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
         self.metric_logger.log(data=eval_metrics, step=self.global_step)
+        # max_steps=0 skips the train loop, so print here or the terminal
+        # never sees Metric Table (values would only land in TensorBoard).
+        print("\n===== Eval at start =====", flush=True)
+        for key in sorted(eval_metrics):
+            value = eval_metrics[key]
+            if isinstance(value, float):
+                print(f"{key}: {value:.6g}", flush=True)
+            else:
+                print(f"{key}: {value}", flush=True)
+        print_metrics_table(
+            step=self.global_step,
+            total_steps=max(int(self.max_steps), 1),
+            start_time=start_time,
+            metrics=eval_metrics,
+            log_path=self.metric_logger.log_path,
+        )
+        print("===== End eval =====\n", flush=True)
         return eval_metrics
 
     def _maybe_eval_and_checkpoint(self, step: int) -> dict:

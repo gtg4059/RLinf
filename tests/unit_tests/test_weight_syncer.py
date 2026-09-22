@@ -33,6 +33,7 @@ from rlinf.hybrid_engines.weight_syncer.patch_syncer import (
     EmptyWeightPatch,
     GPUSnapshotPatchBuilder,
     WeightPatch,
+    align_state_dict_to_keys,
     as_coo_2d_view,
     downscale_nonnegative_indices,
 )
@@ -1026,6 +1027,37 @@ def test_patch_weight_syncer_uses_receiver_key_order():
     mismatched_state_dict.pop(next(iter(mismatched_state_dict)))
     with pytest.raises(ValueError, match="State dict keys do not match snapshot keys"):
         syncer.create_patch(mismatched_state_dict, version=1)
+
+    extra_state_dict = _clone_state_dict(model)
+    extra_state_dict["__fsdp_extra"] = (
+        next(iter(extra_state_dict.values())).detach().clone()
+    )
+    syncer.create_patch(extra_state_dict, version=1)
+    assert "__fsdp_extra" not in extra_state_dict
+
+    # After train, FSDP can omit frozen VLM keys that the receiver still lists.
+    syncer.ordered_keys = list(syncer.ordered_keys) + ["frozen.vlm.weight"]
+    syncer.patch_builder.ordered_keys = syncer.ordered_keys
+    syncer.create_patch(_clone_state_dict(model), version=1)
+
+
+def test_align_state_dict_to_keys_drops_extras_and_reports_missing():
+    tensor = torch.zeros(2)
+    state = {"a": tensor, "b": tensor, "extra": tensor}
+    align_state_dict_to_keys(state, ["a", "b"], mismatch_label="mismatch")
+    assert set(state) == {"a", "b"}
+
+    with pytest.raises(ValueError, match=r"mismatch\. missing="):
+        align_state_dict_to_keys({"a": tensor}, ["a", "b"], mismatch_label="mismatch")
+
+    frozen_missing = {"trainable": tensor, "extra": tensor}
+    align_state_dict_to_keys(
+        frozen_missing,
+        ["trainable"],
+        mismatch_label="mismatch",
+        allowed_keys=["trainable", "frozen"],
+    )
+    assert set(frozen_missing) == {"trainable"}
 
 
 def test_bucket_weight_syncer_roundtrip_load_instant_true():

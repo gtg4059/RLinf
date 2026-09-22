@@ -10,8 +10,8 @@ group_size: 1
 
 reward_coef: 1.0
 use_fixed_reset_state_ids: False
-max_steps_per_rollout_epoch: 150
-max_episode_steps: 150
+max_steps_per_rollout_epoch: 1050
+max_episode_steps: 1050
 
 video_cfg:
   save_video: False
@@ -35,12 +35,20 @@ init_params:
   action_space: droid_abs_joint_pos
   num_envs: null
   max_episode_steps: ${..max_episode_steps}
-  # 150 env steps at OpenPI DROID 15 Hz (10 s).
-  episode_length_s: 10.0
+  # Arena fridge-open: 1050 env steps at OpenPI DROID 15 Hz (70 s).
+  episode_length_s: 70.0
   task_description: "open the fridge door"
-  sample_exterior_camera: True
-  sample_exterior_camera_prob: 0.5
+  sample_exterior_camera: False
+  sample_exterior_camera_prob: 0.0
   stand_height_m: 0.8
+  # Arena NextTo after ObjectPlacer bakes yaw 1.57 into the DROID AABB.
+  # env_cfg default is arena_open_fridge_robot_pos() ≈ (4.60, -1.47, 0.80).
+  robot_pos: [4.603651840801024, -1.4710035928444452, 0.8]
+  # Isaac Lab init_state.rot is wxyz. +90 deg yaw aims converted DROID cams
+  # at the fridge door (+Y). Identity looks along +X, away from the door.
+  robot_rot: [0.70710678, 0.0, 0.0, 0.70710678]
+  sim_dt: 0.0083333333
+  decimation: 8
   # IsaacLab CRI-F data: one run_cri_filter(q, qd) per env.step from
   # measured joint_pos / joint_vel (not commanded qd_nom).
   # OpenPI CRI tokens are previous-tick cri_pre (reset/first obs = 0).
@@ -67,11 +75,11 @@ init_params:
   time_penalty_weight: 0.0
   cri_step_dt: 0.0666666667  # 1/15, OpenPI DROID control dt
   table_cam:
-    height: 224
-    width: 224
+    height: 720
+    width: 1280
   wrist_cam:
-    height: 224
-    width: 224
+    height: 720
+    width: 1280
   eval_cam:
     height: 480
     width: 640

@@ -118,6 +118,7 @@ class FSDPModelManager:
         self.bucket_capacity = cfg.get("sync_bucket_capacity", 128 * 1024 * 1024)
 
         self.param_names_need_sync: list[str] = None
+        self._unwrapped_tensor_shapes: dict[str, tuple[int, ...]] = {}
 
     def _create_amp_context(self) -> ContextManager:
         """
@@ -307,6 +308,11 @@ class FSDPModelManager:
         # here record the original trainable parameters' names before FSDP wrapping
         # persist buffers' names are also recorded, which will be used for weight syncing.
         self.param_names_need_sync = collect_param_names_need_sync(module)
+        self._unwrapped_tensor_shapes = {
+            name: tuple(tensor.shape)
+            for name, tensor in list(module.named_parameters(remove_duplicate=False))
+            + list(module.named_buffers(remove_duplicate=False))
+        }
 
         # build model, optimizer, lr_scheduler, grad_scaler
         self.model = self._strategy.wrap_model(

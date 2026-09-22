@@ -32,6 +32,32 @@ from .bucket_syncer import BucketWeightSyncer, iter_named_tensor_buckets
 from .compressor import PatchCompressor
 
 
+def align_state_dict_to_keys(
+    state_dict: dict[str, torch.Tensor | DTensor],
+    required_keys: list[str] | set[str],
+    *,
+    mismatch_label: str,
+    allowed_keys: list[str] | set[str] | None = None,
+) -> None:
+    """Drop extras; raise if a required key is missing.
+
+    FSDP ``named_parameters`` can expose wrapper-only names the rollout
+    ``state_dict()`` lacks, and after the first train step it can omit frozen
+    VLM keys that are in the receiver snapshot but not in
+    ``param_names_need_sync``. Require only the latter; keep/drop against
+    ``allowed_keys`` (receiver order) when given.
+    """
+    required_set = set(required_keys)
+    allowed_set = set(allowed_keys) if allowed_keys is not None else required_set
+    missing = [key for key in required_keys if key not in state_dict]
+    if missing:
+        extra = sorted(set(state_dict) - allowed_set)
+        raise ValueError(f"{mismatch_label}. missing={missing[:20]} extra={extra[:20]}")
+    for key in list(state_dict):
+        if key not in allowed_set:
+            del state_dict[key]
+
+
 def downscale_nonnegative_indices(tensor: torch.Tensor) -> torch.Tensor:
     """Cast nonnegative index tensors to the smallest supported integer dtype.
 
@@ -286,6 +312,17 @@ class PatchBuilder(ABC):
         if not self.ordered_keys:
             raise ValueError("ordered_keys must not be empty")
 
+    def align_sender_state_dict(
+        self, state_dict: dict[str, torch.Tensor | DTensor]
+    ) -> None:
+        """Require trainable/buffer keys; allow frozen receiver keys to be absent."""
+        align_state_dict_to_keys(
+            state_dict,
+            self.param_names_need_sync,
+            allowed_keys=self.ordered_keys,
+            mismatch_label="State dict keys do not match snapshot keys",
+        )
+
     @staticmethod
     def delta_encode(
         rows: torch.Tensor, cols: torch.Tensor
@@ -447,9 +484,8 @@ class CPUSnapshotPatchBuilder(PatchBuilder):
         # needs participate in the all-gather, but we just create
         # empty patch for it, because this rank does not really
         # send.
+        self.align_sender_state_dict(state_dict)
         if self.snapshot is None:
-            if set(state_dict.keys()) != set(self.ordered_keys):
-                raise ValueError("State dict keys do not match snapshot keys")
             for key in self.param_names_need_sync:
                 _ = materialize_tensor(state_dict[key])
             return EmptyWeightPatch(
@@ -459,9 +495,6 @@ class CPUSnapshotPatchBuilder(PatchBuilder):
                     device=self.transport_device,
                 )
             )
-
-        if set(state_dict.keys()) != set(self.ordered_keys):
-            raise ValueError("State dict keys do not match snapshot keys")
 
         ordinals: list[torch.Tensor] = []
         nnz_per_tensor: list[torch.Tensor] = []
@@ -655,9 +688,8 @@ class GPUSnapshotPatchBuilder(PatchBuilder):
         # needs participate in the all-gather, but we just create
         # empty patch for it, because this rank does not really
         # send.
+        self.align_sender_state_dict(state_dict)
         if self.snapshot is None:
-            if set(state_dict.keys()) != set(self.ordered_keys):
-                raise ValueError("State dict keys do not match snapshot keys")
             for param_name in self.param_names_need_sync:
                 _ = materialize_tensor(state_dict[param_name])
             return EmptyWeightPatch(
@@ -667,9 +699,6 @@ class GPUSnapshotPatchBuilder(PatchBuilder):
                     device=self.transport_device,
                 )
             )
-
-        if set(state_dict.keys()) != set(self.ordered_keys):
-            raise ValueError("State dict keys do not match snapshot keys")
 
         ordinals: list[torch.Tensor] = []
         nnz_per_tensor: list[torch.Tensor] = []
@@ -874,6 +903,11 @@ class PatchWeightSyncer(WeightSyncer):
                 raise TypeError(
                     "Patch init sync receiver does not support DTensor state_dict values"
                 )
+            if target.shape != value.shape:
+                raise RuntimeError(
+                    f"Patch init sync shape mismatch for {key}: "
+                    f"receiver {tuple(target.shape)} vs sender {tuple(value.shape)}"
+                )
             target.copy_(value, non_blocking=True)
         if self.transport_device.type == Worker.torch_device_type:
             fallback_keepalive.extend(tensors_record_stream(bucket.values()))
@@ -926,8 +960,11 @@ class PatchWeightSyncer(WeightSyncer):
         self.param_names_need_sync = param_names_need_sync
         receiver_dtypes = metadata["receiver_dtypes"]
 
-        if set(state_dict.keys()) != set(self.ordered_keys):
-            raise ValueError("Sender state dict keys do not match receiver keys")
+        align_state_dict_to_keys(
+            state_dict,
+            self.ordered_keys,
+            mismatch_label="Sender state dict keys do not match receiver keys",
+        )
 
         if self.init_sync_enabled:
             await self._sync_init_weights(state_dict, receiver_dtypes, send)
@@ -1022,6 +1059,7 @@ class PatchWeightSyncer(WeightSyncer):
     ) -> EmptyWeightPatch | WeightPatch:
         if self.patch_builder is None:
             raise RuntimeError("Sender not initialized")
+        self.patch_builder.align_sender_state_dict(state_dict)
         return self.patch_builder.create_patch(state_dict, version)
 
     async def sync(

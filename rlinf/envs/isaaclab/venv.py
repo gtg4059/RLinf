@@ -13,11 +13,30 @@
 # limitations under the License.
 
 from multiprocessing.connection import Connection
+from typing import Any
 
 import torch
 import torch.multiprocessing as mp
 
 from .utils import CloudpickleWrapper
+
+
+def nested_to_device(value: Any, device: torch.device | str | None) -> Any:
+    """Move nested tensors to ``device``. ``None`` means CPU (no CUDA IPC)."""
+    if value is None:
+        return None
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach()
+        if device is None:
+            return tensor.cpu().contiguous()
+        return tensor.to(device=device).contiguous()
+    if isinstance(value, dict):
+        return {key: nested_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [nested_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(nested_to_device(item, device) for item in value)
+    return value
 
 
 def _torch_worker(
@@ -44,14 +63,16 @@ def _torch_worker(
                 if reset_index is None:
                     reset_result = isaac_env.reset(seed=reset_seed)
                 else:
+                    reset_ids = nested_to_device(reset_index, device)
                     reset_result = isaac_env.reset(
-                        seed=reset_seed, env_ids=reset_index.to(device)
+                        seed=reset_seed, env_ids=reset_ids
                     )
-                obs_queue.put(reset_result)
+                # CPU pickle: Docker seccomp often blocks pidfd_getfd CUDA IPC.
+                obs_queue.put(nested_to_device(reset_result, None))
             elif cmd == "step":
-                input_action = action_queue.get()
+                input_action = nested_to_device(action_queue.get(), device)
                 step_result = isaac_env.step(input_action)
-                obs_queue.put(step_result)
+                obs_queue.put(nested_to_device(step_result, None))
             elif cmd == "close":
                 isaac_env.close()
                 child_remote.close()
@@ -92,21 +113,22 @@ class SubProcIsaacLabEnv:
         )
         self.isaac_lab_process.start()
         self.child_remote.close()
+        self._device = self.device()
 
     def reset(self, seed=None, env_ids=None):
         self.parent_remote.send("reset")
-        self.reset_idx.put((env_ids, seed))
-        obs, info = self.obs_queue.get()
-        return obs, info
+        self.reset_idx.put((nested_to_device(env_ids, None), seed))
+        result = self.obs_queue.get()
+        return nested_to_device(result, self._device)
 
     def step(self, action: torch.Tensor):
         """
         action : (bs, action_dim)
         """
         self.parent_remote.send("step")
-        self.action_queue.put(action)
+        self.action_queue.put(nested_to_device(action, None))
         env_step_result = self.obs_queue.get()
-        return env_step_result
+        return nested_to_device(env_step_result, self._device)
 
     def close(self):
         self.parent_remote.send("close")

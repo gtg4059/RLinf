@@ -117,6 +117,8 @@ class DroidJointPosOutputs(_transforms.DataTransformFn):
 class LeRobotPolarisDroidDataConfig(DataConfigFactory):
     action_dim: int = 32
     use_cri: bool = False
+    # TacVLA prefix encoder: keep float ``cri`` and Task/State language.
+    use_cri_prefix: bool = False
 
     @override
     def create(self, assets_dirs, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -138,7 +140,12 @@ class LeRobotPolarisDroidDataConfig(DataConfigFactory):
         )
 
         model_transforms = ModelTransformFactory()(model_config)
-        if self.use_cri:
+        # Prefix CRI keeps the float ``cri`` field and Task/State prompt.
+        # Only the legacy language-binned path rewrites the tokenizer.
+        use_prefix = self.use_cri_prefix or getattr(
+            model_config, "use_cri_prefix", False
+        )
+        if self.use_cri and not use_prefix:
             model_transforms = _replace_tokenize_prompt_with_cri(
                 model_transforms, model_config
             )

@@ -55,9 +55,35 @@ NEXT_TO_DISTANCE_M = 0.1
 NEXT_TO_CROSS_POSITION_RATIO = 0.0
 FLOOR_Z = 0.0
 ON_CLEARANCE_M = 0.0
-# Extra EE-heading slide. Arena NextTo already owns the 0.1 m gap; keep 0
-# so stand / robot / fridge stay on the solver pose (yaw is applied in place).
+# Same marker yaw Arena ObjectPlacer bakes into the DROID AABB before NextTo.
+ROTATE_AROUND_YAW_RAD = 1.57
+# Extra EE-heading slide. Arena NextTo already owns the 0.1 m gap.
 EE_FORWARD_SHIFT_M = 0.0
+
+
+def yaw_z_aabb(
+    child_min: tuple[float, float, float],
+    child_max: tuple[float, float, float],
+    yaw_rad: float,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Return the axis-aligned box enclosing ``child`` after a Z yaw.
+
+    Matches Arena ``AxisAlignedBoundingBox.rotated_by_quat`` for yaw-only
+    ``RotateAroundSolution``: ObjectPlacer feeds this enclosing box to NextTo.
+    """
+    import math
+
+    cos_y = math.cos(yaw_rad)
+    sin_y = math.sin(yaw_rad)
+    xs = (child_min[0], child_max[0])
+    ys = (child_min[1], child_max[1])
+    corners = tuple(
+        (cos_y * x - sin_y * y, sin_y * x + cos_y * y) for x in xs for y in ys
+    )
+    return (
+        (min(p[0] for p in corners), min(p[1] for p in corners), child_min[2]),
+        (max(p[0] for p in corners), max(p[1] for p in corners), child_max[2]),
+    )
 
 
 def next_to_root_xy(
@@ -137,14 +163,18 @@ def arena_open_fridge_robot_pos(
     center_on_fridge_x: bool = False,
     yawed_stand_front: bool = False,
     ee_forward_shift_m: float = EE_FORWARD_SHIFT_M,
+    yaw_rad: float = ROTATE_AROUND_YAW_RAD,
 ) -> tuple[float, float, float]:
-    """DROID root from Arena ``On`` + ``NextTo`` (yaw applied in place).
+    """DROID root from Arena ``On`` + ``NextTo`` with yawed AABB.
 
-    Matches
-    ``kitchen_bench_lightwheel_open_fridge``: NextTo fridge
-    ``side=negative_y``, ``distance_m=0.1``, then
-    ``rotate_around_solution(yaw_rad=1.57)``. No visual overrides.
+    Matches ``kitchen_bench_lightwheel_open_fridge``: ObjectPlacer applies
+    ``rotate_around_solution(yaw_rad=1.57)`` to the DROID box, then solves
+    NextTo fridge ``side=negative_y``, ``distance_m=0.1``. Solving the
+    un-yawed box and yawing in place shifts the root ~20 cm in X off the
+    fridge center (the view the Arena policy was evaluated on).
     """
+    if yaw_rad:
+        robot_min, robot_max = yaw_z_aabb(robot_min, robot_max, yaw_rad)
     x, y = next_to_root_xy(
         fridge_min,
         fridge_max,
