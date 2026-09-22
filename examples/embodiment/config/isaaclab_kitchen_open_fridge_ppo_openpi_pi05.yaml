@@ -77,21 +77,20 @@ env:
   group_name: "EnvGroup"
 
   train:
-    # 300 steps is 20s at 15 Hz. Two epochs keep per-rank chunks at
-    # 32*2*(300/15) = 1280, so the actor update stays the size that fit
-    # on 2× 96GB with 32 kitchens resident.
+    # 600 steps is 40s at 15 Hz. Two epochs make per-rank chunks
+    # 32*2*(600/15) = 2560.
     rollout_epoch: 2
     # 32 envs/GPU. 2 visible GPUs → 64. 8 GPUs → 256.
     total_num_envs: 64
-    max_episode_steps: 300
-    max_steps_per_rollout_epoch: 300
+    max_episode_steps: 600
+    max_steps_per_rollout_epoch: 600
     auto_reset: False
     ignore_terminations: False
     use_fixed_reset_state_ids: True
     seed: 42
     init_params:
       hold_after_done: False
-      episode_length_s: 20.0
+      episode_length_s: 40.0
       stand_height_m: 0.8
       robot_pos: [4.603651840801024, -1.4710035928444452, 0.8]
       robot_rot: [0.70710678, 0.0, 0.0, 0.70710678]
@@ -103,7 +102,7 @@ env:
       cri_ovf_termination_enabled: False
       # Living cost until the first cycle success (leftover Isaac
       # episodes do not keep paying). -dt/100: 30 steps saved ≈ success/3,
-      # so a 300-step miss costs about three successes.
+      # so a 600-step miss costs about six successes.
       time_penalty_weight: -0.000667
       # OpenPI resizes to 224. 32 tiled views/GPU keeps Isaac off the actor update.
       table_cam:
@@ -141,16 +140,15 @@ env:
     # Second Isaac Kit stays resident during actor train. Keep this small
     # (4/GPU). 2 GPUs → 8. 8 GPUs → 32.
     total_num_envs: 8
-    # 20s at 15 Hz, same horizon as train. Typical PolarIS opens ~26s,
-    # so successes between 20s and 26s count as failures here.
-    max_episode_steps: 300
-    max_steps_per_rollout_epoch: 300
+    # 40s at 15 Hz, same horizon as train. Typical PolarIS opens ~26s.
+    max_episode_steps: 600
+    max_steps_per_rollout_epoch: 600
     auto_reset: False
     ignore_terminations: False
     use_fixed_reset_state_ids: True
     init_params:
       hold_after_done: False
-      episode_length_s: 20.0
+      episode_length_s: 40.0
       stand_height_m: 0.8
       robot_pos: [4.603651840801024, -1.4710035928444452, 0.8]
       robot_rot: [0.70710678, 0.0, 0.0, 0.70710678]
@@ -203,11 +201,11 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  # 1280 % micro must be 0. Kitchen USD + no_shard actor OOM'd at 16.
+  # 2560 % micro must be 0. Kitchen USD + no_shard actor OOM'd at 16.
   micro_batch_size: 8
-  # Per-rank chunks: (envs/GPU)*rollout_epoch*(300/15) = 32*2*20 = 1280.
-  # 2 GPUs → 2560. 8 GPUs → 10240.
-  global_batch_size: 2560
+  # Per-rank chunks: (envs/GPU)*rollout_epoch*(600/15) = 32*2*40 = 2560.
+  # 2 GPUs → 5120. 8 GPUs → 20480.
+  global_batch_size: 5120
   seed: 42
   enable_offload: False
 

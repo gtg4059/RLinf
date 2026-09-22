@@ -6,9 +6,9 @@
 # image and launches the named Hydra config. First positional is the config
 # (same style as run_embodiment.sh); later tokens are Hydra overrides.
 # Collocated actor+env+rollout on all visible GPUs, 32 train / 4 eval
-# envs per GPU. Train episodes are 300 steps and two rollout epochs, so
-# chunks/rank stay 32*2*(300/15) = 1280.
-# This host is 2× Blackwell → 64 train / 8 eval / global_batch 2560.
+# envs per GPU. Train episodes are 600 steps and two rollout epochs, so
+# chunks/rank stay 32*2*(600/15) = 2560.
+# This host is 2× Blackwell → 64 train / 8 eval / global_batch 5120.
 # Override RLINF_NUM_GPUS or pass Hydra env.train.total_num_envs=… to pin.
 # Stop a previous fridge PPO / eval container first (they share GPUs).
 # Do not resume a collapsed language-binned 10000 CRI run.
@@ -57,11 +57,11 @@ if [ ! -f "${CONFIG_YAML}" ]; then
 fi
 
 # 32 train / 4 eval envs per GPU. Train rollout_epoch is 2 and episodes
-# are 300 steps, so per-rank chunks stay (32)*2*(300/15) = 1280.
-# global_batch = 1280 * n_gpus. 64 envs/GPU OOM'd the actor update.
+# are 600 steps, so per-rank chunks stay (32)*2*(600/15) = 2560.
+# global_batch = 2560 * n_gpus. 64 envs/GPU OOM'd the actor update.
 TRAIN_ENVS_PER_GPU=32
 EVAL_ENVS_PER_GPU=4
-CHUNKS_PER_RANK=1280
+CHUNKS_PER_RANK=2560
 
 _visible_gpu_count() {
   if [ -n "${RLINF_NUM_GPUS:-}" ]; then

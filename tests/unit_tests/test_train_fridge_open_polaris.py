@@ -116,12 +116,13 @@ def test_ppo_yaml_uses_all_gpus_at_32_train_envs_per_gpu() -> None:
     train_block, eval_block = text.split("\n  eval:\n", 1)
     assert "actor,env,rollout: all" in text
     assert "total_num_envs: 64" in train_block
-    assert "rollout_epoch: 4" in train_block
-    assert "max_episode_steps: 150" in train_block
+    assert "rollout_epoch: 2" in train_block
+    assert "max_episode_steps: 600" in train_block
+    assert "episode_length_s: 40.0" in train_block
     assert "total_num_envs: 8" in eval_block
     assert "max_episode_steps: 600" in eval_block
     assert "episode_length_s: 40.0" in eval_block
-    assert "global_batch_size: 2560" in text
+    assert "global_batch_size: 5120" in text
     assert "sharding_strategy: \"no_shard\"" in text
     assert "gradient_checkpointing: True" in text
     assert "micro_batch_size: 8" in text
@@ -145,7 +146,7 @@ def test_train_script_scales_envs_to_visible_gpus() -> None:
     assert "VISIBLE_GPUS=8" in completed.stdout
     assert "env.train.total_num_envs=256" in completed.stdout
     assert "env.eval.total_num_envs=32" in completed.stdout
-    assert "actor.global_batch_size=10240" in completed.stdout
+    assert "actor.global_batch_size=20480" in completed.stdout
 
 
 def test_train_script_honors_explicit_env_count() -> None:
