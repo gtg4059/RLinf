@@ -57,16 +57,21 @@ def cri_ovf_exp(
 def cri_ovf_violated(
     cri: torch.Tensor,
     *,
-    threshold: float = CRI_FILTER_LIMIT,
+    threshold: float | torch.Tensor = CRI_FILTER_LIMIT,
 ) -> torch.Tensor:
-    """Return ``(B,)`` bool mask: raw ``cri_max >= threshold`` (Isaac ``CRI_OVF`` term)."""
+    """Return ``(B,)`` bool mask: raw ``cri_max >= threshold`` (Isaac ``CRI_OVF`` term).
+
+    ``threshold`` may be a scalar or a per-row tensor of shape ``(B,)``.
+    """
     values = torch.as_tensor(cri, dtype=torch.float32)
     if values.ndim == 0:
         values = values.unsqueeze(0)
     if values.ndim > 1:
         values = values.amax(dim=-1)
-    limit_t = values.new_tensor(float(threshold))
-    return values >= limit_t
+    limit_t = torch.as_tensor(threshold, dtype=values.dtype, device=values.device)
+    if limit_t.ndim == 0:
+        return values >= limit_t
+    return values >= limit_t.reshape(values.shape)
 
 
 def cri_ovf_termination_step_penalty() -> float:
@@ -87,6 +92,7 @@ def time_penalty_live_mask(
     hold_after_done: bool = False,
     was_frozen: torch.Tensor | None = None,
     success_once: torch.Tensor | None = None,
+    until_horizon: bool = False,
     device: torch.device | str | None = None,
 ) -> torch.Tensor:
     """Rows that still pay the living cost this step.
@@ -94,7 +100,8 @@ def time_penalty_live_mask(
     Charge until the first RLinf-cycle success. The success step still
     pays (``success_once`` is updated after the reward). Leftover Isaac
     episodes after that success do not. Frozen hold-after-done rows
-    also do not pay.
+    also do not pay. ``until_horizon`` keeps the charge on every row
+    through the timeout, including after the door is open.
     """
     if device is None:
         if success_once is not None:
@@ -104,6 +111,8 @@ def time_penalty_live_mask(
         else:
             device = "cpu"
     mask = torch.ones(int(num_envs), dtype=torch.bool, device=device)
+    if until_horizon:
+        return mask
     if hold_after_done and was_frozen is not None:
         mask = mask & ~was_frozen.to(device=mask.device)
     if success_once is not None:

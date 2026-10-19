@@ -36,38 +36,62 @@ runner:
   max_steps: -1
 
   only_eval: False
-  val_check_interval: 50
-  eval_at_start: True
-  save_interval: 50
+  # Eval every 20 steps. The save interval has to be a multiple of this.
+  val_check_interval: 20
+  eval_at_start: False
+  save_interval: 20
   weight_sync_interval: 1
 
+  # Continue the 900-step run after global_step_60. The next update is 61.
   resume_dir: null
   ckpt_path: null
 
 algorithm:
+  # Isaac rsl_rl standardizes GAE over the rollout (mean 0, std 1) before
+  # the policy loss. A cold value head leaves advantages at the return-to-go
+  # (~-126); without this the first update leaves the opening checkpoint.
   normalize_advantages: True
-  kl_penalty: kl
+  # Anchor is actor.model.model_path, snapshotted before resume.
+  kl_penalty: low_var_kl
+  # Pairing two rollouts and putting a negative on the miss cut reach
+  # 60% → 49% by step 187. One rollout per reset.
   group_size: 1
   reward_coef: 1.0
 
   reward_type: chunk_level
-  logprob_type: chunk_level
+  # Clip each of the 15×8 flow dims. chunk_level sums them into one ratio,
+  # so a 0.01 nat/dim shift already leaves the ±0.2 clip (ratio ~0.4).
+  logprob_type: token_level
   entropy_type: token_level
 
+  # One pass. Ratios inside ±2 nats still carry the time ranking when
+  # they sit outside the ±0.2 PPO clip. Beyond ±2 the log-probability has
+  # collapsed and the advantage does not move the weights.
   update_epoch: 2
+  advantage_trust_ratio: true
+  trust_log_ratio_min: -2.0
+  trust_log_ratio_max: 2.0
+  # GAE against the actor value head. gamma 0.995 and gae_lambda 0.97
+  # match the Isaac reach PPO. The head is trained by loss_type actor_critic.
+  # Advantages are standardized. KL (kl_beta, desired_kl, low_var_kl) is unchanged.
   adv_type: gae
   loss_type: actor_critic
   loss_agg_func: "token-mean"
-  kl_beta: 0.0
-  entropy_bonus: 0.02
+  # Holds the update near the π₀.₅ weights that already open the door.
+  kl_beta: 0.05
+  # entropy_coef 0.005. flow_sde reports entropy 0, so this term is 0.
+  entropy_bonus: 0.005
   clip_ratio_high: 0.2
   clip_ratio_low: 0.2
   clip_ratio_c: 3.0
-  value_clip: 0.2
+  # Isaac clips the value by 0.2 around a critic that already matches the
+  # return. From a zero head the return-to-go is about -126, so 0.2 would
+  # keep the value at 0. 150 lets the first updates reach that scale.
+  value_clip: 150.0
   huber_delta: 10.0
 
-  gamma: 0.99
-  gae_lambda: 0.95
+  gamma: 0.995
+  gae_lambda: 0.97
 
   filter_rewards: False
   rewards_lower_bound: 0.1
@@ -77,20 +101,47 @@ env:
   group_name: "EnvGroup"
 
   train:
-    # 600 steps is 40s at 15 Hz. Two epochs make per-rank chunks
-    # 32*2*(600/15) = 2560.
-    rollout_epoch: 2
+    # 900 steps is 60s at 15 Hz. One epoch, 32 envs/GPU:
+    # 32*1*(900/15) = 1920 chunks/rank.
+    rollout_epoch: 1
     # 32 envs/GPU. 2 visible GPUs → 64. 8 GPUs → 256.
     total_num_envs: 64
-    max_episode_steps: 600
-    max_steps_per_rollout_epoch: 600
+    max_episode_steps: 900
+    max_steps_per_rollout_epoch: 900
     auto_reset: False
     ignore_terminations: False
     use_fixed_reset_state_ids: True
     seed: 42
     init_params:
+      # Each open ends that attempt for GAE. Isaac shuts the door and
+      # returns the arm, and the rest of the 900 steps can open it again.
       hold_after_done: False
-      episode_length_s: 40.0
+      isaac_success_termination: True
+      repeat_open_after_success: true
+      # +1 every time a fresh attempt crosses openness 0.2, the RLinf
+      # sparse success scale. A full minute of the other terms stays smaller:
+      # door hold +0.15, first movement +0.2, timeout −0.225, 1 m −0.4.
+      success_bonus: 1.0
+      openness_threshold: 0.2
+      # Delta angle reward is off. Paying only the increase made the step
+      # reward fall back to the time penalty whenever the door stopped.
+      door_progress_weight: 0.0
+      door_progress_cap: 2.0
+      # weight * openness each live step of the current attempt. After the
+      # reset the closed door pays about 0 until it moves again. This weight
+      # makes a 0.2 hold over 900 steps pay +0.15, 15% of one success.
+      door_openness_weight: 0.0008333333333333333
+      # +0.2 the first time each attempt moves the door off rest by 0.05.
+      # 0.2 × the +1 success bonus. A later attempt can earn it again.
+      reach_bonus: 0.2
+      handle_approach_weight: 0.0
+      handle_approach_cap: 0.1
+      handle_approach_openness: 0.05
+      # Per meter from the gripper to the handle bar. A full 60 s at 1 m
+      # is −0.4, under one +1. After an open the arm is back at the spawn
+      # and this cost runs again.
+      ee_bar_distance_weight: -0.0004444444444444445
+      episode_length_s: 60.0
       stand_height_m: 0.8
       robot_pos: [4.603651840801024, -1.4710035928444452, 0.8]
       robot_rot: [0.70710678, 0.0, 0.0, 0.70710678]
@@ -98,12 +149,20 @@ env:
       cri_filter_enabled: False
       cri_penalty_weight: 0 #-0.01
       cri_penalty_limit: 0.96
-      # Hard CRI OVF term: set true to terminate + -success/3 on cri_max >= 0.96.
+      # Gripper within 5 cm of the hinged handle bar rewinds only at CRI 3.
+      # This is 0.05 m, the same gap as dist_cm 5 on the eval video.
+      # Reported CRI stops at 2, so this reach does not rewind. Elsewhere
+      # CRI >= 0.96 still returns the arm to the last scene-reset pose.
+      # The attempt continues, and the horizon reset still closes the door.
+      cri_handle_relax_distance_m: 0.05
+      cri_handle_relax_limit: 3.0
+      cri_boundary_rewind: true
       cri_ovf_termination_enabled: False
-      # Living cost until the first cycle success (leftover Isaac
-      # episodes do not keep paying). -dt/100: 30 steps saved ≈ success/3,
-      # so a 600-step miss costs about six successes.
-      time_penalty_weight: -0.000667
+      # −0.00025 per live step until that attempt opens the door, then again
+      # after the reset. A 900-step timeout pays −0.225. An 11 s open pays
+      # about −0.041. Each later open pays the same speed cost from scratch.
+      time_penalty_weight: -0.00025
+      time_penalty_until_horizon: false
       # OpenPI resizes to 224. 32 tiled views/GPU keeps Isaac off the actor update.
       table_cam:
         height: 224
@@ -118,12 +177,19 @@ env:
       max_envs_in_video: 1
       max_videos: 2
       extra_info_on_video:
+        - episode.Episode_Reward/cri_ovf
         - episode.success_once
         - episode.success_count
         - episode.reach_once
-        - episode.Episode_Reward/cri_ovf
+        - episode.door_openness
+        - episode.door_progress
+        - episode.Episode_Reward/door_openness
         - episode.cri_ovf_term_count
+        - episode.cri_rewind_count
+        - episode.cri_rewind_once
+        - episode.success_without_cri
         - episode.Episode_Reward/time_penalty
+        - episode.Episode_Reward/ee_bar_distance
       video_image_keys:
         - main_images
         - exterior2_images
@@ -136,19 +202,20 @@ env:
       video_base_dir: ${runner.logger.log_path}/video/train
 
   eval:
-    rollout_epoch: 1
+    # 4 epochs × 4 envs/GPU. 2 GPUs → 32 episodes. 8 GPUs → 128.
+    rollout_epoch: 4
     # Second Isaac Kit stays resident during actor train. Keep this small
     # (4/GPU). 2 GPUs → 8. 8 GPUs → 32.
     total_num_envs: 8
-    # 40s at 15 Hz, same horizon as train. Typical PolarIS opens ~26s.
-    max_episode_steps: 600
-    max_steps_per_rollout_epoch: 600
+    # 60s at 15 Hz, same horizon as train. Typical PolarIS opens ~12s.
+    max_episode_steps: 900
+    max_steps_per_rollout_epoch: 900
     auto_reset: False
     ignore_terminations: False
     use_fixed_reset_state_ids: True
     init_params:
       hold_after_done: False
-      episode_length_s: 40.0
+      episode_length_s: 60.0
       stand_height_m: 0.8
       robot_pos: [4.603651840801024, -1.4710035928444452, 0.8]
       robot_rot: [0.70710678, 0.0, 0.0, 0.70710678]
@@ -156,6 +223,10 @@ env:
       cri_filter_enabled: False
       cri_penalty_weight: 0.0
       cri_penalty_limit: 0.96
+      # 0.05 m = dist_cm 5. At or inside that gap the CRI limit is 3.
+      cri_handle_relax_distance_m: 0.05
+      cri_handle_relax_limit: 3.0
+      cri_boundary_rewind: true
       time_penalty_weight: 0.0
       table_cam:
         height: 224
@@ -170,12 +241,19 @@ env:
       max_envs_in_video: 1
       max_videos: null
       extra_info_on_video:
+        - episode.Episode_Reward/cri_ovf
         - episode.success_once
         - episode.success_count
         - episode.reach_once
-        - episode.Episode_Reward/cri_ovf
         - episode.cri_ovf_term_count
+        - episode.cri_rewind_count
+        - episode.cri_rewind_once
+        - episode.success_without_cri
         - episode.Episode_Reward/time_penalty
+      right_info_on_video:
+        - episode.cri_max
+        - episode.cri_limit
+        - episode.handle_cm
       video_image_keys:
         - main_images
         - exterior2_images
@@ -201,11 +279,12 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  # 2560 % micro must be 0. Kitchen USD + no_shard actor OOM'd at 16.
+  # 1920 % micro must be 0. Kitchen USD + no_shard actor OOM'd at 16.
   micro_batch_size: 8
-  # Per-rank chunks: (envs/GPU)*rollout_epoch*(600/15) = 32*2*40 = 2560.
-  # 2 GPUs → 5120. 8 GPUs → 20480.
-  global_batch_size: 5120
+  # Per-rank chunks: (envs/GPU)*rollout_epoch*(900/15) = 32*1*60 = 1920.
+  # 2 GPUs → 3840. 8 GPUs → 15360. The train script recomputes this
+  # from the horizon when actor.global_batch_size is not overridden.
+  global_batch_size: 3840
   seed: 42
   enable_offload: False
 
@@ -220,6 +299,9 @@ actor:
     openpi:
       config_name: "pi05_droid_jointpos_polaris_cri_adapter"
       num_images_in_input: 2
+      # Noise 0 is the ~100% mean trajectory but has no PPO gradient.
+      # 0.02 left the step-1 ratio near 0.4, so the ±0.2 clip dropped the
+      # time ranking. 0.1 widens the flow std about 5× and started at 48% success.
       noise_level: 0.5
       joint_logprob: False
       num_steps: ${actor.model.num_steps}
@@ -230,14 +312,29 @@ actor:
       detach_critic_input: True
 
   optim:
-    lr: 5.0e-6
-    value_lr: 1.0e-4
+    # 5e-4 on the first Adam step zeroed reach. Start at 5e-5 and adapt
+    # from actor/kl_loss (distance to the opening checkpoint). desired_kl
+    # 1.0 holds the rate while KL is in [0.5, 2.0]: /1.5 above 2.0, *1.5
+    # below 0.5, and never above 1e-4.
+    lr: 5.0e-5
+    lr_scheduler: adaptive
+    desired_kl: 0.3
+    adaptive_lr_min: 1.0e-5
+    adaptive_lr_max: 1.0e-4
+    # Value head only (its input is detached). 5e-4 matches the Isaac
+    # critic rate so a cold head can leave 0. The actor rate stays 5e-5.
+    value_lr: 5.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.95
     adam_eps: 1.0e-08
+    # OpenPI PPO default. Advantages are O(0.1) and grad norm stays near 2,
+    # so the previous 0.2 cap discarded most of the time-ranking step.
     clip_grad: 1.0
     weight_decay: 0.01
+    # Step 100 already finished critic warmup. A non-zero budget here would
+    # freeze the actor again and rebuild Adam, dropping the loaded moments.
     critic_warmup_steps: 0
+    critic_warmup_update_epoch: 5
 
   fsdp_config:
     strategy: "fsdp"

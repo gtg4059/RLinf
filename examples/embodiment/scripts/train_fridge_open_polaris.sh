@@ -6,9 +6,9 @@
 # image and launches the named Hydra config. First positional is the config
 # (same style as run_embodiment.sh); later tokens are Hydra overrides.
 # Collocated actor+env+rollout on all visible GPUs, 32 train / 4 eval
-# envs per GPU. Train episodes are 600 steps and two rollout epochs, so
-# chunks/rank stay 32*2*(600/15) = 2560.
-# This host is 2× Blackwell → 64 train / 8 eval / global_batch 5120.
+# envs per GPU. The train horizon is read from the config (900 steps,
+# 15-step chunks): chunks/rank = 32*1*(900/15) = 1920.
+# This host is 2× Blackwell → 64 train / 8 eval / global_batch 3840.
 # Override RLINF_NUM_GPUS or pass Hydra env.train.total_num_envs=… to pin.
 # Stop a previous fridge PPO / eval container first (they share GPUs).
 # Do not resume a collapsed language-binned 10000 CRI run.
@@ -56,12 +56,11 @@ if [ ! -f "${CONFIG_YAML}" ]; then
   exit 1
 fi
 
-# 32 train / 4 eval envs per GPU. Train rollout_epoch is 2 and episodes
-# are 600 steps, so per-rank chunks stay (32)*2*(600/15) = 2560.
-# global_batch = 2560 * n_gpus. 64 envs/GPU OOM'd the actor update.
+# 32 train / 4 eval envs per GPU. Chunks follow the train horizon in the
+# config: envs/rank * rollout_epoch * (max_steps / num_action_chunks).
+# 900 steps and 15-step chunks → 60 chunks/env. global_batch = that * n_gpus.
 TRAIN_ENVS_PER_GPU=32
 EVAL_ENVS_PER_GPU=4
-CHUNKS_PER_RANK=2560
 
 _visible_gpu_count() {
   if [ -n "${RLINF_NUM_GPUS:-}" ]; then
@@ -86,18 +85,79 @@ _has_hydra_override() {
   return 1
 }
 
+_override_value() {
+  local key="$1"
+  local o
+  for o in "${OVERRIDES[@]}"; do
+    case "${o}" in
+      "${key}="*)
+        printf '%s\n' "${o#"${key}="}"
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+# First "key: value" inside the env.train block, before env.eval.
+_yaml_train_value() {
+  local key="$1"
+  awk -v key="${key}:" '
+    $0 ~ /^  train:/ { in_train=1; next }
+    in_train && $0 ~ /^  [A-Za-z]/ { in_train=0 }
+    in_train && $1 == key { print $2; exit }
+  ' "${CONFIG_YAML}"
+}
+
+_yaml_first_value() {
+  local key="$1"
+  awk -v key="${key}:" '$1 == key { print $2; exit }' "${CONFIG_YAML}"
+}
+
+_resolve_int() {
+  local override_key="$1"
+  local yaml_value="$2"
+  local label="$3"
+  local value=""
+  if value="$(_override_value "${override_key}")"; then
+    :
+  else
+    value="${yaml_value}"
+  fi
+  if ! [[ "${value}" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: ${label} must be a positive integer, got '${value}'." >&2
+    exit 1
+  fi
+  printf '%s\n' "${value}"
+}
+
 N_GPUS="$(_visible_gpu_count)"
 N_GPUS="${N_GPUS//[[:space:]]/}"
 if [ -z "${N_GPUS}" ] || [ "${N_GPUS}" -lt 1 ]; then
   echo "ERROR: no visible GPUs (set RLINF_NUM_GPUS or CUDA_VISIBLE_DEVICES)." >&2
   exit 1
 fi
-TRAIN_ENVS=$((TRAIN_ENVS_PER_GPU * N_GPUS))
 EVAL_ENVS=$((EVAL_ENVS_PER_GPU * N_GPUS))
-GLOBAL_BATCH=$((CHUNKS_PER_RANK * N_GPUS))
-if ! _has_hydra_override "env.train.total_num_envs"; then
+if TRAIN_ENVS="$(_override_value env.train.total_num_envs)"; then
+  :
+else
+  TRAIN_ENVS=$((TRAIN_ENVS_PER_GPU * N_GPUS))
   OVERRIDES+=("env.train.total_num_envs=${TRAIN_ENVS}")
 fi
+if (( TRAIN_ENVS % N_GPUS != 0 )); then
+  echo "ERROR: env.train.total_num_envs=${TRAIN_ENVS} is not divisible by ${N_GPUS} GPUs." >&2
+  exit 1
+fi
+HORIZON="$(_resolve_int env.train.max_steps_per_rollout_epoch "$(_yaml_train_value max_steps_per_rollout_epoch)" "env.train.max_steps_per_rollout_epoch")"
+ROLLOUT_EPOCH="$(_resolve_int env.train.rollout_epoch "$(_yaml_train_value rollout_epoch)" "env.train.rollout_epoch")"
+ACTION_CHUNKS="$(_resolve_int actor.model.num_action_chunks "$(_yaml_first_value num_action_chunks)" "actor.model.num_action_chunks")"
+if (( HORIZON % ACTION_CHUNKS != 0 )); then
+  echo "ERROR: horizon ${HORIZON} is not divisible by num_action_chunks ${ACTION_CHUNKS}." >&2
+  exit 1
+fi
+ENVS_PER_RANK=$((TRAIN_ENVS / N_GPUS))
+CHUNKS_PER_RANK=$((ENVS_PER_RANK * ROLLOUT_EPOCH * HORIZON / ACTION_CHUNKS))
+GLOBAL_BATCH=$((CHUNKS_PER_RANK * N_GPUS))
 if ! _has_hydra_override "env.eval.total_num_envs"; then
   OVERRIDES+=("env.eval.total_num_envs=${EVAL_ENVS}")
 fi
@@ -204,6 +264,7 @@ echo "CONFIG_NAME=${CONFIG_NAME}"
 echo "VISIBLE_GPUS=${N_GPUS}"
 echo "TRAIN_ENVS_PER_GPU=${TRAIN_ENVS_PER_GPU} train_envs=${TRAIN_ENVS}"
 echo "EVAL_ENVS_PER_GPU=${EVAL_ENVS_PER_GPU} eval_envs=${EVAL_ENVS}"
+echo "HORIZON_STEPS=${HORIZON} chunks_per_rank=${CHUNKS_PER_RANK}"
 echo "GLOBAL_BATCH=${GLOBAL_BATCH}"
 echo "POLARIS_OPENPI_CKPT=${POLARIS_OPENPI_CKPT}"
 echo "IMAGE_TAG=${IMAGE_TAG}"

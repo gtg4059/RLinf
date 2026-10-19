@@ -198,6 +198,21 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             "reward_type": self.cfg.algorithm.reward_type,
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
+            "success_return_threshold": self.cfg.algorithm.get(
+                "success_return_threshold", 0.8
+            ),
+            "success_chunk_reward_min": self.cfg.algorithm.get(
+                "success_chunk_reward_min", 0.0
+            ),
+            "success_advantage": self.cfg.algorithm.get("success_advantage", 0.5),
+            "approach_advantage": self.cfg.algorithm.get("approach_advantage", 0.0),
+            "approach_return_max": self.cfg.algorithm.get("approach_return_max", 0.2),
+            "speed_horizon_chunks": self.cfg.algorithm.get(
+                "speed_horizon_chunks", 0.0
+            ),
+            "advantage_horizon_steps": self.cfg.algorithm.get(
+                "advantage_horizon_steps", 0.0
+            ),
         }
 
         adv_and_ret = calculate_adv_and_returns(**kwargs)
@@ -436,6 +451,15 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                         "task_type": self.cfg.runner.task_type,
                         "critic_warmup": self.optimizer_steps
                         < self.critic_warmup_steps,
+                        "advantage_trust_ratio": bool(
+                            self.cfg.algorithm.get("advantage_trust_ratio", False)
+                        ),
+                        "trust_log_ratio_min": self.cfg.algorithm.get(
+                            "trust_log_ratio_min", None
+                        ),
+                        "trust_log_ratio_max": self.cfg.algorithm.get(
+                            "trust_log_ratio_max", None
+                        ),
                     }
 
                     loss, metrics_data = policy_loss(**loss_kwargs)

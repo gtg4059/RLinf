@@ -168,6 +168,35 @@ def compute_decoupled_ppo_actor_loss(
     return pg_loss, metrics_data
 
 
+def _trust_region_log_ratio(
+    log_ratio: torch.Tensor,
+    clip_ratio_low: float,
+    clip_ratio_high: float,
+    trust_log_ratio_min: Optional[float] = None,
+    trust_log_ratio_max: Optional[float] = None,
+) -> torch.Tensor:
+    """Clamp the log-ratio forward and pass its gradient straight through.
+
+    A flow-SDE ratio just outside the PPO clip multiplies the time-ranking
+    advantage by zero. The forward value stays inside that clip, and the
+    backward pass still follows the log-ratio. When ``trust_log_ratio_min``
+    or ``trust_log_ratio_max`` is set, ratios outside that band are detached
+    so a collapsed log-probability does not move the weights.
+    """
+    low = torch.log(log_ratio.new_tensor(max(1.0 - float(clip_ratio_low), 1e-6)))
+    high = torch.log(log_ratio.new_tensor(1.0 + float(clip_ratio_high)))
+    clamped = torch.clamp(log_ratio, min=low, max=high)
+    steered = clamped.detach() + log_ratio - log_ratio.detach()
+    if trust_log_ratio_min is None and trust_log_ratio_max is None:
+        return steered
+    inside = torch.ones_like(log_ratio, dtype=torch.bool)
+    if trust_log_ratio_min is not None:
+        inside = inside & (log_ratio >= float(trust_log_ratio_min))
+    if trust_log_ratio_max is not None:
+        inside = inside & (log_ratio <= float(trust_log_ratio_max))
+    return torch.where(inside, steered, clamped.detach())
+
+
 def compute_ppo_actor_loss(
     logprobs: torch.Tensor,
     old_logprobs: torch.Tensor,
@@ -183,6 +212,9 @@ def compute_ppo_actor_loss(
     clip_log_ratio_min: Optional[float] = None,
     clip_log_ratio_max: Optional[float] = None,
     fast_path_zero_loss_mask: Optional[bool] = False,
+    advantage_trust_ratio: bool = False,
+    trust_log_ratio_min: Optional[float] = None,
+    trust_log_ratio_max: Optional[float] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, dict]:
     """
@@ -247,23 +279,45 @@ def compute_ppo_actor_loss(
         log_ratio = torch.clamp(log_ratio, min=clip_log_ratio_min)
     if clip_log_ratio_max is not None:
         log_ratio = torch.clamp(log_ratio, max=clip_log_ratio_max)
+    # Metrics stay on the raw ratio. The loss below may substitute a
+    # trust-region ratio so a fast-success advantage is not multiplied by 0.
+    raw_log_ratio = log_ratio.detach()
+    approx_kl = torch.where(loss_mask, raw_log_ratio, 0.0)
+    raw_ratio = torch.where(loss_mask, torch.exp(log_ratio.detach()), 0)
+    if advantage_trust_ratio:
+        log_ratio = _trust_region_log_ratio(
+            log_ratio,
+            clip_ratio_low,
+            clip_ratio_high,
+            trust_log_ratio_min=trust_log_ratio_min,
+            trust_log_ratio_max=trust_log_ratio_max,
+        )
     ratio = torch.where(loss_mask, torch.exp(log_ratio), 0)
-    approx_kl = torch.where(loss_mask, log_ratio.detach(), 0.0)
 
     clipped_ratio = torch.clamp(ratio, 1.0 - clip_ratio_low, 1.0 + clip_ratio_high)
-    policy_loss1 = -advantages * ratio
-    policy_loss2 = -advantages * clipped_ratio
+    # Raw ratio for logs. The trust-region path has already clamped ``ratio``.
+    raw_clipped = torch.clamp(
+        raw_ratio, 1.0 - clip_ratio_low, 1.0 + clip_ratio_high
+    )
+    raw_clip_mask = (-advantages * raw_ratio) < (-advantages * raw_clipped)
 
-    clip_mask = policy_loss1.detach() < policy_loss2.detach()
-
-    policy_loss = torch.max(policy_loss1, policy_loss2)
-    if clip_ratio_c is not None:
-        assert clip_ratio_c > 1.0, "clip_ratio_c must be greater than 1.0"
-        policy_loss3 = torch.sign(advantages) * clip_ratio_c * advantages
-        dual_clip_mask = policy_loss3.detach() < policy_loss.detach()
-        policy_loss = torch.min(policy_loss, policy_loss3)
+    if advantage_trust_ratio:
+        # ``ratio`` is already inside the clip. Skipping the max() keeps a
+        # single autograd path so the fast-success advantage is not dropped
+        # when the two clipped surrogates compare equal.
+        policy_loss = -advantages * ratio
+        dual_clip_mask = torch.zeros_like(raw_clip_mask)
     else:
-        dual_clip_mask = torch.zeros_like(clip_mask)
+        policy_loss1 = -advantages * ratio
+        policy_loss2 = -advantages * clipped_ratio
+        policy_loss = torch.max(policy_loss1, policy_loss2)
+        if clip_ratio_c is not None:
+            assert clip_ratio_c > 1.0, "clip_ratio_c must be greater than 1.0"
+            policy_loss3 = torch.sign(advantages) * clip_ratio_c * advantages
+            dual_clip_mask = policy_loss3.detach() < policy_loss.detach()
+            policy_loss = torch.min(policy_loss, policy_loss3)
+        else:
+            dual_clip_mask = torch.zeros_like(raw_clip_mask)
 
     metric_policy_loss_abs = loss_agg_func(
         policy_loss.abs(), loss_mask, loss_mask_ratio
@@ -272,10 +326,9 @@ def compute_ppo_actor_loss(
         policy_loss, loss_mask, loss_mask_ratio
     )  # default max_episode_steps is None
 
-    clip_mask = policy_loss1.detach() < policy_loss2.detach()
     dual_clip_mask = (dual_clip_mask * loss_mask).bool()
 
-    clip_fraction = (clip_mask * loss_mask).sum() / float(loss_mask_count)
+    clip_fraction = (raw_clip_mask * loss_mask).sum() / float(loss_mask_count)
     approx_kl = -torch.sum(approx_kl) / float(loss_mask_count)
 
     dual_cliped_ratio = torch.where(dual_clip_mask, ratio, 0)
@@ -286,8 +339,8 @@ def compute_ppo_actor_loss(
 
     # Compile metrics for logging
     loss_mask_for_metrics = loss_mask
-    ratio_for_metrics = ratio.detach()
-    ratio_abs_for_metrics = (ratio - 1).abs().detach()
+    ratio_for_metrics = raw_ratio.detach()
+    ratio_abs_for_metrics = (raw_ratio - 1).abs().detach()
     clipped_ratio_for_metrics = clipped_ratio.detach()
     dual_cliped_ratio_for_metrics = dual_cliped_ratio.detach()
 
@@ -310,6 +363,12 @@ def compute_ppo_actor_loss(
         ),
         "actor/approx_kl": approx_kl.detach(),
         "actor/clip_fraction": clip_fraction.detach(),
+        # Mean 1/2 (log π - log π_old)^2, clamped per token. This is the
+        # scale rsl_rl compares to desired_kl; approx_kl sums the raw tail.
+        "actor/update_kl": masked_mean(
+            (0.5 * raw_log_ratio.square()).clamp(max=10.0),
+            loss_mask_for_metrics,
+        ),
     }
     return policy_loss, metrics_data
 

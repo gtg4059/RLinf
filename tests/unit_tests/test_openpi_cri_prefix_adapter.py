@@ -22,6 +22,7 @@ import torch
 
 from rlinf.models.embodiment.openpi.cri_prefix import (
     CRIPositionalEmbedding,
+    cri_pos_weight,
     encode_cri_prefix_tokens,
     normalize_cri_prefix_state_dict,
     vlm_value_prefix_mask,
@@ -50,6 +51,40 @@ def test_wrap_bare_cri_pos_parameter_replaces_root_param() -> None:
     assert host.cri_pos._fsdp_wrap_name == "cri_pos"
     assert "cri_pos.weight" in host.state_dict()
     assert "cri_pos" not in host.state_dict()
+
+
+def test_cri_pos_weight_unwraps_fsdp_wrapper() -> None:
+    inner = CRIPositionalEmbedding(9, 4, data=torch.ones(9, 4))
+    wrapper = torch.nn.Module()
+    wrapper._fsdp_wrapped_module = inner
+
+    def _to_returns_self(*_args, **_kwargs):
+        return wrapper
+
+    wrapper.to = _to_returns_self
+    tokens = torch.zeros(2, 9, 4)
+    added = tokens + cri_pos_weight(wrapper).to(dtype=tokens.dtype)
+    assert torch.equal(added, torch.ones(2, 9, 4))
+
+
+def test_wrapped_cri_pos_matches_embed_prefix_add() -> None:
+    host = torch.nn.Module()
+    host.cri_pos = torch.nn.Parameter(torch.ones(9, 4))
+    wrap_bare_cri_pos_parameter(host)
+    tokens = torch.zeros(2, 9, 4)
+    added = tokens + host.cri_pos.to(dtype=tokens.dtype)
+    assert added.shape == (2, 9, 4)
+    assert torch.equal(added, torch.ones(2, 9, 4))
+    assert isinstance(host.cri_pos.to(torch.device("cpu")), CRIPositionalEmbedding)
+
+
+def test_wrapped_module_loads_bare_cri_pos_key() -> None:
+    host = torch.nn.Module()
+    host.cri_pos = torch.nn.Parameter(torch.zeros(9, 4))
+    wrap_bare_cri_pos_parameter(host)
+    table = torch.arange(36, dtype=torch.float32).reshape(9, 4)
+    host.load_state_dict(normalize_cri_prefix_state_dict({"cri_pos": table}))
+    assert torch.equal(host.cri_pos.weight, table)
 
 
 def test_cri_pos_module_is_uniform_dtype() -> None:

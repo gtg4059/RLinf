@@ -326,6 +326,8 @@ class ObservationsCfg:
             },
         )
         door_openness = ObsTerm(func=mdp.fridge_door_openness)
+        # Gripper xyz and the long handle centerline. Not fed to the policy.
+        handle_reach = ObsTerm(func=mdp.fridge_handle_reach)
 
         def __post_init__(self):
             self.enable_corruption = False

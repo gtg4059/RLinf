@@ -6,6 +6,7 @@ import torch
 
 from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.isaac_reset import (
     isaac_reset_row_ids,
+    merge_hold_row_ids,
     zero_rows,
 )
 
@@ -64,3 +65,17 @@ def test_set_chunk_hold_casts_hold_to_states_dtype():
     mask, hold = set_chunk_hold(mask, hold, states, torch.tensor([1]))
     assert hold.dtype == torch.float64
     assert torch.equal(hold[1], states[1])
+
+
+def test_merge_hold_row_ids_includes_cri_rewind():
+    isaac = torch.tensor([0])
+    cri_term = torch.zeros(0, dtype=torch.long)
+    rewind = torch.tensor([2, 0])
+    ids = merge_hold_row_ids(isaac, cri_term, rewind)
+    assert torch.equal(ids, torch.tensor([0, 2]))
+
+
+def test_merge_hold_row_ids_empty():
+    empty = torch.zeros(0, dtype=torch.long)
+    ids = merge_hold_row_ids(empty, empty, empty)
+    assert int(ids.numel()) == 0

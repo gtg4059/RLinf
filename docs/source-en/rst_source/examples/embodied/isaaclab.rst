@@ -301,8 +301,29 @@ Pick one config and launch training:
    # Weights: set POLARIS_OPENPI_CKPT to an RLinf-loadable PolarIS dir
    #   (config_name=pi05_droid_jointpos_polaris). CRI conversion is separate.
    # Gym id Isaac-OpenFridge-Kitchen-Droid-AbsJointPos-v0. 15 Hz.
-   # Online CRI-F + time-penalty rewards match the cube→plate CRI train
-   # knobs (cri_penalty_weight -0.01, time_penalty_weight -0.0001).
+   # Train reward is -1/3 per step until the success termination, plus +40
+   # on that crossing, +8 the first time the door leaves rest by 0.05, and
+   # +1 times the current openness on every step until that done. Holding
+   # the door at 0.19 keeps paying +0.19 until the horizon. A smaller angle
+   # pays less. Also −0.4/15 per meter from the gripper to the handle
+   # bar (Isaac position weight −0.4 times the 1/15 s step). The bar term
+   # stops at the open. The crossing terminates the episode, so an 11 s open
+   # pays about −55 of time and a timeout pays −300. CRI at or above 0.96 rewinds the
+   # arm to the pose from the last scene reset and does not end the attempt.
+   # The horizon reset still restores the original scene and the closed door.
+   # env/cri_rewind_count is the mean number of those rewinds.
+   # env/success_without_cri is the fraction of episodes that cross 0.2
+   # with no rewind.
+   # Eval still scores a single crossing
+   # of 0.2 and keeps Isaac's success termination.
+   # Advantage is GAE (gamma 0.995, lambda 0.97) from the actor value head,
+   # then standardized to mean 0 and std 1. The value clip is 150 so a cold
+   # head can reach the return. The KL penalty to the opening checkpoint stays 0.05.
+   # One pass. A log-ratio inside ±2 nats still applies that ranking
+   # outside the 0.2 clip; beyond ±2 it does not move the weights.
+   # Grad clip 1.0, adaptive lr from 5e-5 up to 1e-4 (desired KL 1.0), KL penalty 0.05.
+   # Eval runs 4 epochs (32 episodes on
+   # 2 GPUs).
    # PolarIS weights stay pi05_droid_jointpos_polaris (no CRI tokens).
    # GPU e2e needs Isaac Sim; CI skips that path.
    POLARIS_OPENPI_CKPT=/path/to/model/RLinf-Pi05-Polaris-droid_jointpos \

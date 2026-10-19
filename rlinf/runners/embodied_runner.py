@@ -31,6 +31,7 @@ from rlinf.utils.metric_utils import compute_evaluate_metrics, print_metrics_tab
 from rlinf.utils.runner_utils import (
     check_progress,
     should_eval_at_start,
+    success_floor_tripped,
 )
 from rlinf.utils.timers import Timer
 
@@ -108,6 +109,7 @@ class EmbodiedRunner:
         self.consumed_samples = 0
         # the step here is GRPO step
         self.global_step = 0
+        self._success_once_window: list[float] = []
 
         # compute `max_steps`
         self.set_max_steps()
@@ -483,6 +485,27 @@ class EmbodiedRunner:
         self.print_metrics_table_async(
             step, self.max_steps, start_time, logging_metrics, start_step
         )
+        return logging_metrics
+
+    def _success_floor_reached(self, metrics: dict) -> bool:
+        """Stop when train success_once stays under the configured floor."""
+        floor = self.cfg.runner.get("success_floor", None)
+        window = int(self.cfg.runner.get("success_floor_window", 0) or 0)
+        if floor is None or window <= 0:
+            return False
+        value = metrics.get("env/success_once")
+        if value is None:
+            return False
+        self._success_once_window.append(float(value))
+        if not success_floor_tripped(self._success_once_window, window, float(floor)):
+            return False
+        recent = self._success_once_window[-window:]
+        mean = sum(recent) / float(window)
+        self.logger.warning(
+            f"Stopping: env/success_once mean {mean:.3f} over {window} steps "
+            f"is below {float(floor):.3f}."
+        )
+        return True
 
     def _finish_run(self) -> None:
         self.metric_logger.finish()
@@ -585,7 +608,7 @@ class EmbodiedRunner:
             if profiled_step is not None:
                 self._close_profiling_window(profiled_step)
 
-            self._log_step_metrics(
+            logged = self._log_step_metrics(
                 step=_step,
                 start_time=start_time,
                 start_step=start_step,
@@ -597,6 +620,9 @@ class EmbodiedRunner:
                 actor_training_metrics=actor_training_metrics,
                 eval_metrics=eval_metrics,
             )
+            if self._success_floor_reached(logged):
+                self._save_checkpoint()
+                break
 
         self._finish_run()
 
@@ -666,7 +692,7 @@ class EmbodiedRunner:
             if profiled_step is not None:
                 self._close_profiling_window(profiled_step)
 
-            self._log_step_metrics(
+            logged = self._log_step_metrics(
                 step=_step,
                 start_time=start_time,
                 start_step=start_step,
@@ -678,6 +704,9 @@ class EmbodiedRunner:
                 actor_training_metrics=actor_training_metrics,
                 eval_metrics=eval_metrics,
             )
+            if self._success_floor_reached(logged):
+                self._save_checkpoint()
+                break
 
         self._finish_run()
 

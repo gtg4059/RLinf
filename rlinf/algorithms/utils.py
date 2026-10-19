@@ -64,6 +64,41 @@ def kl_penalty(
     raise NotImplementedError
 
 
+def reference_kl_loss(
+    logprobs: torch.Tensor,
+    ref_logprobs: torch.Tensor,
+    loss_mask: torch.Tensor | None,
+    kl_penalty_type: str,
+    action_dim: int,
+) -> torch.Tensor:
+    """Mean KL of the current policy against a frozen reference.
+
+    Uses the same token layout as ``preprocess_loss_inputs`` for
+    ``logprob_type: token_level``. ``kl`` / ``k1`` is ``log π - log π_ref``.
+
+    Args:
+        logprobs: Current-policy log probabilities.
+        ref_logprobs: Reference-policy log probabilities, same shape.
+        loss_mask: Steps that still contribute to the loss. ``None`` keeps all.
+        kl_penalty_type: Estimator name accepted by ``kl_penalty``.
+        action_dim: Last-dimension width before the token reshape.
+
+    Returns:
+        Scalar mean divergence on the masked tokens.
+    """
+    batch_size = logprobs.shape[0]
+    current = logprobs.reshape(batch_size, -1, action_dim)
+    reference = ref_logprobs.reshape(batch_size, -1, action_dim)
+    divergence = kl_penalty(current, reference, kl_penalty_type)
+    if loss_mask is None:
+        return divergence.mean()
+    weights = loss_mask.unsqueeze(-1).expand_as(divergence).to(divergence.dtype)
+    denominator = weights.sum()
+    if denominator.item() == 0.0:
+        return divergence.sum() * 0.0
+    return (divergence * weights).sum() / denominator
+
+
 def preprocess_embodied_advantages_inputs(
     rewards: torch.Tensor,
     dones: torch.Tensor,
@@ -136,6 +171,9 @@ def calculate_scores(
     dones: torch.Tensor,
     **kwargs,
 ) -> dict:
+    # Per-chunk rewards, kept so episode_success can ignore the approach.
+    # The sum stops at the done, so a success termination ends the time penalty.
+    step_rewards = rewards
     scores = torch.zeros(kwargs["batch_size"])
     for step in reversed(range(kwargs["n_steps"])):
         scores = scores * ~dones[step + 1]
@@ -148,6 +186,8 @@ def calculate_scores(
             "dones": dones,
         }
     )
+    if kwargs.get("adv_type") == "episode_success":
+        kwargs["step_rewards"] = step_rewards
 
     return kwargs
 
@@ -383,6 +423,33 @@ def postprocess_loss_metric(metrics_data: dict) -> dict:
         elif isinstance(v, (float, int)):
             metrics_data[k] = v
     return metrics_data
+
+
+def resolve_update_epoch(
+    update_epoch: int,
+    critic_warmup_update_epoch: int,
+    optimizer_steps: int,
+    critic_warmup_steps: int,
+) -> int:
+    """How many passes to take over the rollout just collected.
+
+    While the actor is frozen, the value head can train for several passes on
+    that same rollout. After warmup this returns ``update_epoch`` so the
+    policy is not updated more than once per rollout.
+
+    Args:
+        update_epoch: Passes used once the actor is training.
+        critic_warmup_update_epoch: Passes used on a warmup rollout.
+        optimizer_steps: Value/actor updates finished so far.
+        critic_warmup_steps: Updates that must finish before the actor unfreezes.
+
+    Returns:
+        The epoch count for this rollout.
+    """
+    update_epoch = int(update_epoch)
+    if int(critic_warmup_steps) > 0 and int(optimizer_steps) < int(critic_warmup_steps):
+        return max(update_epoch, int(critic_warmup_update_epoch))
+    return update_epoch
 
 
 def expand_to_target_dim(tensor, target_shape):

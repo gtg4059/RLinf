@@ -68,3 +68,21 @@ def test_cri_prefix_linears_are_fsdp_no_split_names():
     assert "cri_out_proj" in names
     assert "cri_pos" in names
     assert "action_in_proj" in names
+
+    class _Cfg:
+        train_expert_only = True
+        noise_method = "flow_sde"
+        use_rlt = False
+
+    class _Host:
+        config = _Cfg()
+
+    modules = OpenPi0ForRLActionPrediction._no_split_modules.fget(_Host())
+    assert "SiglipEncoderLayer" in modules
+    assert "SiglipVisionTransformer" in modules
+    assert "PaliGemmaMultiModalProjector" in modules
+    _Host.config.train_expert_only = False
+    modules = OpenPi0ForRLActionPrediction._no_split_modules.fget(_Host())
+    assert "SiglipEncoderLayer" in modules
+    assert "SiglipVisionTransformer" in modules
+    assert "PaliGemmaMultiModalProjector" in modules

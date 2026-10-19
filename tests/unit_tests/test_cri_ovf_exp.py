@@ -102,6 +102,12 @@ def test_cri_ovf_violated_at_and_below_threshold():
     assert bool(cri_ovf_violated(above, threshold=0.96).all())
 
 
+def test_cri_ovf_violated_accepts_a_per_row_limit():
+    cri = torch.tensor([[1.5, 0.1], [2.0, 0.0], [2.0, 0.0]])
+    hit = cri_ovf_violated(cri, threshold=torch.tensor([0.96, 2.0, 3.0]))
+    assert hit.tolist() == [True, True, False]
+
+
 def test_cri_ovf_termination_penalty_is_success_reward_third():
     expected = -ISAACLAB_STEP_DT / 3.0
     assert CRI_OVF_TERM_PENALTY == pytest.approx(expected)
@@ -145,6 +151,17 @@ def test_time_penalty_live_mask_success_step_still_pays():
     after = time_penalty_live_mask(2, success_once=success_once)
     assert torch.equal(before, torch.tensor([True, True]))
     assert torch.equal(after, torch.tensor([False, True]))
+
+
+def test_time_penalty_live_mask_until_horizon_pays_after_the_open():
+    mask = time_penalty_live_mask(
+        2,
+        hold_after_done=True,
+        was_frozen=torch.tensor([True, False]),
+        success_once=torch.tensor([True, True]),
+        until_horizon=True,
+    )
+    assert torch.equal(mask, torch.tensor([True, True]))
 
 
 def test_time_penalty_live_mask_hold_after_done_still_skips_frozen():

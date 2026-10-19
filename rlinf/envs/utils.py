@@ -239,21 +239,27 @@ def tile_images(
 
 
 def put_text_on_image(
-    image: np.ndarray, lines: list[str], max_width: int = 200
+    image: np.ndarray,
+    lines: list[str],
+    max_width: int = 200,
+    align: str = "left",
 ) -> np.ndarray:
-    """
-    Put text lines on an image with automatic line wrapping.
+    """Put text lines on an image with automatic line wrapping.
 
     Args:
-        image: Input image as numpy array
-        lines: List of text lines to add
-        max_width: Maximum width for text wrapping
+        image: Input image as numpy array.
+        lines: Text lines to add.
+        max_width: Maximum width for text wrapping.
+        align: ``left`` draws black text at the left edge. ``right`` draws
+            white text with a dark stroke at the right edge.
     """
     assert image.dtype == np.uint8, image.dtype
     image = image.copy()
     image = Image.fromarray(image)
     draw = ImageDraw.Draw(image)
     font = ImageFont.load_default(size=20)
+    fill = (255, 255, 255) if align == "right" else (0, 0, 0)
+    stroke_width = 2 if align == "right" else 0
 
     new_lines = []
     for line in lines:
@@ -274,11 +280,22 @@ def put_text_on_image(
 
     y = -10
     for line in new_lines:
-        bbox = draw.textbbox((0, 0), text=line)
+        bbox = draw.textbbox((0, 0), text=line, font=font)
         textheight = bbox[3] - bbox[1]
+        textwidth = bbox[2] - bbox[0]
         y += textheight + 10
-        x = 10
-        draw.text((x, y), text=line, fill=(0, 0, 0))
+        if align == "right":
+            x = image.width - 10 - textwidth
+        else:
+            x = 10
+        draw.text(
+            (x, y),
+            text=line,
+            font=font,
+            fill=fill,
+            stroke_width=stroke_width,
+            stroke_fill=(0, 0, 0),
+        )
     return np.array(image)
 
 
@@ -287,23 +304,25 @@ def put_info_on_image(
     info: dict[str, float],
     extras: Optional[list[str]] = None,
     overlay: bool = True,
+    align: str = "left",
 ) -> np.ndarray:
-    """
-    Put information dictionary and extra lines on an image.
+    """Put information dictionary and extra lines on an image.
 
     Args:
-        image: Input image
-        info: Dictionary of key-value pairs to display
-        extras: Additional text lines to display
-        overlay: Whether to overlay text on image
+        image: Input image.
+        info: Key-value pairs to display.
+        extras: Additional text lines to display.
+        overlay: Whether to overlay text on the image.
+        align: ``left`` or ``right`` edge of the frame.
     """
+    del overlay
     lines = [
         f"{k}: {v:.3f}" if isinstance(v, float) else f"{k}: {v}"
         for k, v in info.items()
     ]
     if extras is not None:
         lines.extend(extras)
-    return put_text_on_image(image, lines)
+    return put_text_on_image(image, lines, align=align)
 
 
 def crop_and_resize(image, crop_scale, batch_size):

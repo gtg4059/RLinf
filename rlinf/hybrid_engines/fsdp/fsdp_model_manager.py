@@ -40,6 +40,7 @@ from rlinf.hybrid_engines.fsdp import (
     FSDP,
     FSDPModule,
 )
+from rlinf.hybrid_engines.fsdp.optim_lr import apply_cfg_lrs_to_optimizer
 from rlinf.hybrid_engines.fsdp.strategy.base import FSDPStrategyBase
 from rlinf.hybrid_engines.fsdp.utils import (
     create_device_mesh,
@@ -374,24 +375,23 @@ class FSDPModelManager:
         self._strategy.load_checkpoint(
             self.model, self.optimizer, self.lr_scheduler, load_path
         )
-        # DCP restores optimizer param-group lrs. Re-apply YAML so a resume can
-        # continue with a new actor / value learning rate.
+        # DCP restores optimizer param-group lrs and scheduler base_lrs.
+        # Re-apply YAML so a resume can continue at a new learning rate.
         self._apply_optim_lr_from_cfg()
 
     def _apply_optim_lr_from_cfg(self) -> None:
-        """Overwrite optimizer param-group lrs from ``cfg.optim`` after resume."""
+        """Overwrite optimizer and scheduler lrs from ``cfg.optim`` after resume."""
         if self.optimizer is None:
             return
         optim_cfg = self._cfg.get("optim", None)
         if optim_cfg is None:
             return
-        actor_lr = optim_cfg.get("lr", None)
-        value_lr = optim_cfg.get("value_lr", None)
-        groups = self.optimizer.param_groups
-        if actor_lr is not None and groups:
-            groups[0]["lr"] = float(actor_lr)
-        if value_lr is not None and len(groups) > 1:
-            groups[1]["lr"] = float(value_lr)
+        apply_cfg_lrs_to_optimizer(
+            self.optimizer,
+            getattr(self, "lr_scheduler", None),
+            actor_lr=optim_cfg.get("lr", None),
+            value_lr=optim_cfg.get("value_lr", None),
+        )
 
     def save_checkpoint(self, save_path: str, step: int = 0) -> None:
         """
@@ -516,6 +516,10 @@ class FSDPModelManager:
         total_steps = optim_config.get("total_training_steps", 0)
         num_warmup_steps = int(optim_config.get("lr_warmup_steps", -1))
         lr_scheduler = optim_config.get("lr_scheduler", "constant")
+        # Adaptive changes the actor rate after each update from the mean KL.
+        # The torch scheduler is only a placeholder and is not stepped.
+        if lr_scheduler == "adaptive":
+            lr_scheduler = "constant"
         num_cycles = optim_config.get("num_cycles", 0.5)
         min_lr = optim_config.get("min_lr", 0.0)
         min_lr_rate = optim_config.get("min_lr_rate", None)

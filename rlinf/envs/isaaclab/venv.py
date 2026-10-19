@@ -18,6 +18,8 @@ from typing import Any
 import torch
 import torch.multiprocessing as mp
 
+from .spawn_rewind import capture_robot_spawn
+from .spawn_rewind import rewind_robot_to_spawn
 from .utils import CloudpickleWrapper
 
 
@@ -69,6 +71,13 @@ def _torch_worker(
                     )
                 # CPU pickle: Docker seccomp often blocks pidfd_getfd CUDA IPC.
                 obs_queue.put(nested_to_device(reset_result, None))
+                capture_robot_spawn(
+                    isaac_env, None if reset_index is None else reset_ids
+                )
+            elif cmd == "rewind_spawn":
+                rewind_ids = nested_to_device(reset_idx_queue.get(), device)
+                rewound_obs = rewind_robot_to_spawn(isaac_env, rewind_ids)
+                obs_queue.put(nested_to_device(rewound_obs, None))
             elif cmd == "step":
                 input_action = nested_to_device(action_queue.get(), device)
                 step_result = isaac_env.step(input_action)
@@ -118,6 +127,13 @@ class SubProcIsaacLabEnv:
     def reset(self, seed=None, env_ids=None):
         self.parent_remote.send("reset")
         self.reset_idx.put((nested_to_device(env_ids, None), seed))
+        result = self.obs_queue.get()
+        return nested_to_device(result, self._device)
+
+    def rewind_to_spawn(self, env_ids: torch.Tensor):
+        """Teleport ``env_ids`` to the joint pose stored at the last reset."""
+        self.parent_remote.send("rewind_spawn")
+        self.reset_idx.put(nested_to_device(env_ids, None))
         result = self.obs_queue.get()
         return nested_to_device(result, self._device)
 

@@ -1432,6 +1432,21 @@ class EnvWorker(Worker):
             "loss_mask_sum": rollout_batch.get("loss_mask_sum", None),
             "normalize_advantages": self.cfg.algorithm.get("normalize_advantages", True)
             and not self.use_training_pipeline,
+            "success_return_threshold": self.cfg.algorithm.get(
+                "success_return_threshold", 0.8
+            ),
+            "success_chunk_reward_min": self.cfg.algorithm.get(
+                "success_chunk_reward_min", 0.0
+            ),
+            "success_advantage": self.cfg.algorithm.get("success_advantage", 0.5),
+            "approach_advantage": self.cfg.algorithm.get("approach_advantage", 0.0),
+            "approach_return_max": self.cfg.algorithm.get("approach_return_max", 0.2),
+            "speed_horizon_chunks": self.cfg.algorithm.get(
+                "speed_horizon_chunks", 0.0
+            ),
+            "advantage_horizon_steps": self.cfg.algorithm.get(
+                "advantage_horizon_steps", 0.0
+            ),
         }
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
         rollout_batch.update(advantages_and_returns)

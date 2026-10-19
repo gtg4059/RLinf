@@ -24,10 +24,13 @@ from torch.distributed.tensor import DTensor
 from torch.multiprocessing.reductions import reduce_tensor
 
 import rlinf.algorithms  # noqa: F401
+from rlinf.algorithms.adaptive_lr import adapt_learning_rate
 from rlinf.algorithms.expert import build_expert_model_config
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
 from rlinf.algorithms.utils import (
     kl_penalty,
+    reference_kl_loss,
+    resolve_update_epoch,
 )
 from rlinf.config import SupportedModel, torch_dtype_from_precision
 from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
@@ -39,6 +42,7 @@ from rlinf.hybrid_engines.fsdp.state_dict_utils import (
     clean_fsdp_state_dict_key,
     collect_cleaned_named_tensors,
     fill_missing_named_tensors,
+    unwrap_fsdp_module,
 )
 from rlinf.hybrid_engines.fsdp.utils import (
     pack_fsdp_input,
@@ -1128,6 +1132,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         if needed, offload model parameters and optimizer states to CPU.
         """
         self.setup_model_and_optimizer()
+        # Snapshot before a resume load replaces these weights. The reference
+        # stays the checkpoint named by actor.model.model_path.
+        self.ref_policy_state_dict = None
+        self._ref_swap_buffer: dict = {}
+        if float(self.cfg.algorithm.get("kl_beta", 0.0)) > 0.0:
+            self.ref_policy_state_dict = retrieve_model_state_dict_in_cpu(self.model)
+            cri_pos = self._cri_pos_tensor()
+            self._ref_cri_pos = (
+                None
+                if cri_pos is None
+                else cri_pos.detach().to(device="cpu", copy=True).pin_memory()
+            )
+            self.log_info("Captured the initial actor weights as the KL reference.")
 
         if self.enable_offload:
             self.offload_param_and_grad()
@@ -1391,6 +1408,24 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "reward_type": self.cfg.algorithm.reward_type,
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
+            "normalize_advantages": self.cfg.algorithm.get(
+                "normalize_advantages", True
+            ),
+            "success_return_threshold": self.cfg.algorithm.get(
+                "success_return_threshold", 0.8
+            ),
+            "success_chunk_reward_min": self.cfg.algorithm.get(
+                "success_chunk_reward_min", 0.0
+            ),
+            "success_advantage": self.cfg.algorithm.get("success_advantage", 0.5),
+            "approach_advantage": self.cfg.algorithm.get("approach_advantage", 0.0),
+            "approach_return_max": self.cfg.algorithm.get("approach_return_max", 0.2),
+            "speed_horizon_chunks": self.cfg.algorithm.get(
+                "speed_horizon_chunks", 0.0
+            ),
+            "advantage_horizon_steps": self.cfg.algorithm.get(
+                "advantage_horizon_steps", 0.0
+            ),
         }
 
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
@@ -1600,6 +1635,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch = process_nested_dict_for_train(
                 self.rollout_batch, shuffle_id
             )
+        self._attach_ref_logprobs()
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
@@ -1609,8 +1645,21 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             f"{rollout_size} is not divisible by {batch_size_per_rank}"
         )
         metrics = {}
-        update_epoch = self.cfg.algorithm.get("update_epoch", 1)
-        for _ in range(update_epoch):
+        base_update_epoch = int(self.cfg.algorithm.get("update_epoch", 1))
+        warmup_update_epoch = int(
+            self.cfg.actor.optim.get("critic_warmup_update_epoch", base_update_epoch)
+        )
+        update_epoch = resolve_update_epoch(
+            base_update_epoch,
+            warmup_update_epoch,
+            self.optimizer_steps,
+            self.critic_warmup_steps,
+        )
+        # Extra warmup passes must not continue as actor updates on this batch
+        # once the value-head budget is spent.
+        started_in_warmup = update_epoch > base_update_epoch
+        for epoch_idx in range(update_epoch):
+            stop_warmup_epochs = False
             rollout_dataloader_iter = split_dict_to_chunk(
                 self.rollout_batch,
                 rollout_size // batch_size_per_rank,
@@ -1653,8 +1702,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 if len(lr_list) > 1:
                     data["critic/lr"] = lr_list[1]
                 append_to_dict(metrics, data)
-        # put LR scheduler step here
-        self.lr_scheduler.step()
+                if (
+                    started_in_warmup
+                    and self.critic_warmup_steps <= 0
+                    and epoch_idx + 1 >= base_update_epoch
+                ):
+                    stop_warmup_epochs = True
+                    break
+            if stop_warmup_epochs:
+                break
         self.optimizer.zero_grad()
         clear_memory()
         explained_variance_stats = pop_critic_explained_variance_stats(metrics)
@@ -1662,6 +1718,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
         )
+        if str(self.cfg.actor.optim.get("lr_scheduler", "constant")) == "adaptive":
+            # kl_loss is the distance from the opening checkpoint. It is ~0
+            # before any update, ~0.2 while the door still opens, and ~4
+            # after the policy has collapsed. update_kl stays large from the
+            # flow ratio mismatch even when the weights have not moved.
+            kl_for_lr = mean_metric_dict.get("actor/kl_loss")
+            if kl_for_lr is None:
+                kl_for_lr = mean_metric_dict.get(
+                    "actor/update_kl", mean_metric_dict.get("actor/approx_kl", 0.0)
+                )
+            self._adapt_actor_lr(float(kl_for_lr))
+        else:
+            self.lr_scheduler.step()
         if explained_variance_stats:
             reduced_stats = all_reduce_dict(
                 explained_variance_stats, op=torch.distributed.ReduceOp.SUM
@@ -1671,6 +1740,84 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             )
 
         return mean_metric_dict
+
+    def _adapt_actor_lr(self, kl_mean: float) -> None:
+        """Set the next actor rate from this update's mean KL.
+
+        The value-head group is left at ``value_lr``. Matches rsl_rl: divide
+        by 1.5 when KL exceeds twice ``desired_kl``, multiply by 1.5 when it
+        is below half.
+        """
+        optim_cfg = self.cfg.actor.optim
+        current = float(self.optimizer.param_groups[0]["lr"])
+        new_lr = adapt_learning_rate(
+            current,
+            kl_mean,
+            float(optim_cfg.get("desired_kl", 0.016)),
+            min_lr=float(optim_cfg.get("adaptive_lr_min", 1.0e-5)),
+            max_lr=float(optim_cfg.get("adaptive_lr_max", 1.0e-2)),
+        )
+        self.optimizer.param_groups[0]["lr"] = new_lr
+
+    def _attach_ref_logprobs(self) -> None:
+        """Store reference logprobs on the rollout batch when ``kl_beta`` > 0.
+
+        Swaps in the weights captured at worker init, runs one no-grad
+        forward, then restores the training weights.
+        """
+        if float(self.cfg.algorithm.get("kl_beta", 0.0)) <= 0.0:
+            return
+        if self.ref_policy_state_dict is None:
+            raise RuntimeError(
+                "kl_beta > 0 but the reference policy was not captured."
+            )
+        prev_logprobs = self.rollout_batch["prev_logprobs"]
+        micro_batch_size = int(self.cfg.actor.micro_batch_size)
+        num_samples = int(prev_logprobs.shape[0])
+        if num_samples % micro_batch_size != 0:
+            raise RuntimeError(
+                f"{num_samples=} is not divisible by {micro_batch_size=}."
+            )
+        chunks = split_dict_to_chunk(
+            self.rollout_batch, num_samples // micro_batch_size
+        )
+        ref_parts: list[torch.Tensor] = []
+        cri_pos = self._cri_pos_tensor()
+        cri_backup = (
+            None if cri_pos is None else cri_pos.detach().to(device="cpu", copy=True)
+        )
+        with cpu_weight_swap(
+            self.model, self.ref_policy_state_dict, self._ref_swap_buffer
+        ):
+            # state_dict() omits the root cri_pos parameter, so copy it too.
+            if cri_pos is not None and self._ref_cri_pos is not None:
+                cri_pos.data.copy_(self._ref_cri_pos)
+            with torch.no_grad():
+                for chunk in chunks:
+                    chunk = put_tensor_device(chunk, self.device)
+                    output = self.model(
+                        forward_inputs=chunk["forward_inputs"],
+                        compute_logprobs=True,
+                        compute_entropy=False,
+                        compute_values=False,
+                        use_cache=False,
+                    )
+                    ref_parts.append(output["logprobs"].detach().cpu())
+                    del chunk, output
+        if cri_pos is not None and cri_backup is not None:
+            cri_pos.data.copy_(cri_backup)
+        self.rollout_batch["ref_logprobs"] = torch.cat(ref_parts, dim=0)
+        self.torch_platform.empty_cache()
+
+    def _cri_pos_tensor(self) -> torch.Tensor | None:
+        """Return the CRI prefix parameter when this model has one."""
+        unwrapped = unwrap_fsdp_module(self.model)
+        cri_pos = getattr(unwrapped, "cri_pos", None)
+        if isinstance(cri_pos, nn.Module):
+            cri_pos = getattr(cri_pos, "weight", None)
+        if isinstance(cri_pos, torch.Tensor):
+            return cri_pos
+        return None
 
     def train_micro_batch(
         self,
@@ -1743,6 +1890,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "max_episode_steps": self.cfg.env.train.max_episode_steps,
             "task_type": self.cfg.runner.task_type,
             "critic_warmup": self.optimizer_steps < self.critic_warmup_steps,
+            "advantage_trust_ratio": bool(
+                self.cfg.algorithm.get("advantage_trust_ratio", False)
+            ),
+            "trust_log_ratio_min": self.cfg.algorithm.get("trust_log_ratio_min", None),
+            "trust_log_ratio_max": self.cfg.algorithm.get("trust_log_ratio_max", None),
         }
 
         if SupportedModel(self.cfg.actor.model.model_type) in [
@@ -1773,9 +1925,31 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
         metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
 
+        kl_beta = float(self.cfg.algorithm.get("kl_beta", 0.0))
+        kl_loss = torch.zeros((), device=loss.device)
+        if kl_beta > 0.0 and not loss_kwargs["critic_warmup"]:
+            ref_logprobs = micro_batch.get("ref_logprobs")
+            if ref_logprobs is None:
+                raise RuntimeError(
+                    "kl_beta > 0 but this micro-batch has no ref_logprobs."
+                )
+            penalty_type = self.cfg.algorithm.get(
+                "kl_penalty_type", self.cfg.algorithm.get("kl_penalty", "kl")
+            )
+            kl_loss = reference_kl_loss(
+                output_dict["logprobs"],
+                ref_logprobs,
+                loss_mask,
+                str(penalty_type),
+                int(self.cfg.actor.model.get("action_dim", 7)),
+            )
+            loss = loss + kl_beta * kl_loss
+        metrics_data["actor/kl_loss"] = kl_loss.detach().item()
+
         if self.enable_sft_co_train:
             loss = self._train_sft_epoch(metrics_data, loss)
 
+        loss = self._keep_value_head_in_graph(loss, compute_values)
         loss /= self.gradient_accumulation
         if not loss.requires_grad:
             # Critic-warmup freeze + actor-only loss: no graph. Attach a zero
@@ -1790,6 +1964,33 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         metrics_data["actor/total_loss"] = loss.detach().item()
         append_to_dict(metrics, metrics_data)
+
+    def _keep_value_head_in_graph(
+        self, loss: torch.Tensor, compute_values: bool
+    ) -> torch.Tensor:
+        """Give an unused value head a zero gradient.
+
+        ``episode_success`` does not ask for values, so the value head would
+        otherwise be missing from the autograd graph. FSDP still reduces
+        every trainable parameter. The added term is zero and does not change
+        the policy step.
+
+        Args:
+            loss: Micro-batch loss about to be scaled and backpropagated.
+            compute_values: True when this loss already runs the value head.
+
+        Returns:
+            The same loss, plus a zero term on the value head when needed.
+        """
+        if compute_values:
+            return loss
+        value_head = getattr(unwrap_fsdp_module(self.model), "value_head", None)
+        if value_head is None:
+            return loss
+        for param in value_head.parameters():
+            if param.requires_grad:
+                loss = loss + param.reshape(-1)[0] * 0.0
+        return loss
 
     def set_global_step(self, global_step: int) -> None:
         """

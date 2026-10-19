@@ -17,10 +17,19 @@
 from __future__ import annotations
 
 import gymnasium as gym
-
 import torch
 
 from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.door import door_reached_from_rest
+from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.door_reward import (
+    capped_closing_reward,
+    capped_progress_reward,
+    cri_limit_near_handle,
+    ee_bar_distance_penalty,
+    handle_reach_distance,
+    openness_level_reward,
+    repeat_open_crossing,
+    success_crossing,
+)
 from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.env import (
     IsaaclabPickPlaceCubePlateEnv,
 )
@@ -62,9 +71,53 @@ class IsaaclabOpenFridgeKitchenEnv(IsaaclabPickPlaceCubePlateEnv):
         worker_info,
     ):
         init_params = cfg.init_params
-        self._stand_height_m = float(
-            init_params.get("stand_height_m", _STAND_HEIGHT_M)
+        self._stand_height_m = float(init_params.get("stand_height_m", _STAND_HEIGHT_M))
+        # 1.0 on the first crossing of the Arena threshold. 0 keeps the
+        # Isaac dt-scaled success reward (eval).
+        self._success_bonus = float(init_params.get("success_bonus", 0.0))
+        # weight 0.3 makes a monotonic 0→1 open worth 0.3 before the cap.
+        self._door_progress_weight = float(init_params.get("door_progress_weight", 0.0))
+        self._door_progress_cap = float(init_params.get("door_progress_cap", 0.4))
+        # Per live step, weight times the current openness. 0 disables it.
+        self._door_openness_weight = float(init_params.get("door_openness_weight", 0.0))
+        # One payment the first time the door leaves rest. 0 disables it.
+        self._reach_bonus = float(init_params.get("reach_bonus", 0.0))
+        # Closing the gap to the handle bar, before the door moves.
+        # weight 0.2 pays 0.1 for the first 0.5 m and then stops.
+        self._handle_approach_weight = float(
+            init_params.get("handle_approach_weight", 0.0)
         )
+        self._handle_approach_cap = float(init_params.get("handle_approach_cap", 0.1))
+        self._handle_approach_openness = float(
+            init_params.get("handle_approach_openness", 0.05)
+        )
+        # Isaac position tracking: weight −0.4 times the 1/15 s step, per meter.
+        self._ee_bar_distance_weight = float(
+            init_params.get("ee_bar_distance_weight", 0.0)
+        )
+        self._openness_threshold = float(init_params.get("openness_threshold", 0.2))
+        # After an open, Isaac resets the scene and a later open in the same
+        # horizon pays the success bonus again.
+        self._repeat_open_after_success = bool(
+            init_params.get("repeat_open_after_success", False)
+        )
+        # Within 10 cm of the hinged handle bar the rewind level is 3.
+        # Reported CRI is clamped at 2, so that reach does not rewind.
+        # Farther away the level stays at cri_penalty_limit (0.96).
+        self._cri_handle_relax_distance_m = float(
+            init_params.get("cri_handle_relax_distance_m", 0.10)
+        )
+        self._cri_handle_relax_limit = float(
+            init_params.get("cri_handle_relax_limit", 3.0)
+        )
+        self._isaac_success_termination = bool(
+            init_params.get("isaac_success_termination", True)
+        )
+        self._door_openness_prev = None
+        self._door_progress_paid = None
+        self._handle_dist_prev = None
+        self._handle_approach_paid = None
+        self._last_handle_reach = None
         super().__init__(
             cfg,
             num_envs,
@@ -74,6 +127,21 @@ class IsaaclabOpenFridgeKitchenEnv(IsaaclabPickPlaceCubePlateEnv):
         )
         self.reach_once = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._open_attempt_paid = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._opened_once = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._reached_once = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._ee_bar_distance_sum = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self._door_openness_reward_sum = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
         )
         self._last_door_openness = torch.zeros(
             self.num_envs, dtype=torch.float32, device=self.device
@@ -86,6 +154,11 @@ class IsaaclabOpenFridgeKitchenEnv(IsaaclabPickPlaceCubePlateEnv):
             self._last_door_openness = torch.as_tensor(
                 openness, device=self.device, dtype=torch.float32
             ).reshape(-1)
+        handle_reach = policy.get("handle_reach") if isinstance(policy, dict) else None
+        if handle_reach is not None:
+            self._last_handle_reach = torch.as_tensor(
+                handle_reach, device=self.device, dtype=torch.float32
+            ).reshape(self.num_envs, -1)
         return super()._wrap_obs(obs)
 
     def _reset_metrics(self, env_idx=None):
@@ -95,8 +168,63 @@ class IsaaclabOpenFridgeKitchenEnv(IsaaclabPickPlaceCubePlateEnv):
         if env_idx is not None:
             ids = torch.as_tensor(env_idx, device=self.device).reshape(-1)
             self.reach_once.index_fill_(0, ids, False)
+            self._clear_repeat_open_state(ids)
+            self._zero_door_reward_state(ids)
+            self._zero_handle_approach_state(ids)
+            bar_sum = getattr(self, "_ee_bar_distance_sum", None)
+            if bar_sum is not None:
+                bar_sum.index_fill_(0, ids, 0.0)
+            angle_sum = getattr(self, "_door_openness_reward_sum", None)
+            if angle_sum is not None:
+                angle_sum.index_fill_(0, ids, 0.0)
             return
         self.reach_once.zero_()
+        self._clear_repeat_open_state(None)
+        self._zero_door_reward_state(None)
+        self._zero_handle_approach_state(None)
+        bar_sum = getattr(self, "_ee_bar_distance_sum", None)
+        if bar_sum is not None:
+            bar_sum.zero_()
+        angle_sum = getattr(self, "_door_openness_reward_sum", None)
+        if angle_sum is not None:
+            angle_sum.zero_()
+
+    def _cri_ovf_term_limits(self) -> float | torch.Tensor:
+        """Raise the rewind level to 3 when the gripper is on the handle."""
+        base = float(self._cri_ovf_term_threshold)
+        reach = getattr(self, "_last_handle_reach", None)
+        if reach is None or int(reach.shape[-1]) < 9:
+            return base
+        distance, valid = handle_reach_distance(reach)
+        self._last_handle_distance = distance.detach()
+        return cri_limit_near_handle(
+            distance,
+            valid,
+            base_limit=base,
+            near_distance_m=self._cri_handle_relax_distance_m,
+            near_limit=self._cri_handle_relax_limit,
+        )
+
+    def _record_cri_video_metrics(self, episode: dict) -> None:
+        """Scalars drawn on the eval video: CRI, its limit, handle distance."""
+        cri = getattr(self, "_video_cri", None)
+        if cri is not None:
+            cri_t = torch.as_tensor(cri, device=self.device, dtype=torch.float32)
+            if cri_t.ndim == 1:
+                cri_t = cri_t.unsqueeze(0)
+            episode["cri_max"] = cri_t.amax(dim=-1)
+        limits = getattr(self, "_video_cri_limit", None)
+        if limits is not None:
+            limit_t = torch.as_tensor(
+                limits, device=self.device, dtype=torch.float32
+            ).reshape(-1)
+            if limit_t.numel() == 1:
+                limit_t = limit_t.expand(self.num_envs)
+            episode["cri_limit"] = limit_t
+        distance = getattr(self, "_last_handle_distance", None)
+        if distance is not None:
+            cm = torch.as_tensor(distance, device=self.device, dtype=torch.float32)
+            episode["handle_cm"] = cm.reshape(-1) * 100.0
 
     def _record_metrics(self, step_reward, terminations, infos):
         infos = super()._record_metrics(step_reward, terminations, infos)
@@ -106,8 +234,299 @@ class IsaaclabOpenFridgeKitchenEnv(IsaaclabPickPlaceCubePlateEnv):
         self.reach_once = self.reach_once | door_reached_from_rest(openness)
         episode = infos.setdefault("episode", {})
         episode["reach_once"] = self.reach_once.clone()
+        self._log_repeat_open_metrics(episode)
         episode["door_openness"] = openness.clone()
+        self._record_cri_video_metrics(episode)
+        paid = getattr(self, "_door_progress_paid", None)
+        if paid is not None:
+            episode["door_progress"] = paid.clone()
+        handle_paid = getattr(self, "_handle_approach_paid", None)
+        if handle_paid is not None:
+            episode["handle_approach"] = handle_paid.clone()
+        bar_sum = getattr(self, "_ee_bar_distance_sum", None)
+        if bar_sum is not None:
+            episode["Episode_Reward/ee_bar_distance"] = bar_sum.clone()
+        angle_sum = getattr(self, "_door_openness_reward_sum", None)
+        if angle_sum is not None:
+            episode["Episode_Reward/door_openness"] = angle_sum.clone()
         return infos
+
+    def _zero_door_reward_state(self, env_idx: torch.Tensor | None) -> None:
+        prev = getattr(self, "_door_openness_prev", None)
+        paid = getattr(self, "_door_progress_paid", None)
+        if prev is None or paid is None:
+            return
+        if env_idx is None:
+            prev.zero_()
+            paid.zero_()
+            return
+        prev.index_fill_(0, env_idx, 0.0)
+        paid.index_fill_(0, env_idx, 0.0)
+
+    def _zero_handle_approach_state(self, env_idx: torch.Tensor | None) -> None:
+        prev = getattr(self, "_handle_dist_prev", None)
+        paid = getattr(self, "_handle_approach_paid", None)
+        if prev is None or paid is None:
+            return
+        if env_idx is None:
+            prev.zero_()
+            paid.zero_()
+            return
+        prev.index_fill_(0, env_idx, 0.0)
+        paid.index_fill_(0, env_idx, 0.0)
+
+    def _ensure_handle_approach_state(self) -> None:
+        if self._handle_dist_prev is not None:
+            return
+        self._handle_dist_prev = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self._handle_approach_paid = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+
+    def _ensure_door_reward_state(self) -> None:
+        if self._door_openness_prev is not None:
+            return
+        self._door_openness_prev = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self._door_progress_paid = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+
+    def _clear_repeat_open_state(self, env_idx: torch.Tensor | None) -> None:
+        """Drop per-attempt latches. Keep the horizon-level open record."""
+        paid = getattr(self, "_open_attempt_paid", None)
+        opened = getattr(self, "_opened_once", None)
+        reached = getattr(self, "_reached_once", None)
+        if paid is None or opened is None or reached is None:
+            return
+        if env_idx is None:
+            paid.zero_()
+            opened.zero_()
+            reached.zero_()
+            return
+        paid.index_fill_(0, env_idx, False)
+        opened.index_fill_(0, env_idx, False)
+        reached.index_fill_(0, env_idx, False)
+
+    def _log_repeat_open_metrics(self, episode: dict) -> None:
+        """Keep horizon logs as 'opened at least once' across later resets."""
+        if not bool(getattr(self, "_repeat_open_after_success", False)):
+            return
+        opened = getattr(self, "_opened_once", None)
+        if opened is None:
+            return
+        episode["success_once"] = opened.clone()
+        rewinds = getattr(self, "_cri_rewind_count", None)
+        if rewinds is not None:
+            from rlinf.envs.isaaclab.spawn_rewind import cri_boundary_episode_metrics
+
+            episode.update(cri_boundary_episode_metrics(opened, rewinds))
+        reached = getattr(self, "_reached_once", None)
+        if reached is not None:
+            self._reached_once = reached | self.reach_once
+            episode["reach_once"] = self._reached_once.clone()
+
+    def _start_next_open_attempt(self, terminations: torch.Tensor) -> None:
+        """After Isaac shuts the door, the next crossing can pay again.
+
+        ``success_once`` is what stops the time penalty. Clearing it here,
+        after metrics are recorded, restarts that cost on the new attempt.
+        The horizon-level ``_opened_once`` flag stays set.
+        """
+        openness = getattr(self, "_last_door_openness", None)
+        if openness is None:
+            return
+        shut = openness.reshape(-1) <= float(self._openness_threshold)
+        done = terminations.reshape(-1).bool().to(device=shut.device)
+        reset = done & shut
+        if not bool(reset.any()):
+            return
+        ids = torch.nonzero(reset, as_tuple=False).reshape(-1)
+        self.success_once.index_fill_(0, ids, False)
+        paid = getattr(self, "_open_attempt_paid", None)
+        if paid is not None:
+            paid.index_fill_(0, ids, False)
+        reach = getattr(self, "reach_once", None)
+        if reach is not None:
+            reach.index_fill_(0, ids, False)
+        self._zero_door_reward_state(ids)
+        self._zero_handle_approach_state(ids)
+
+    def step(self, actions=None, auto_reset=True):
+        obs, reward, terminations, truncations, infos = super().step(
+            actions, auto_reset=auto_reset
+        )
+        if bool(getattr(self, "_repeat_open_after_success", False)):
+            self._start_next_open_attempt(terminations)
+        return obs, reward, terminations, truncations, infos
+
+    def _augment_step_reward(self, step_reward, terminations, was_frozen):
+        """End one open when the door crosses the threshold.
+
+        With ``repeat_open_after_success``, Isaac has already reset the
+        scene on that step, so the returned openness is closed. The
+        incoming termination is the open. The latch is cleared after the
+        step, and a later open in the same horizon pays again.
+        """
+        reach_bonus = float(getattr(self, "_reach_bonus", 0.0))
+        handle_weight = float(getattr(self, "_handle_approach_weight", 0.0))
+        live = ~was_frozen.to(device=step_reward.device).reshape(-1)
+        openness = self._last_door_openness.to(
+            device=step_reward.device, dtype=step_reward.dtype
+        ).reshape(-1)
+        if (
+            self._success_bonus != 0.0
+            or self._door_progress_weight != 0.0
+            or reach_bonus != 0.0
+            or handle_weight != 0.0
+        ):
+            self._ensure_door_reward_state()
+            progress, new_paid = capped_progress_reward(
+                self._door_openness_prev,
+                openness,
+                self._door_progress_paid,
+                weight=self._door_progress_weight,
+                cap=self._door_progress_cap,
+            )
+            progress = torch.where(live, progress, torch.zeros_like(progress))
+            new_paid = torch.where(live, new_paid, self._door_progress_paid)
+            if reach_bonus != 0.0:
+                already_reached = self.reach_once.to(device=live.device).reshape(-1)
+                newly_reached = (
+                    door_reached_from_rest(openness) & ~already_reached & live
+                )
+                step_reward = step_reward + reach_bonus * newly_reached.to(
+                    dtype=step_reward.dtype
+                )
+            self._door_progress_paid = new_paid
+            self._door_openness_prev = torch.where(
+                live, openness, self._door_openness_prev
+            )
+            step_reward = step_reward + progress.to(dtype=step_reward.dtype)
+            step_reward = step_reward + self._handle_approach_step(openness, live)
+        step_reward = step_reward + self._door_openness_level_step(openness, live)
+        step_reward = step_reward + self._ee_bar_distance_step(live)
+        if bool(getattr(self, "_repeat_open_after_success", False)):
+            attempt_paid = getattr(self, "_open_attempt_paid", None)
+            if attempt_paid is None:
+                attempt_paid = torch.zeros(
+                    self.num_envs, dtype=torch.bool, device=live.device
+                )
+                self._open_attempt_paid = attempt_paid
+            already = attempt_paid.to(device=live.device).reshape(-1)
+            crossed = repeat_open_crossing(
+                openness,
+                already,
+                terminations,
+                live,
+                threshold=self._openness_threshold,
+            )
+            opened_once = getattr(self, "_opened_once", None)
+            if opened_once is None:
+                opened_once = torch.zeros(
+                    self.num_envs, dtype=torch.bool, device=crossed.device
+                )
+            self._opened_once = opened_once.to(device=crossed.device) | crossed
+            self._open_attempt_paid = already.to(device=crossed.device) | crossed
+        else:
+            already = self.success_once.to(device=live.device).reshape(-1)
+            crossed = (
+                success_crossing(
+                    openness, already, threshold=self._openness_threshold
+                )
+                & live
+            )
+        if self._success_bonus != 0.0:
+            step_reward = step_reward + self._success_bonus * crossed.to(
+                dtype=step_reward.dtype
+            )
+        terminations = terminations.clone()
+        terminations = terminations | crossed.to(device=terminations.device)
+        if self._last_task_success is None:
+            self._last_task_success = crossed
+        else:
+            self._last_task_success = self._last_task_success | crossed.to(
+                device=self._last_task_success.device
+            )
+        return step_reward, terminations
+
+    def _door_openness_level_step(
+        self, openness: torch.Tensor, live: torch.Tensor
+    ) -> torch.Tensor:
+        """Pay the current door angle on every live step.
+
+        A smaller angle pays less. After the door opens, Isaac resets it
+        shut, so the next attempt starts this term again from zero.
+        """
+        weight = float(getattr(self, "_door_openness_weight", 0.0))
+        zeros = torch.zeros(
+            self.num_envs, dtype=openness.dtype, device=openness.device
+        )
+        if weight == 0.0:
+            return zeros
+        level = openness_level_reward(openness, weight)
+        level = torch.where(live.reshape(-1), level, zeros)
+        angle_sum = getattr(self, "_door_openness_reward_sum", None)
+        if angle_sum is None:
+            angle_sum = torch.zeros(
+                self.num_envs, dtype=torch.float32, device=self.device
+            )
+            self._door_openness_reward_sum = angle_sum
+        angle_sum.add_(level.to(dtype=angle_sum.dtype))
+        return level.to(dtype=torch.float32)
+
+    def _ee_bar_distance_step(self, live: torch.Tensor) -> torch.Tensor:
+        """Penalize meters from the gripper to the handle bar on live steps.
+
+        Frozen rows pay nothing. After an open the arm is back at the spawn
+        and the penalty runs again until the next open.
+        """
+        weight = float(getattr(self, "_ee_bar_distance_weight", 0.0))
+        reach = getattr(self, "_last_handle_reach", None)
+        zeros = torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+        if weight == 0.0 or reach is None or int(reach.shape[-1]) < 9:
+            return zeros
+        distance, _valid = handle_reach_distance(reach)
+        penalty = ee_bar_distance_penalty(distance, weight)
+        penalty = torch.where(live.reshape(-1), penalty, zeros)
+        bar_sum = getattr(self, "_ee_bar_distance_sum", None)
+        if bar_sum is not None:
+            bar_sum.add_(penalty.to(dtype=bar_sum.dtype))
+        return penalty.to(dtype=torch.float32)
+
+    def _handle_approach_step(
+        self, openness: torch.Tensor, live: torch.Tensor
+    ) -> torch.Tensor:
+        """Reward closing the gap to the handle bar, until the door moves.
+
+        The target is the handle axis, so height on the vertical bar does
+        not change the distance.
+        """
+        weight = float(getattr(self, "_handle_approach_weight", 0.0))
+        reach = getattr(self, "_last_handle_reach", None)
+        if weight == 0.0 or reach is None or int(reach.shape[-1]) < 9:
+            return torch.zeros(
+                self.num_envs, dtype=openness.dtype, device=openness.device
+            )
+        self._ensure_handle_approach_state()
+        distance, _valid = handle_reach_distance(reach)
+        distance = distance.to(dtype=openness.dtype)
+        limit = float(getattr(self, "_handle_approach_openness", 0.05))
+        active = live.reshape(-1) & (openness.reshape(-1) <= limit)
+        reward, new_paid = capped_closing_reward(
+            self._handle_dist_prev,
+            distance,
+            self._handle_approach_paid,
+            weight=weight,
+            cap=float(self._handle_approach_cap),
+            active=active,
+        )
+        self._handle_approach_paid = new_paid
+        self._handle_dist_prev = torch.where(active, distance, self._handle_dist_prev)
+        return reward.to(dtype=openness.dtype)
 
     def _make_env_function(self):
         num_envs = int(self.cfg.init_params.num_envs)
@@ -120,6 +539,7 @@ class IsaaclabOpenFridgeKitchenEnv(IsaaclabPickPlaceCubePlateEnv):
         sim_dt = getattr(self.cfg.init_params, "sim_dt", None)
         decimation = getattr(self.cfg.init_params, "decimation", None)
         stand_height_m = self._stand_height_m
+        isaac_success_termination = self._isaac_success_termination
 
         def make_env_isaaclab():
             import os
@@ -140,12 +560,12 @@ class IsaaclabOpenFridgeKitchenEnv(IsaaclabPickPlaceCubePlateEnv):
             except Exception:
                 pass
 
+            from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.compose_on_stand import (
+                compose_droid_on_stand_arena,
+            )
             from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.env_cfg import (
                 OpenFridgeKitchenEnvCfg,
                 _resolve_arena_assets_root,
-            )
-            from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.compose_on_stand import (
-                compose_droid_on_stand_arena,
             )
             from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.materials import (
                 patch_fridge_material_terminals,
@@ -178,6 +598,14 @@ class IsaaclabOpenFridgeKitchenEnv(IsaaclabPickPlaceCubePlateEnv):
             if robot_rot is not None:
                 isaac_env_cfg.scene.robot.init_state.rot = tuple(robot_rot)
 
+            if not isaac_success_termination:
+                from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.door_reward import (
+                    fridge_success_disabled,
+                )
+
+                # Keep the term name and its params so the Isaac success
+                # reward stays 0 and the door is not reset on that step.
+                isaac_env_cfg.terminations.success.func = fridge_success_disabled
             if episode_length_s is not None:
                 isaac_env_cfg.episode_length_s = float(episode_length_s)
             if sim_dt is not None:
@@ -207,9 +635,7 @@ class IsaaclabOpenFridgeKitchenEnv(IsaaclabPickPlaceCubePlateEnv):
                 if getattr(eval_cam, "lookat", None) is not None:
                     isaac_env_cfg.viewer.lookat = tuple(eval_cam.lookat)
 
-            env = gym.make(
-                env_id, cfg=isaac_env_cfg, render_mode="rgb_array"
-            ).unwrapped
+            env = gym.make(env_id, cfg=isaac_env_cfg, render_mode="rgb_array").unwrapped
             albedo = (
                 f"{arena_root}/background_library/"
                 "lightwheel_kitchen_one_wall_coastal/textures/"

@@ -393,3 +393,120 @@ def compute_raw_advantages(
             advantages = (advantages - valid.mean()) / (valid.std() + 1e-5)
 
     return advantages, None
+
+
+@register_advantage("episode_success")
+def compute_episode_success_advantages(
+    rewards: torch.Tensor,
+    loss_mask: torch.Tensor,
+    success_return_threshold: float = 0.8,
+    success_chunk_reward_min: float = 0.0,
+    success_advantage: float = 0.5,
+    approach_advantage: float = 0.0,
+    approach_return_max: float = 0.2,
+    speed_horizon_chunks: float = 0.0,
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+    """Reinforce door motion on successes, and handle approach before contact.
+
+    ``rewards`` is the per-episode return from ``calculate_scores``. When
+    that return is at least ``success_return_threshold``, chunks whose own
+    reward is strictly above ``success_chunk_reward_min`` get
+    ``success_advantage``, scaled up when the episode is shorter than
+    ``speed_horizon_chunks``. An episode below ``approach_return_max`` never
+    received the door-reach bonus, so its positive chunks are the handle
+    approach and get ``approach_advantage`` with no speed scale. Episodes in
+    between are near misses and stay zero. There is no baseline and no
+    negative.
+
+    Args:
+        rewards: Episode returns. One score per batch column, or
+            ``[n_groups, group_size]``.
+        loss_mask: Trainable steps, shape ``[n_steps, batch]``.
+        success_return_threshold: Minimum return counted as a success.
+        success_chunk_reward_min: Chunks at or below this reward are not
+            reinforced. Zero keeps only positive reward chunks.
+        success_advantage: Advantage written on a success's positive chunks.
+        approach_advantage: Advantage written when the door was never reached.
+        approach_return_max: Returns below this never earned the door bonus.
+        speed_horizon_chunks: Chunk horizon used to prefer shorter successes.
+            ``0`` leaves every success at ``success_advantage``.
+
+    Returns:
+        Advantages with the same shape as ``loss_mask``, and no returns.
+    """
+    step_rewards = kwargs.get("step_rewards")
+    if loss_mask is None:
+        raise ValueError("episode_success advantages require a loss_mask.")
+    if step_rewards is None:
+        raise ValueError("episode_success advantages require step_rewards.")
+    episode_return = rewards.reshape(-1).to(dtype=torch.float32)
+    if step_rewards.shape[-1] != episode_return.shape[0]:
+        raise ValueError(
+            "step_rewards batch "
+            f"{step_rewards.shape[-1]} does not match returns {episode_return.shape[0]}"
+        )
+    live = loss_mask.to(dtype=torch.float32)
+    positive = (step_rewards > float(success_chunk_reward_min)).to(dtype=live.dtype)
+    success = episode_return >= float(success_return_threshold)
+    approach = episode_return < float(approach_return_max)
+    horizon = float(speed_horizon_chunks)
+    if horizon > 0.0:
+        length = live.sum(dim=0).clamp(min=1.0)
+        speed_scale = ((horizon - length) / horizon).clamp(min=0.0, max=1.0)
+    else:
+        speed_scale = torch.ones(
+            episode_return.shape[0], dtype=live.dtype, device=live.device
+        )
+    advantages = positive * live * (
+        success.to(dtype=live.dtype).view(1, -1)
+        * float(success_advantage)
+        * speed_scale.view(1, -1)
+        + approach.to(dtype=live.dtype).view(1, -1) * float(approach_advantage)
+    )
+    return advantages, None
+
+
+@register_advantage("min_time")
+def compute_min_time_advantages(
+    rewards: torch.Tensor,
+    loss_mask: torch.Tensor,
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+    """Center the undiscounted time return on every live chunk.
+
+    ``rewards`` is the undiscounted return up to the done. A success
+    termination therefore ends the time penalty, and a timeout keeps paying
+    until the horizon. Subtracting the batch mean keeps that difference:
+    a shorter penalty stays positive. When ``advantage_horizon_steps`` is
+    positive, that centered return is divided by this span and by the number
+    of live chunks, so each
+    episode has the same total weight. Set the span to the timeout return
+    (penalty per step times the horizon) so a one-step gap stays ``1/horizon``.
+    Masked hold steps stay zero. A span of 0 leaves the centered return
+    unchanged.
+
+    Args:
+        rewards: Episode returns. One score per batch column, or
+            ``[n_groups, group_size]``.
+        loss_mask: Trainable steps, shape ``[n_steps, batch]``.
+
+    Returns:
+        Advantages with the same shape as ``loss_mask``, and no returns.
+    """
+    if loss_mask is None:
+        raise ValueError("min_time advantages require a loss_mask.")
+    episode_return = rewards.reshape(-1).to(dtype=torch.float32)
+    live = loss_mask.to(dtype=torch.float32)
+    if live.shape[-1] != episode_return.shape[0]:
+        raise ValueError(
+            "loss_mask batch "
+            f"{live.shape[-1]} does not match returns {episode_return.shape[0]}"
+        )
+    centered = episode_return - episode_return.mean()
+    horizon = float(kwargs.get("advantage_horizon_steps", 0.0) or 0.0)
+    if horizon > 0.0:
+        length = live.sum(dim=0).clamp(min=1.0)
+        centered = centered / horizon / length
+    advantages = live * centered.view(1, -1)
+    return advantages, None

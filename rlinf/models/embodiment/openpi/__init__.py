@@ -102,15 +102,29 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     if actor_model_config.train_expert_only:
         model.freeze_vlm()
 
+    # A root Parameter named cri_pos is tracked by FSDP but omitted from
+    # state_dict(), so checkpoint save asserts. Wrap it before load so both
+    # bare ``cri_pos`` and ``cri_pos.weight`` land on the module.
+    from rlinf.models.embodiment.openpi.cri_prefix import (
+        normalize_cri_prefix_state_dict,
+        wrap_bare_cri_pos_parameter,
+    )
+
+    wrap_bare_cri_pos_parameter(model)
+
     # Load weights from checkpoint if it's a checkpoint directory, otherwise load from safetensors
     if os.path.exists(full_weights_path):
         # Direct checkpoint directory
         model_state_dict = torch.load(full_weights_path, map_location="cpu")
-        model.load_state_dict(model_state_dict, strict=False)
+        model.load_state_dict(
+            normalize_cri_prefix_state_dict(model_state_dict), strict=False
+        )
     elif os.path.exists(actor_full_weights_path):
         # Checkpoint directory from runner
         model_state_dict = torch.load(actor_full_weights_path, map_location="cpu")
-        model.load_state_dict(model_state_dict, strict=False)
+        model.load_state_dict(
+            normalize_cri_prefix_state_dict(model_state_dict), strict=False
+        )
     else:
         # Original model directory with safetensors files
         weight_paths = sorted(glob.glob(os.path.join(checkpoint_dir, "*.safetensors")))
@@ -120,7 +134,9 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         for weight_path in weight_paths:
             state_dict = safetensors.torch.load_file(weight_path, device="cpu")
             all_state_dict.update(state_dict)
-        model.load_state_dict(all_state_dict, strict=False)
+        model.load_state_dict(
+            normalize_cri_prefix_state_dict(all_state_dict), strict=False
+        )
 
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     cast_cri_prefix_params_to_bfloat16(model)

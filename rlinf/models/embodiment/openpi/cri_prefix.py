@@ -41,6 +41,21 @@ class CRIPositionalEmbedding(torch.nn.Module):
             data = data.detach().clone()
         self.weight = torch.nn.Parameter(data)
 
+    def to(self, *args, **kwargs):
+        """Return the table tensor for OpenPI ``embed_prefix``.
+
+        That path does ``cri_tokens + self.cri_pos.to(dtype=cri_tokens.dtype)``.
+        ``nn.Module.to`` would return this module and the add would fail.
+        Device moves still go through ``nn.Module.to``.
+        """
+        dtype = kwargs.get("dtype")
+        if "device" not in kwargs and (
+            (not args and dtype is not None)
+            or (len(args) == 1 and isinstance(args[0], torch.dtype))
+        ):
+            return self.weight.to(*args, **kwargs)
+        return super().to(*args, **kwargs)
+
 
 def wrap_bare_cri_pos_parameter(model: torch.nn.Module) -> None:
     """Replace a root ``cri_pos`` Parameter with ``CRIPositionalEmbedding``.
@@ -65,9 +80,21 @@ def wrap_bare_cri_pos_parameter(model: torch.nn.Module) -> None:
 
 
 def cri_pos_weight(cri_pos: torch.Tensor | torch.nn.Module) -> torch.Tensor:
-    """Return the ``(num_cri_tokens, width)`` table from a tensor or module."""
+    """Return the ``(num_cri_tokens, width)`` table from a tensor or module.
+
+    FSDP replaces ``cri_pos`` with ``FullyShardedDataParallel``. That wrapper's
+    ``.to(dtype=...)`` returns the wrapper, so callers must add this tensor.
+    """
     if isinstance(cri_pos, torch.nn.Module):
-        return cri_pos.weight
+        inner: torch.nn.Module = cri_pos
+        seen: set[int] = set()
+        while id(inner) not in seen:
+            seen.add(id(inner))
+            wrapped = getattr(inner, "_fsdp_wrapped_module", None)
+            if not isinstance(wrapped, torch.nn.Module):
+                break
+            inner = wrapped
+        return inner.weight
     return cri_pos
 
 

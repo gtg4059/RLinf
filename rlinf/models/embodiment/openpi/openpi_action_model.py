@@ -132,14 +132,20 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if self.config.train_expert_only:
             no_split_modules = [
                 "GemmaDecoderLayer",
+                "SiglipEncoderLayer",
                 "SiglipVisionEmbeddings",
+                "SiglipVisionTransformer",
+                "PaliGemmaMultiModalProjector",
                 "GemmaRMSNorm",
                 "GemmaRotaryEmbedding",
             ]
         else:
             no_split_modules = [
                 "GemmaMLP",
+                "SiglipEncoderLayer",
                 "SiglipVisionEmbeddings",
+                "SiglipVisionTransformer",
+                "PaliGemmaMultiModalProjector",
                 "GemmaRMSNorm",
                 "GemmaRotaryEmbedding",
             ]
@@ -456,14 +462,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        try:
-            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks = (
+            self._embed_prefix_optional_cri(
                 images, img_masks, lang_tokens, lang_masks, cri
             )
-        except TypeError:
-            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-                images, img_masks, lang_tokens, lang_masks
-            )
+        )
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = (
             self.embed_suffix(state, x_t, time)
         )
@@ -1317,17 +1320,87 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             return cri
         return cri.to(device=weight.device, dtype=weight.dtype)
 
+    def embed_prefix(self, images, img_masks, lang_tokens, lang_masks, cri=None):
+        """Embed the prefix, adding CRI tokens from the positional table tensor.
+
+        OpenPI adds ``self.cri_pos.to(dtype=...)``. After FSDP that attribute is
+        a ``FullyShardedDataParallel``, whose ``to`` returns the wrapper and the
+        add raises ``TypeError``.
+        """
+        if not getattr(self, "use_cri_prefix", False):
+            return super().embed_prefix(images, img_masks, lang_tokens, lang_masks, cri)
+
+        saved_flag = self.use_cri_prefix
+        self.use_cri_prefix = False
+        try:
+            embs, pad_masks, att_masks = super().embed_prefix(
+                images, img_masks, lang_tokens, lang_masks
+            )
+        finally:
+            self.use_cri_prefix = saved_flag
+
+        if cri is None:
+            raise ValueError("use_cri_prefix=True but observation.cri is missing")
+        from rlinf.models.embodiment.openpi.cri_prefix import cri_pos_weight
+
+        cri = torch.clamp(
+            cri.to(dtype=torch.float32).reshape(cri.shape[0], -1), 0.0, 2.0
+        )
+        hidden = F.silu(self.cri_in_proj(cri))
+        cri_tokens = self.cri_out_proj(hidden).reshape(
+            cri.shape[0], self.num_cri_tokens, -1
+        )
+        pos = cri_pos_weight(self.cri_pos)
+        cri_tokens = cri_tokens + pos.to(
+            dtype=cri_tokens.dtype, device=cri_tokens.device
+        )
+        embs = torch.cat([embs, cri_tokens], dim=1)
+        pad_masks = torch.cat(
+            [
+                pad_masks,
+                torch.ones(
+                    cri.shape[0],
+                    self.num_cri_tokens,
+                    dtype=torch.bool,
+                    device=cri.device,
+                ),
+            ],
+            dim=1,
+        )
+        att_masks = torch.cat(
+            [
+                att_masks,
+                torch.zeros(
+                    cri.shape[0],
+                    self.num_cri_tokens,
+                    dtype=att_masks.dtype,
+                    device=att_masks.device,
+                ),
+            ],
+            dim=1,
+        )
+        return embs, pad_masks, att_masks
+
+    def _embed_prefix_optional_cri(
+        self, images, img_masks, lang_tokens, lang_masks, cri
+    ):
+        """Call ``embed_prefix`` with CRI when that argument exists."""
+        try:
+            return self.embed_prefix(images, img_masks, lang_tokens, lang_masks, cri)
+        except TypeError as exc:
+            message = str(exc)
+            if "unexpected" in message or "positional" in message:
+                return self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+            raise
+
     def _build_prefix_cache(self, images, img_masks, lang_tokens, lang_masks, cri=None):
         """Embed prefix tokens and compute KV cache for efficient suffix generation."""
         cri = self._cast_cri_to_proj_dtype(cri)
-        try:
-            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+        prefix_embs, prefix_pad_masks, prefix_att_masks = (
+            self._embed_prefix_optional_cri(
                 images, img_masks, lang_tokens, lang_masks, cri
             )
-        except TypeError:
-            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-                images, img_masks, lang_tokens, lang_masks
-            )
+        )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
         prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)

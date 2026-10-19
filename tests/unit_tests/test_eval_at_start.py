@@ -21,7 +21,11 @@ from unittest.mock import MagicMock
 
 from omegaconf import OmegaConf
 
-from rlinf.utils.runner_utils import should_enable_eval, should_eval_at_start
+from rlinf.utils.runner_utils import (
+    should_enable_eval,
+    should_eval_at_start,
+    success_floor_tripped,
+)
 from rlinf.workers.env.env_worker import EnvWorker
 
 
@@ -34,6 +38,12 @@ def test_should_eval_at_start_only_at_step_zero():
 def test_should_eval_at_start_respects_flag():
     cfg = OmegaConf.create({"runner": {"eval_at_start": False}})
     assert not should_eval_at_start(cfg, 0)
+
+
+def test_success_floor_waits_for_a_full_window():
+    assert not success_floor_tripped([0.1, 0.1], window=3, floor=0.4)
+    assert success_floor_tripped([0.5, 0.3, 0.3], window=3, floor=0.4)
+    assert not success_floor_tripped([0.4, 0.4, 0.4], window=3, floor=0.4)
 
 
 def test_should_enable_eval_for_eval_at_start():

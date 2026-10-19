@@ -296,8 +296,20 @@ Docker 镜像只提供 venv（``/opt/venv``）。把当前 checkout 绑定到
    # 权重：把 POLARIS_OPENPI_CKPT 指到 RLinf 可加载的 PolarIS 目录
    #   （config_name=pi05_droid_jointpos_polaris）。CRI 转换为另一步。
    # Gym id Isaac-OpenFridge-Kitchen-Droid-AbsJointPos-v0。15 Hz。
-   # 在线 CRI-F 与 time-penalty 奖励与 cube→plate CRI 训练旋钮一致
-   # （cri_penalty_weight -0.01，time_penalty_weight -0.0001）。
+   # 训练奖励是每步 -1/3，直到成功 termination，越过 0.2 时再加 +40。
+   # 门首次离开静止 0.05 时再加 +8。成功前的每个步再加当前开角的 1 倍。
+   # 停在 0.19 时直到 horizon 仍是每步 +0.19。开角变小，这一项也变小。
+   # 夹爪到门把手的距离每米再加 −0.4/15（Isaac 位置权重 −0.4 乘 1/15 秒），开门后停止。
+   # 越过该阈值会终止回合。11 秒打开的时间惩罚约 −55，超时是 −300。
+   # CRI 达到或超过 0.96 时，机械臂回到上次场景重置时的姿态，尝试不结束。
+   # horizon 重置仍恢复原始场景和关上的门。
+   # env/cri_rewind_count 是这些回退次数的均值。
+   # env/success_without_cri 是没有回退就越过 0.2 的回合比例。
+   # 评测仍以越过 0.2 一次为成功，并保留 Isaac 的成功终止。
+   # advantage 是 actor 价值头的 GAE（gamma 0.995，lambda 0.97），再标准化为均值 0、标准差 1。价值裁剪为 150，使未训练的价值头能跟上 return。对起始检查点的 KL 惩罚仍是 0.05。
+   # 通过 1 次。对数比在 ±2 nat 内时，即便超出 0.2 clip 也保留该排名；超出 ±2 则不更新权重。
+   # 梯度裁剪 1.0、自适应学习率从 5e-5 起、最高 1e-4（desired KL 1.0）、KL 惩罚 0.05。
+   # 评测跑 4 个 epoch（2 GPU 上 32 条）。
    # PolarIS 权重仍为 pi05_droid_jointpos_polaris（不含 CRI token）。
    # GPU e2e 需要 Isaac Sim；CI 跳过该路径。
    POLARIS_OPENPI_CKPT=/path/to/model/RLinf-Pi05-Polaris-droid_jointpos \

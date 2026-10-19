@@ -381,6 +381,23 @@ class RecordVideo(gym.Wrapper):
             return list(keys)
         return []
 
+    def _get_right_info_keys(self) -> list[str]:
+        """Info keys drawn at the top-right instead of the left stack."""
+        keys = self._cfg_get("right_info_on_video", None)
+        if not keys:
+            return []
+        if isinstance(keys, str):
+            return [keys]
+        return [str(key) for key in list(keys)]
+
+    def _overlay_info_keys(self) -> list[str]:
+        """Left-stack keys plus any top-right keys, without duplicates."""
+        keys = list(self._get_video_info_keys())
+        for key in self._get_right_info_keys():
+            if key not in keys:
+                keys.append(key)
+        return keys
+
     def _lookup_info_value(self, info: Any, key: str) -> Any:
         """Read a key from info, supporting dotted access for nested dicts."""
         if not isinstance(info, dict):
@@ -421,7 +438,7 @@ class RecordVideo(gym.Wrapper):
             info_item["termination"] = bool(value) if value is not None else value
 
         if infos is not None:
-            for key in self._get_video_info_keys():
+            for key in self._overlay_info_keys():
                 value = self._lookup_info_value(infos, key)
                 if value is None:
                     continue
@@ -463,15 +480,27 @@ class RecordVideo(gym.Wrapper):
         if not images:
             return
         if self.video_cfg.get("info_on_video", True):
-            images = [
-                put_info_on_image(
-                    img,
-                    self._build_info_item(
-                        infos, rewards, terminations, env_id, time_idx
-                    ),
+            right_keys = self._get_right_info_keys()
+            right_labels = {
+                "episode.cri_max": "CRI",
+                "episode.cri_limit": "limit",
+                "episode.handle_cm": "dist_cm",
+            }
+            drawn = []
+            for img, env_id in zip(images, env_ids):
+                info_item = self._build_info_item(
+                    infos, rewards, terminations, env_id, time_idx
                 )
-                for img, env_id in zip(images, env_ids)
-            ]
+                right_item = {
+                    right_labels.get(key, key): info_item.pop(key)
+                    for key in right_keys
+                    if key in info_item
+                }
+                frame = put_info_on_image(img, info_item)
+                if right_item:
+                    frame = put_info_on_image(frame, right_item, align="right")
+                drawn.append(frame)
+            images = drawn
         if len(images) > 1:
             nrows = int(np.sqrt(len(images)))
             full_image = tile_images(images, nrows=nrows)

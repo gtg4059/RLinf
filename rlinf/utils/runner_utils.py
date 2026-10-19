@@ -57,6 +57,18 @@ def should_eval_at_start(cfg: Any, global_step: int) -> bool:
     return bool(_runner_get(cfg, "eval_at_start", False)) and int(global_step) == 0
 
 
+def success_floor_tripped(history: list[float], window: int, floor: float) -> bool:
+    """Return True when the last ``window`` successes average below ``floor``.
+
+    Fewer than ``window`` samples never trips. The comparison is strict, so
+    a mean equal to ``floor`` keeps training.
+    """
+    if window <= 0 or len(history) < window:
+        return False
+    recent = history[-window:]
+    return sum(recent) / float(window) < float(floor)
+
+
 def safe_is_divisible(a, b):
     """a safe divisible check to allow b to be 0"""
     if a == 0 or b == 0:

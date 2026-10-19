@@ -31,6 +31,7 @@ from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.hold import (
 )
 from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.isaac_reset import (
     isaac_reset_row_ids,
+    merge_hold_row_ids,
     set_chunk_hold,
     zero_rows,
 )
@@ -359,6 +360,11 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._cri_ovf_termination_enabled = bool(
             init_params.get("cri_ovf_termination_enabled", False)
         )
+        # CRI at the limit rewinds the arm to the last scene-reset pose.
+        # The episode clock keeps running. The horizon reset is unchanged.
+        self._cri_boundary_rewind = bool(
+            init_params.get("cri_boundary_rewind", False)
+        )
         term_threshold = init_params.get("cri_ovf_term_threshold", None)
         self._cri_ovf_term_threshold = float(
             self._cri_penalty_limit
@@ -375,6 +381,10 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         else:
             self._cri_ovf_term_penalty = float(term_penalty)
         self._time_penalty_weight = float(init_params.get("time_penalty_weight", 0.0))
+        # True: the living cost runs through the timeout, after the open too.
+        self._time_penalty_until_horizon = bool(
+            init_params.get("time_penalty_until_horizon", False)
+        )
         from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.constants import (
             DROID_CONTROL_DT,
         )
@@ -412,6 +422,11 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._use_exterior2 = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
         )
+        self._cri_rewind_count = (
+            torch.zeros(self.num_envs, dtype=torch.float32, device=self.device)
+            if self._cri_boundary_rewind
+            else None
+        )
         self._frozen = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self._hold_actions = None
         self._hold_obs = None
@@ -436,6 +451,22 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._chunk_hold_actions = None
         self._init_cri_buffers()
 
+    def _augment_step_reward(
+        self,
+        step_reward: torch.Tensor,
+        terminations: torch.Tensor,
+        was_frozen: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Task-specific reward added after the shared CRI and time penalty.
+
+        The default keeps the Isaac reward. Subclasses may add a bonus and
+        set ``terminations`` so ``hold_after_done`` freezes the rest of the
+        horizon. ``dones`` is built from the returned terminations, which is
+        what cuts GAE.
+        """
+        del was_frozen
+        return step_reward, terminations
+
     def chunk_step(self, chunk_actions):
         """Clear intra-chunk reset-hold so the next policy chunk can act."""
         self._chunk_hold.zero_()
@@ -456,6 +487,8 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
                 self._cri_ovf_term_count.index_fill_(0, ids, 0.0)
             if getattr(self, "_time_penalty_sum", None) is not None:
                 self._time_penalty_sum.index_fill_(0, ids, 0.0)
+            if getattr(self, "_cri_rewind_count", None) is not None:
+                self._cri_rewind_count.index_fill_(0, ids, 0.0)
             return
         self._success_count.zero_()
         if getattr(self, "_cri_ovf_sum", None) is not None:
@@ -465,6 +498,8 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             self._cri_ovf_term_count.zero_()
         if getattr(self, "_time_penalty_sum", None) is not None:
             self._time_penalty_sum.zero_()
+        if getattr(self, "_cri_rewind_count", None) is not None:
+            self._cri_rewind_count.zero_()
 
     def _make_env_function(self):
         num_envs = int(self.cfg.init_params.num_envs)
@@ -722,6 +757,10 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             cri = cri.unsqueeze(0)
         self._cri_obs_cache.copy_(cri[: self.num_envs])
 
+    def _cri_ovf_term_limits(self) -> float | torch.Tensor:
+        """CRI level that counts as a boundary hit, one value or one per env."""
+        return self._cri_ovf_term_threshold
+
     def _solve_cri_from_obs(self, obs: dict[str, Any]) -> torch.Tensor:
         """One ``run_cri_filter(q, qd)`` from this-tick Isaac observations."""
         q, qd = measured_arm_q_qd(obs, num_envs=self.num_envs, device=self.device)
@@ -754,6 +793,14 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         if self._last_cri_ovf_term is not None:
             episode_info["cri_ovf_term"] = self._last_cri_ovf_term
             episode_info["cri_ovf_term_count"] = self._cri_ovf_term_count.clone()
+        if getattr(self, "_cri_rewind_count", None) is not None:
+            from rlinf.envs.isaaclab.spawn_rewind import cri_boundary_episode_metrics
+
+            episode_info.update(
+                cri_boundary_episode_metrics(
+                    self.success_once, self._cri_rewind_count
+                )
+            )
         if getattr(self, "_cri_penalty_sum", None) is not None:
             from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.rewards import (
                 cri_episode_reward_logs,
@@ -771,6 +818,46 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         infos["episode"] = episode_info
         return infos
 
+    def _rewind_cri_boundary(
+        self,
+        obs: dict[str, Any],
+        cri_hit: torch.Tensor,
+        was_frozen: torch.Tensor,
+        cri_pre: torch.Tensor,
+    ) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor]:
+        """Rewind live rows that crossed the CRI limit. Keep the episode clock.
+
+        The hit is already stored on ``_last_cri_ovf_term``. The returned
+        ``cri_pre`` is recomputed from the pose the arm has after the rewind,
+        which is what the next step reads. The row ids are held at that pose
+        for the rest of the action chunk.
+        """
+        from rlinf.envs.isaaclab.spawn_rewind import cri_boundary_rewind_mask
+
+        openness = getattr(self, "_last_door_openness", None)
+        threshold = float(getattr(self, "_openness_threshold", 0.2))
+        rewind = cri_boundary_rewind_mask(
+            cri_hit,
+            was_frozen,
+            self.success_once,
+            openness=openness,
+            openness_threshold=threshold,
+        )
+        if not bool(rewind.any()):
+            return (
+                obs,
+                cri_pre,
+                torch.zeros(0, dtype=torch.long, device=self.device),
+            )
+        ids = torch.nonzero(rewind, as_tuple=False).reshape(-1)
+        rewound = self._wrap_obs(self.env.rewind_to_spawn(ids))
+        obs = overwrite_frozen_obs(obs, rewound, rewind)
+        if self._cri_rewind_count is not None:
+            self._cri_rewind_count = self._cri_rewind_count + rewind.to(
+                dtype=self._cri_rewind_count.dtype
+            )
+        return obs, self._solve_cri_from_obs(obs), ids
+
     def step(self, actions=None, auto_reset=True):
         from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.rewards import (
             accumulate_cri_episode_reward,
@@ -784,17 +871,17 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         hold_after_done = self._hold_after_done
         isaac_reset_ids = torch.zeros(0, dtype=torch.long, device=self.device)
         cri_reset_ids = torch.zeros(0, dtype=torch.long, device=self.device)
+        rewind_ids = torch.zeros(0, dtype=torch.long, device=self.device)
         self._last_cri_ovf_term = None
-        if hold_after_done and actions is not None:
-            actions = apply_hold_actions(actions, self._hold_actions, was_frozen)
-        elif (
-            (not hold_after_done)
-            and actions is not None
-            and bool(self._chunk_hold.any())
-        ):
+        # Spawn rewind and success-hold both pin absolute joint targets.
+        # Rewind hold applies in training too: hold_after_done only freezes
+        # rows that already succeeded, and a CRI rewind is not one of those.
+        if actions is not None and bool(self._chunk_hold.any()):
             actions = apply_hold_actions(
                 actions, self._chunk_hold_actions, self._chunk_hold
             )
+        if hold_after_done and actions is not None:
+            actions = apply_hold_actions(actions, self._hold_actions, was_frozen)
 
         if hold_after_done and bool(was_frozen.all()) and self._hold_obs is not None:
             step_reward = torch.zeros(
@@ -850,10 +937,21 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
                 step_reward = r_task + self._cri_penalty_weight * ovf.to(
                     device=r_task.device, dtype=r_task.dtype
                 )
-            cri_hit = cri_ovf_violated(
-                cri_pre, threshold=self._cri_ovf_term_threshold
-            ).reshape(-1)
+            cri_limits = self._cri_ovf_term_limits()
+            cri_hit = cri_ovf_violated(cri_pre, threshold=cri_limits).reshape(-1)
             self._last_cri_ovf_term = cri_hit.clone()
+            # Keep the pre-rewind reading. A rewind replaces ``cri_pre`` with
+            # the spawn pose, which is not the motion that crossed the limit.
+            self._video_cri = cri_pre.detach()
+            self._video_cri_limit = cri_limits
+            if (
+                self._cri_boundary_rewind
+                and not self._cri_ovf_termination_enabled
+                and bool(cri_hit.any())
+            ):
+                obs, cri_pre, rewind_ids = self._rewind_cri_boundary(
+                    obs, cri_hit, was_frozen, cri_pre
+                )
             if self._cri_ovf_termination_enabled and bool(cri_hit.any()):
                 terminations = terminations | cri_hit.reshape_as(terminations)
                 step_reward = step_reward + self._cri_ovf_term_penalty * cri_hit.to(
@@ -896,6 +994,7 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             hold_after_done=hold_after_done,
             was_frozen=was_frozen,
             success_once=getattr(self, "success_once", None),
+            until_horizon=bool(getattr(self, "_time_penalty_until_horizon", False)),
             device=self.device,
         )
         time_pen = None
@@ -912,6 +1011,9 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._last_time_penalty = time_pen
 
         self._last_task_success = r_task > 0
+        step_reward, terminations = self._augment_step_reward(
+            step_reward, terminations, was_frozen
+        )
         if self._last_cri_ovf_term is not None:
             self._cri_ovf_term_count = self._cri_ovf_term_count + (
                 self._last_cri_ovf_term.to(dtype=self._cri_ovf_term_count.dtype)
@@ -936,19 +1038,10 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
                 )
 
         self._remember_q(obs)
-        post_reset_ids = isaac_reset_ids
-        if int(cri_reset_ids.numel()) > 0:
-            if int(post_reset_ids.numel()) == 0:
-                post_reset_ids = cri_reset_ids
-            else:
-                post_reset_ids = torch.cat(
-                    [post_reset_ids, cri_reset_ids]
-                ).unique()
-        if (
-            (not hold_after_done)
-            and int(post_reset_ids.numel()) > 0
-            and obs.get("states") is not None
-        ):
+        post_reset_ids = merge_hold_row_ids(
+            isaac_reset_ids, cri_reset_ids, rewind_ids
+        )
+        if int(post_reset_ids.numel()) > 0 and obs.get("states") is not None:
             self._chunk_hold, self._chunk_hold_actions = set_chunk_hold(
                 self._chunk_hold,
                 self._chunk_hold_actions,
@@ -957,7 +1050,7 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             )
         if cri_pre is not None:
             self._store_cri_pre(cri_pre)
-            if (not hold_after_done) and int(post_reset_ids.numel()) > 0:
+            if int(post_reset_ids.numel()) > 0:
                 zero_rows(self._cri_obs_cache, post_reset_ids)
         self._elapsed_steps += 1
         truncations = (self.elapsed_steps >= self.cfg.max_episode_steps) | truncations

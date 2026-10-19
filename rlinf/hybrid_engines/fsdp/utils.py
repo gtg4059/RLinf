@@ -564,8 +564,8 @@ def get_lr_scheduler(
     if min_lr_rate is not None:
         min_lr = None
 
-    # HF-style (with warmup)
-    if lr_scheduler == "constant":
+    # HF-style (with warmup). ``fixed`` is the rsl_rl name for a constant rate.
+    if lr_scheduler in ("constant", "fixed"):
         from torch.optim.lr_scheduler import LambdaLR
 
         def lr_lambda(current_step):

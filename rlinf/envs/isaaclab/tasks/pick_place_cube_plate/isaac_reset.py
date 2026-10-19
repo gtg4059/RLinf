@@ -41,6 +41,24 @@ def zero_rows(tensor: torch.Tensor, row_ids: torch.Tensor) -> None:
     tensor.index_fill_(0, ids, 0)
 
 
+def merge_hold_row_ids(*groups: torch.Tensor) -> torch.Tensor:
+    """Unique row ids that should hold the post-teleport joint target.
+
+    Isaac success resets, CRI terminations, and CRI spawn rewinds all teleport
+    the arm inside a 15-step action chunk. The leftover actions were planned
+    for the pre-teleport pose, so every teleported row has to be held.
+    """
+    present = [
+        group.reshape(-1).long()
+        for group in groups
+        if group is not None and int(group.numel()) > 0
+    ]
+    if not present:
+        device = groups[0].device if groups else None
+        return torch.zeros(0, dtype=torch.long, device=device)
+    return torch.cat(present).unique()
+
+
 def set_chunk_hold(
     hold_mask: torch.Tensor,
     hold_actions: torch.Tensor | None,
