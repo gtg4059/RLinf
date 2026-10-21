@@ -36,6 +36,7 @@ from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.door_reward import (
     capped_closing_reward,
     capped_progress_reward,
     cri_limit_near_handle,
+    waive_cri_penalty_near_handle,
     LEFT_FINGERTIP_OFFSET_M,
     RIGHT_FINGERTIP_OFFSET_M,
     FRIDGE_HANDLE_LOCAL_END,
@@ -58,6 +59,9 @@ from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.placement import (
 from rlinf.envs.isaaclab.tasks.pick_place_cube_plate import wrap_droid_obs
 from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.env import (
     IsaaclabPickPlaceCubePlateEnv,
+)
+from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.isaac_reset import (
+    zero_paused_reward,
 )
 from rlinf.utils.metric_utils import compute_loss_mask
 
@@ -139,6 +143,44 @@ def test_cri_limit_rises_to_3_within_10cm_of_the_handle():
     assert limits[0].item() == pytest.approx(3.0)
     assert limits[1].item() == pytest.approx(0.96)
     assert limits[2].item() == pytest.approx(0.96)
+
+
+def test_cri_penalty_is_zero_inside_the_handle_radius():
+    """Inside 8 cm the penalty is 0 even when CRI is past the raised limit."""
+    penalty = torch.tensor([5.0, 5.0, 5.0])
+    distance = torch.tensor([0.05, 0.08, 0.09])
+    valid = torch.tensor([True, True, True])
+    waived = waive_cri_penalty_near_handle(
+        penalty, distance, valid, near_distance_m=0.08
+    )
+    assert waived.tolist() == pytest.approx([0.0, 0.0, 5.0])
+    missing = waive_cri_penalty_near_handle(
+        penalty[:1],
+        torch.zeros(1),
+        torch.tensor([False]),
+        near_distance_m=0.08,
+    )
+    assert float(missing[0]) == pytest.approx(5.0)
+
+
+def test_cri_limit_is_left_out_of_env_metrics():
+    """The per-step limit stays on the video and is not averaged."""
+    from rlinf.utils.metric_utils import (
+        compute_evaluate_metrics,
+        omit_cri_limit_metric,
+    )
+
+    env_info = {
+        "cri_limit": torch.tensor([0.96, 3.0]),
+        "cri_limit_outside": torch.tensor([True, False]),
+        "success_once": torch.tensor([1.0, 0.0]),
+    }
+    omit_cri_limit_metric(env_info)
+    assert "cri_limit" not in env_info
+    assert "cri_limit_outside" not in env_info
+    metrics = compute_evaluate_metrics([env_info])
+    assert "cri_limit" not in metrics
+    assert float(metrics["success_once"]) == pytest.approx(0.5)
 
 
 def test_compute_door_openness_closed_and_threshold():
@@ -484,6 +526,65 @@ def test_fridge_augment_adds_bonus_and_terminates_once():
     assert reward[0].item() == pytest.approx(0.0)
     assert reward[1].item() == pytest.approx(0.0)
     assert bool(terminations[1])
+
+
+def test_post_success_gap_is_not_part_of_the_new_episode():
+    """Hold steps after a success reset pay nothing and do not reopen latches.
+
+    The next policy chunk clears the attempt, the same way a fresh reset
+    does, and keeps the horizon record that the door already opened.
+    """
+    env = IsaaclabOpenFridgeKitchenEnv.__new__(IsaaclabOpenFridgeKitchenEnv)
+    env.num_envs = 1
+    env.device = torch.device("cpu")
+    env._success_bonus = 1.0
+    env._door_progress_weight = 0.3
+    env._door_progress_cap = 0.4
+    env._door_openness_weight = 0.5
+    env._reach_bonus = 0.2
+    env._handle_approach_weight = 0.0
+    env._ee_bar_distance_weight = 0.0
+    env._openness_threshold = 0.2
+    env._repeat_open_after_success = True
+    env._door_openness_prev = torch.tensor([0.0])
+    env._door_progress_paid = torch.tensor([0.0])
+    env._door_openness_reward_sum = torch.zeros(1)
+    env._last_door_openness = torch.tensor([0.5])
+    env.success_once = torch.tensor([False])
+    env.reach_once = torch.tensor([False])
+    env._open_attempt_paid = torch.tensor([False])
+    env._opened_once = torch.tensor([True])
+    env._last_task_success = torch.tensor([False])
+    env._reward_pause = torch.tensor([True])
+    reward, terminations = env._augment_step_reward(
+        torch.tensor([-0.00025]),
+        torch.zeros(1, dtype=torch.bool),
+        torch.zeros(1, dtype=torch.bool),
+    )
+    reward = zero_paused_reward(reward, env._reward_pause)
+    assert reward.item() == pytest.approx(0.0)
+    assert not bool(terminations[0])
+    assert not bool(env.reach_once[0])
+    assert env._door_openness_reward_sum.item() == pytest.approx(0.0)
+    assert not bool(env._open_attempt_paid[0])
+
+    env.success_once = torch.tensor([True])
+    env.reach_once = torch.tensor([True])
+    env._open_attempt_paid = torch.tensor([True])
+    env._door_openness_prev = torch.tensor([0.4])
+    env._door_progress_paid = torch.tensor([0.2])
+    env._handle_dist_prev = torch.tensor([0.1])
+    env._handle_approach_paid = torch.tensor([0.05])
+    env._post_success_gap = torch.tensor([True])
+    ids = torch.nonzero(env._post_success_gap.reshape(-1), as_tuple=False).reshape(-1)
+    env._reset_attempt_latches(ids)
+    assert not bool(env.success_once[0])
+    assert not bool(env.reach_once[0])
+    assert not bool(env._open_attempt_paid[0])
+    assert env._door_openness_prev.item() == pytest.approx(0.0)
+    assert env._door_progress_paid.item() == pytest.approx(0.0)
+    assert env._handle_approach_paid.item() == pytest.approx(0.0)
+    assert bool(env._opened_once[0])
 
 
 def test_handle_contact_is_zero_and_grows_as_the_tip_leaves():

@@ -179,9 +179,7 @@ def compute_critic_explained_variance_stats(
     returns = returns.detach().float()
     values = values.detach().float()
     if loss_mask is not None:
-        mask = loss_mask.to(device=returns.device, dtype=torch.bool)
-        if mask.shape != returns.shape:
-            mask = torch.broadcast_to(mask, returns.shape)
+        mask = align_loss_mask(loss_mask, returns)
         returns = returns[mask]
         values = values[mask]
     else:
@@ -348,6 +346,42 @@ def compute_evaluate_metrics(eval_metrics_list):
     return all_eval_metrics
 
 
+def omit_cri_limit_metric(env_info: dict) -> None:
+    """Leave the CRI limit off the aggregated env metrics.
+
+    Eval video still reads ``episode.cri_limit``. The logged mean is the
+    barrier itself, so it is not reported.
+    """
+    env_info.pop("cri_limit", None)
+    env_info.pop("cri_limit_outside", None)
+
+
+def align_loss_mask(loss_mask: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+    """Match a loss mask to ``values`` for metric reductions.
+
+    Chunk-level advantages are ``[n_chunk, batch, 1]``. The step mask that
+    drops the hold tail inside an action chunk is ``[n_chunk, batch, chunk]``.
+    A chunk stays in the metric when any of its steps are kept.
+    """
+    mask = loss_mask.to(device=values.device, dtype=torch.bool)
+    if mask.ndim == values.ndim - 1:
+        mask = mask.unsqueeze(-1)
+    if mask.ndim == values.ndim:
+        # A per-step mask meets a per-chunk value. Collapse the step axis.
+        reduce_dims = [
+            dim
+            for dim, (mask_size, value_size) in enumerate(
+                zip(mask.shape, values.shape, strict=True)
+            )
+            if value_size == 1 and mask_size > 1
+        ]
+        if reduce_dims:
+            mask = mask.any(dim=reduce_dims, keepdim=True)
+    if mask.shape != values.shape:
+        mask = torch.broadcast_to(mask, values.shape)
+    return mask
+
+
 def compute_rollout_metrics(data_buffer: dict) -> dict:
     rollout_metrics = {}
     loss_mask = data_buffer.get("loss_mask", None)
@@ -391,11 +425,7 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
     def valid_values(values: torch.Tensor) -> torch.Tensor:
         if loss_mask is None:
             return values.reshape(-1)
-        mask = loss_mask.to(device=values.device, dtype=torch.bool)
-        if mask.ndim == values.ndim - 1:
-            mask = mask.unsqueeze(-1)
-        if mask.shape != values.shape:
-            mask = torch.broadcast_to(mask, values.shape)
+        mask = align_loss_mask(loss_mask, values)
         return values[mask]
 
     if "rewards" in data_buffer:

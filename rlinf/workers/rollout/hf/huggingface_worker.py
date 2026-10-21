@@ -147,6 +147,16 @@ class MultiStepRolloutWorker(Worker):
 
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
+            # Actor checkpoints include the PPO value head. Eval rollout can
+            # run the policy without it.
+            own = self.hf_model.state_dict()
+            skipped = [key for key in model_dict if key not in own]
+            model_dict = {key: value for key, value in model_dict.items() if key in own}
+            if skipped:
+                self.log_info(
+                    f"Skipped {len(skipped)} checkpoint keys absent from the "
+                    f"rollout model, including {skipped[:4]}"
+                )
             self.hf_model.load_state_dict(model_dict)
 
         rlt_feature_model_config = OmegaConf.select(

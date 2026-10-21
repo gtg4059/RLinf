@@ -34,6 +34,7 @@ from rlinf.data.embodied_io_struct import (
 )
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.scheduler import Channel
+from rlinf.utils.metric_utils import omit_cri_limit_metric
 from rlinf.workers.env.env_worker import EnvWorker
 from rlinf.workers.env.env_worker import gather_episode_stat
 
@@ -182,6 +183,7 @@ class RTCEnvWorker(EnvWorker):
                             env_info[key] = gather_episode_stat(
                                 final_info["episode"][key], dones
                             )
+            omit_cri_limit_metric(env_info)
         env_output = EnvOutput(
             obs=extracted_obs,
             final_obs=final_obs,

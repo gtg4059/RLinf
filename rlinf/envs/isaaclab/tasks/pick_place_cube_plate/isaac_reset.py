@@ -81,3 +81,19 @@ def set_chunk_hold(
         held = hold_actions.to(device=src.device, dtype=src.dtype).clone()
         held[row_ids_on_src] = src[row_ids_on_src]
     return hold_mask, held
+
+
+def zero_paused_reward(
+    step_reward: torch.Tensor, pause: torch.Tensor | None
+) -> torch.Tensor:
+    """Drop reward on steps that still belong to the previous action chunk.
+
+    After a success reset the rest of that chunk holds the arm. Those steps
+    are not the new episode, so they contribute nothing to the return.
+    """
+    if pause is None or not bool(pause.reshape(-1).any()):
+        return step_reward
+    paused = pause.reshape(-1).to(device=step_reward.device)
+    out = step_reward.clone()
+    out[paused] = 0
+    return out

@@ -29,11 +29,15 @@ from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.rewards import (
     TIME_PENALTY_REWARD_KEY,
     accumulate_cri_episode_reward,
     accumulate_time_episode_reward,
+    apply_cri_soft_arm_limit,
     cri_episode_reward_logs,
+    cri_exceed_linear,
+    cri_exceed_settings,
     cri_ovf_exp,
     cri_ovf_reward,
     cri_ovf_termination_step_penalty,
     cri_ovf_violated,
+    cri_soft_approach_scale,
     time_episode_reward_logs,
     time_penalty_live_mask,
     time_step_penalty,
@@ -61,6 +65,76 @@ def test_cri_ovf_exp_grows_past_limit():
     p_hi = cri_ovf_exp(above, limit=0.96, sigma=20.0, ovf_threshold=2.0)
     assert float(p_hi[0]) > float(p_lim[0])
     assert float(p_hi[0]) == pytest.approx(1.5, abs=1e-5)
+
+
+def test_cri_ovf_exp_per_row_limit_spares_the_handle():
+    """CRI 2 is the cap. A limit of 3 pays nothing; 0.96 pays the full barrier."""
+    cri = torch.full((2, 9), 2.0)
+    pen = cri_ovf_exp(
+        cri,
+        limit=torch.tensor([0.96, 3.0]),
+        sigma=20.0,
+        ovf_threshold=2.0,
+    )
+    assert float(pen[0]) == pytest.approx(2.0, abs=1e-4)
+    assert float(pen[1]) == pytest.approx(0.0, abs=1e-4)
+
+
+def test_cri_exceed_linear_is_one_plus_excess_past_the_limit():
+    cri = torch.tensor([[0.5], [0.96], [1.46], [2.0]])
+    term = cri_exceed_linear(cri, limit=0.96)
+    assert term.tolist() == pytest.approx([0.0, 1.0, 1.5, 2.04])
+    per_row = cri_exceed_linear(
+        torch.full((2, 9), 2.0),
+        limit=torch.tensor([0.96, 3.0]),
+    )
+    assert float(per_row[0]) == pytest.approx(2.04)
+    assert float(per_row[1]) == pytest.approx(0.0)
+
+
+def test_cri_exceed_mode_trigger():
+    assert cri_exceed_settings(
+        "soft", boundary_rewind=True, termination=True, penalty_weight=-0.01
+    ) == ("soft", False, False, -0.01)
+    assert cri_exceed_settings(
+        "hard", boundary_rewind=False, termination=True, penalty_weight=-0.01
+    ) == ("hard", True, False, 0.0)
+    assert cri_exceed_settings(
+        None, boundary_rewind=True, termination=False, penalty_weight=0.0
+    ) == (None, True, False, 0.0)
+    with pytest.raises(ValueError):
+        cri_exceed_settings(
+            "reset", boundary_rewind=True, termination=False, penalty_weight=0.0
+        )
+
+
+def test_cri_soft_approach_scale_slows_before_the_limit():
+    cri = torch.tensor([[0.0], [0.96], [1.5]])
+    scale = cri_soft_approach_scale(cri, limit=0.96, sigma=20.0)
+    assert float(scale[0]) == pytest.approx(1.0, abs=1e-5)
+    assert float(scale[1]) == pytest.approx(1.0, abs=1e-5)
+    assert float(scale[2]) == pytest.approx(1.0, abs=1e-5)
+    near = cri_soft_approach_scale(torch.tensor([[0.90]]), limit=0.96, sigma=20.0)
+    assert 0.0 < float(near[0]) < 1.0
+
+
+def test_apply_cri_soft_arm_limit_blends_arm_and_keeps_gripper():
+    actions = torch.tensor([[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.4]])
+    pose = torch.zeros(1, 7)
+    cri = torch.tensor([[0.90]])
+    out = apply_cri_soft_arm_limit(actions, pose, cri, limit=0.96, sigma=20.0)
+    assert float(out[0, -1]) == pytest.approx(0.4)
+    assert float(out[0, 0]) < 1.0
+    assert float(out[0, 0]) > 0.0
+    held = apply_cri_soft_arm_limit(
+        actions,
+        pose,
+        cri,
+        limit=0.96,
+        sigma=20.0,
+        row_mask=torch.tensor([False]),
+    )
+    assert torch.equal(held, actions)
 
 
 def test_cri_ovf_exp_weight_scale():

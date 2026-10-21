@@ -25,33 +25,169 @@ from .constants import CRI_OVF_THRESHOLD
 from .constants import TIME_PENALTY_WEIGHT
 
 
+def resolve_cri_exceed_mode(mode: str | None) -> str | None:
+    """Return ``soft``, ``hard``, or ``None`` when the trigger is unset.
+
+    ``soft`` slows the arm near the CRI limit and adds the barrier penalty.
+    ``hard`` rewinds the arm to the last scene-reset pose and adds no penalty.
+    """
+    if mode is None:
+        return None
+    name = str(mode).strip().lower()
+    if name not in ("soft", "hard"):
+        raise ValueError(f"cri_exceed_mode must be 'soft' or 'hard', got {mode!r}")
+    return name
+
+
+def cri_exceed_settings(
+    mode: str | None,
+    *,
+    boundary_rewind: bool,
+    termination: bool,
+    penalty_weight: float,
+) -> tuple[str | None, bool, bool, float]:
+    """Resolve the exceedance trigger into rewind, termination, and penalty.
+
+    An unset trigger leaves the three flags as configured. ``soft`` turns
+    rewind and termination off. ``hard`` rewinds and drops the penalty.
+    """
+    resolved = resolve_cri_exceed_mode(mode)
+    if resolved == "soft":
+        return resolved, False, False, float(penalty_weight)
+    if resolved == "hard":
+        return resolved, True, False, 0.0
+    return None, bool(boundary_rewind), bool(termination), float(penalty_weight)
+
+
 def cri_ovf_exp(
     cri: torch.Tensor,
     *,
-    limit: float = CRI_FILTER_LIMIT,
+    limit: float | torch.Tensor = CRI_FILTER_LIMIT,
     sigma: float = CRI_OVF_SIGMA,
     ovf_threshold: float = CRI_OVF_THRESHOLD,
 ) -> torch.Tensor:
     """Soft CRI overflow penalty. Matches IsaacLab ``mdp.CRI_OVF_exp``.
 
-    ``cri`` is ``(B, K)`` or ``(B,)``. Returns a non-negative ``(B,)`` term:
-    0 at CRI=0, ~1 at ``limit``, then linear up to 1 at ``ovf_threshold``.
-    Apply a negative reward weight.
+    ``cri`` is ``(B, K)`` or ``(B,)``. ``limit`` is a scalar or one value per
+    row. Returns a non-negative ``(B,)`` term: 0 at CRI=0, ~1 at ``limit``,
+    then linear up to 1 at ``ovf_threshold``. Apply a negative reward weight.
+    A row limit above ``ovf_threshold`` keeps the same linear span as the
+    scalar 0.96 limit, so a near-handle limit of 3 does not explode.
     """
     values = torch.as_tensor(cri, dtype=torch.float32)
     if values.ndim == 0:
         values = values.unsqueeze(0)
     if values.ndim > 1:
         values = values.amax(dim=-1)
-    limit_t = values.new_tensor(float(limit))
+    limit_t = torch.as_tensor(limit, dtype=values.dtype, device=values.device)
+    if limit_t.ndim == 0:
+        limit_t = limit_t.expand_as(values)
+    else:
+        limit_t = limit_t.reshape(values.shape)
     headroom = (limit_t - values).clamp(min=0.0)
     exp_pen = torch.exp(-float(sigma) * headroom) - torch.exp(
-        values.new_tensor(-float(sigma) * float(limit))
+        -float(sigma) * limit_t
     )
     excess = (values - limit_t).clamp(min=0.0)
-    span = max(float(ovf_threshold) - float(limit), 1e-6)
+    default_span = max(float(ovf_threshold) - float(CRI_FILTER_LIMIT), 1e-6)
+    span = (float(ovf_threshold) - limit_t).clamp(min=1e-6)
+    span = torch.where(
+        limit_t >= float(ovf_threshold),
+        limit_t.new_full((), default_span).expand_as(span),
+        span,
+    )
     lin_pen = (excess / span).clamp(max=1.0)
     return exp_pen + lin_pen
+
+
+def cri_exceed_linear(
+    cri: torch.Tensor,
+    *,
+    limit: float | torch.Tensor = CRI_FILTER_LIMIT,
+) -> torch.Tensor:
+    """Linear overflow term ``y = 1 + x`` once CRI is on or past the limit.
+
+    ``x`` is ``cri - limit``. Below the limit the term is 0. On the limit it
+    is 1, and each further unit of CRI adds 1. ``cri`` is ``(B, K)`` or
+    ``(B,)``. ``limit`` is a scalar or one value per row.
+    """
+    values = torch.as_tensor(cri, dtype=torch.float32)
+    if values.ndim == 0:
+        values = values.unsqueeze(0)
+    if values.ndim > 1:
+        values = values.amax(dim=-1)
+    limit_t = torch.as_tensor(limit, dtype=values.dtype, device=values.device)
+    if limit_t.ndim == 0:
+        limit_t = limit_t.expand_as(values)
+    else:
+        limit_t = limit_t.reshape(values.shape)
+    excess = (values - limit_t).clamp(min=0.0)
+    return torch.where(values >= limit_t, excess + 1.0, torch.zeros_like(excess))
+
+
+def cri_soft_approach_scale(
+    cri: torch.Tensor,
+    *,
+    limit: float | torch.Tensor,
+    sigma: float,
+) -> torch.Tensor:
+    """Arm-command scale in ``[0, 1]``.
+
+    The scale is 1 far below ``limit`` and falls to 0 as CRI reaches it, on
+    the same exponential as ``cri_ovf_exp``. At and above the limit it is 1
+    again, so the arm can move off the barrier. The penalty covers that side.
+    """
+    values = torch.as_tensor(cri, dtype=torch.float32)
+    if values.ndim == 0:
+        values = values.unsqueeze(0)
+    if values.ndim > 1:
+        values = values.amax(dim=-1)
+    limit_t = torch.as_tensor(limit, dtype=values.dtype, device=values.device)
+    if limit_t.ndim == 0:
+        limit_t = limit_t.expand_as(values)
+    else:
+        limit_t = limit_t.reshape(values.shape)
+    headroom = (limit_t - values).clamp(min=0.0)
+    exp_pen = torch.exp(-float(sigma) * headroom) - torch.exp(
+        -float(sigma) * limit_t
+    )
+    approaching = (1.0 - exp_pen).clamp(0.0, 1.0)
+    return torch.where(values >= limit_t, torch.ones_like(approaching), approaching)
+
+
+def apply_cri_soft_arm_limit(
+    actions: torch.Tensor,
+    current_q: torch.Tensor,
+    cri: torch.Tensor,
+    *,
+    limit: float | torch.Tensor,
+    sigma: float,
+    arm_dims: int = 7,
+    row_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Pull absolute arm targets toward the current joints as CRI nears the limit.
+
+    The gripper channel stays put. Rows with ``row_mask`` false are unchanged,
+    so a chunk hold is not undone. Non-tensor actions are returned as given.
+    """
+    if not torch.is_tensor(actions) or actions.shape[-1] < arm_dims:
+        return actions
+    scale = cri_soft_approach_scale(cri, limit=limit, sigma=sigma)
+    scale = scale.to(device=actions.device, dtype=actions.dtype).reshape(-1)
+    joints = current_q.to(device=actions.device, dtype=actions.dtype)
+    if joints.shape[-1] < arm_dims or joints.shape[0] != actions.shape[0]:
+        return actions
+    cmd = actions.clone()
+    arm = cmd[..., :arm_dims]
+    pose = joints[..., :arm_dims]
+    width = scale.reshape(-1, *([1] * (arm.ndim - 1)))
+    blended = pose + width * (arm - pose)
+    if row_mask is not None:
+        keep = row_mask.to(device=cmd.device).reshape(-1).bool()
+        keep = keep.reshape(-1, *([1] * (arm.ndim - 1)))
+        blended = torch.where(keep, blended, arm)
+    cmd[..., :arm_dims] = blended
+    return cmd
 
 
 def cri_ovf_violated(

@@ -1429,12 +1429,22 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         }
 
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
+        step_loss_mask = advantages_and_returns.pop("step_loss_mask", None)
 
         self.rollout_batch.update(advantages_and_returns)
         if kwargs["loss_mask"] is not None:
             self.rollout_batch.update({"loss_mask": kwargs["loss_mask"]})
         if kwargs["loss_mask_sum"] is not None:
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
+        if step_loss_mask is not None:
+            # Steps after the success inside a chunk were not executed as
+            # policy actions. Keep them out of the token loss. The next
+            # policy chunk is a new episode and is unchanged.
+            current = self.rollout_batch.get("loss_mask")
+            if current is None:
+                self.rollout_batch["loss_mask"] = step_loss_mask
+            else:
+                self.rollout_batch["loss_mask"] = step_loss_mask & current.bool()
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
         return rollout_metrics

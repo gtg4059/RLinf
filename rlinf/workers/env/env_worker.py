@@ -39,7 +39,10 @@ from rlinf.envs.wrappers import RecordVideo
 from rlinf.scheduler import Channel, Cluster, CommMapper, Worker
 from rlinf.utils.data_iter_utils import split_list
 from rlinf.utils.distributed import masked_stats, normalize_from_stats
-from rlinf.utils.metric_utils import compute_split_num
+from rlinf.utils.metric_utils import (
+    omit_cri_limit_metric,
+    compute_split_num,
+)
 from rlinf.utils.nested_dict_process import (
     clone_nested_to_cpu,
     copy_dict_tensor,
@@ -510,6 +513,7 @@ class EnvWorker(Worker):
                     env_info[key] = gather_episode_stat(
                         final_info["episode"][key], chunk_dones[:, -1]
                     )
+        omit_cri_limit_metric(env_info)
 
         intervene_actions = (
             infos["intervene_action"] if "intervene_action" in infos else None
@@ -600,6 +604,7 @@ class EnvWorker(Worker):
                     env_info[key] = gather_episode_stat(
                         infos["episode"][key], newly_done
                     )
+        omit_cri_limit_metric(env_info)
 
         rlt_switch_flags = (
             infos["rlt_switch_flags"] if "rlt_switch_flags" in infos else None
@@ -1449,11 +1454,18 @@ class EnvWorker(Worker):
             ),
         }
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
+        step_loss_mask = advantages_and_returns.pop("step_loss_mask", None)
         rollout_batch.update(advantages_and_returns)
         if kwargs["loss_mask"] is not None:
             rollout_batch["loss_mask"] = kwargs["loss_mask"]
         if kwargs["loss_mask_sum"] is not None:
             rollout_batch["loss_mask_sum"] = kwargs["loss_mask_sum"]
+        if step_loss_mask is not None:
+            current = rollout_batch.get("loss_mask")
+            if current is None:
+                rollout_batch["loss_mask"] = step_loss_mask
+            else:
+                rollout_batch["loss_mask"] = step_loss_mask & current.bool()
         return rollout_batch
 
     def prepare_pipeline_batch(self, trajectory: Trajectory) -> dict[str, torch.Tensor]:

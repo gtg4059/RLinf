@@ -308,8 +308,12 @@ Pick one config and launch training:
    # pays less. Also −0.4/15 per meter from the gripper to the handle
    # bar (Isaac position weight −0.4 times the 1/15 s step). The bar term
    # stops at the open. The crossing terminates the episode, so an 11 s open
-   # pays about −55 of time and a timeout pays −300. CRI at or above 0.96 rewinds the
-   # arm to the pose from the last scene reset and does not end the attempt.
+   # pays about −55 of time and a timeout pays −300. ``cri_exceed_mode: soft``
+   # does not rewind: the arm command slows as CRI approaches the limit.
+   # On and past the limit the barrier is ``1 + (CRI - limit)`` per step,
+   # scaled by ``cri_penalty_weight``. ``hard`` rewinds
+   # the arm to the pose from the last scene reset and adds no penalty.
+   # Neither mode ends the attempt.
    # The horizon reset still restores the original scene and the closed door.
    # env/cri_rewind_count is the mean number of those rewinds.
    # env/success_without_cri is the fraction of episodes that cross 0.2

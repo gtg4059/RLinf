@@ -101,8 +101,8 @@ class IsaaclabOpenFridgeKitchenEnv(IsaaclabPickPlaceCubePlateEnv):
         self._repeat_open_after_success = bool(
             init_params.get("repeat_open_after_success", False)
         )
-        # Within 10 cm of the hinged handle bar the rewind level is 3.
-        # Reported CRI is clamped at 2, so that reach does not rewind.
+        # Inside this radius the CRI penalty is zero. The rewind level is 3,
+        # so a hard reset still waits until CRI reaches that level.
         # Farther away the level stays at cri_penalty_limit (0.96).
         self._cri_handle_relax_distance_m = float(
             init_params.get("cri_handle_relax_distance_m", 0.10)
@@ -197,12 +197,30 @@ class IsaaclabOpenFridgeKitchenEnv(IsaaclabPickPlaceCubePlateEnv):
             return base
         distance, valid = handle_reach_distance(reach)
         self._last_handle_distance = distance.detach()
+        self._last_handle_valid = valid.detach()
         return cri_limit_near_handle(
             distance,
             valid,
             base_limit=base,
             near_distance_m=self._cri_handle_relax_distance_m,
             near_limit=self._cri_handle_relax_limit,
+        )
+
+    def _waive_cri_penalty_near_handle(self, ovf: torch.Tensor) -> torch.Tensor:
+        """Drop the CRI penalty while the gripper is inside the handle radius."""
+        from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.door_reward import (
+            waive_cri_penalty_near_handle,
+        )
+
+        distance = getattr(self, "_last_handle_distance", None)
+        valid = getattr(self, "_last_handle_valid", None)
+        if distance is None or valid is None:
+            return ovf
+        return waive_cri_penalty_near_handle(
+            ovf,
+            distance,
+            valid,
+            near_distance_m=self._cri_handle_relax_distance_m,
         )
 
     def _record_cri_video_metrics(self, episode: dict) -> None:
@@ -345,6 +363,17 @@ class IsaaclabOpenFridgeKitchenEnv(IsaaclabPickPlaceCubePlateEnv):
         if not bool(reset.any()):
             return
         ids = torch.nonzero(reset, as_tuple=False).reshape(-1)
+        self._reset_attempt_latches(ids)
+
+    def _reset_attempt_latches(self, ids: torch.Tensor) -> None:
+        """Clear one attempt so the next episode starts like a fresh reset.
+
+        The horizon record of having opened stays. Time penalty, reach, and
+        the door-reward latches start again on the next policy chunk.
+        """
+        if int(ids.numel()) == 0:
+            return
+        ids = ids.to(device=self.success_once.device)
         self.success_once.index_fill_(0, ids, False)
         paid = getattr(self, "_open_attempt_paid", None)
         if paid is not None:
@@ -354,6 +383,14 @@ class IsaaclabOpenFridgeKitchenEnv(IsaaclabPickPlaceCubePlateEnv):
             reach.index_fill_(0, ids, False)
         self._zero_door_reward_state(ids)
         self._zero_handle_approach_state(ids)
+
+    def chunk_step(self, chunk_actions):
+        """Drop the previous chunk's tail and start the new episode clean."""
+        gap = getattr(self, "_post_success_gap", None)
+        if gap is not None and bool(gap.any()):
+            ids = torch.nonzero(gap.reshape(-1), as_tuple=False).reshape(-1)
+            self._reset_attempt_latches(ids)
+        return super().chunk_step(chunk_actions)
 
     def step(self, actions=None, auto_reset=True):
         obs, reward, terminations, truncations, infos = super().step(
@@ -374,6 +411,9 @@ class IsaaclabOpenFridgeKitchenEnv(IsaaclabPickPlaceCubePlateEnv):
         reach_bonus = float(getattr(self, "_reach_bonus", 0.0))
         handle_weight = float(getattr(self, "_handle_approach_weight", 0.0))
         live = ~was_frozen.to(device=step_reward.device).reshape(-1)
+        pause = getattr(self, "_reward_pause", None)
+        if pause is not None:
+            live = live & ~pause.reshape(-1).to(device=live.device)
         openness = self._last_door_openness.to(
             device=step_reward.device, dtype=step_reward.dtype
         ).reshape(-1)
@@ -548,7 +588,18 @@ class IsaaclabOpenFridgeKitchenEnv(IsaaclabPickPlaceCubePlateEnv):
 
             from isaaclab.app import AppLauncher
 
-            sim_app = AppLauncher(headless=True, enable_cameras=True).app
+            # The descriptor pools are fixed when Kit starts. A later carb set
+            # cannot grow them. Per-env eval CameraCfg views plus a cloned
+            # kitchen exhausted the default pools at 96 envs/GPU. These sizes
+            # are the Isaac Sim 5.1 camera-extension test args.
+            sim_app = AppLauncher(
+                headless=True,
+                enable_cameras=True,
+                kit_args=(
+                    "--/rtx/descriptorSets=360000 "
+                    "--/rtx/reservedDescriptors=900000"
+                ),
+            ).app
             # DLSS / post-AA each allocate RTX ParameterBlocks per camera.
             # Kitchen CameraCfg views already sit near the descriptor-set limit.
             try:

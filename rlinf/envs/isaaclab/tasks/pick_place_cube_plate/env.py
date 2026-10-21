@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import gymnasium as gym
@@ -33,6 +34,7 @@ from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.isaac_reset import (
     isaac_reset_row_ids,
     merge_hold_row_ids,
     set_chunk_hold,
+    zero_paused_reward,
     zero_rows,
 )
 
@@ -365,6 +367,23 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._cri_boundary_rewind = bool(
             init_params.get("cri_boundary_rewind", False)
         )
+        from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.rewards import (
+            cri_exceed_settings,
+        )
+
+        # soft: slow the arm near the limit and add the barrier penalty.
+        # hard: rewind, and do not add that penalty. Unset keeps the flags.
+        (
+            self._cri_exceed_mode,
+            self._cri_boundary_rewind,
+            self._cri_ovf_termination_enabled,
+            self._cri_penalty_weight,
+        ) = cri_exceed_settings(
+            init_params.get("cri_exceed_mode", None),
+            boundary_rewind=self._cri_boundary_rewind,
+            termination=self._cri_ovf_termination_enabled,
+            penalty_weight=self._cri_penalty_weight,
+        )
         term_threshold = init_params.get("cri_ovf_term_threshold", None)
         self._cri_ovf_term_threshold = float(
             self._cri_penalty_limit
@@ -449,6 +468,13 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             self.num_envs, dtype=torch.bool, device=self.device
         )
         self._chunk_hold_actions = None
+        # Steps after a success reset, still inside the chunk that caused it.
+        # Those actions were planned for the previous episode. Reward stays 0
+        # until the next policy chunk starts a fresh attempt.
+        self._post_success_gap = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
+        self._reward_pause = self._post_success_gap
         self._init_cri_buffers()
 
     def _augment_step_reward(
@@ -468,7 +494,14 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         return step_reward, terminations
 
     def chunk_step(self, chunk_actions):
-        """Clear intra-chunk reset-hold so the next policy chunk can act."""
+        """Start the next policy chunk as a new episode after a success reset.
+
+        The leftover of the chunk that opened the door is not part of this
+        episode. Hold is cleared so the new chunk is the first action, the
+        same way a reset starts training.
+        """
+        self._post_success_gap.zero_()
+        self._reward_pause = self._post_success_gap
         self._chunk_hold.zero_()
         self._chunk_hold_actions = None
         return super().chunk_step(chunk_actions)
@@ -618,6 +651,9 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         if getattr(self, "_chunk_hold", None) is not None:
             self._chunk_hold.zero_()
             self._chunk_hold_actions = None
+        if getattr(self, "_post_success_gap", None) is not None:
+            self._post_success_gap.zero_()
+            self._reward_pause = self._post_success_gap
         self._remember_q(obs)
         self._hold_obs = clone_obs(obs)
         return obs, self._attach_traj_info(infos, obs)
@@ -761,6 +797,10 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         """CRI level that counts as a boundary hit, one value or one per env."""
         return self._cri_ovf_term_threshold
 
+    def _waive_cri_penalty_near_handle(self, ovf: torch.Tensor) -> torch.Tensor:
+        """Rows that still pay the CRI penalty. The fridge zeros the handle radius."""
+        return ovf
+
     def _solve_cri_from_obs(self, obs: dict[str, Any]) -> torch.Tensor:
         """One ``run_cri_filter(q, qd)`` from this-tick Isaac observations."""
         q, qd = measured_arm_q_qd(obs, num_envs=self.num_envs, device=self.device)
@@ -862,6 +902,8 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.rewards import (
             accumulate_cri_episode_reward,
             accumulate_time_episode_reward,
+            apply_cri_soft_arm_limit,
+            cri_exceed_linear,
             cri_ovf_exp,
             cri_ovf_violated,
             time_penalty_live_mask,
@@ -869,6 +911,9 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
 
         was_frozen = self._frozen.clone()
         hold_after_done = self._hold_after_done
+        # Gap rows are the previous chunk's tail after a success reset.
+        # They are not the new episode; that starts at the next policy chunk.
+        self._reward_pause = self._post_success_gap.clone()
         isaac_reset_ids = torch.zeros(0, dtype=torch.long, device=self.device)
         cri_reset_ids = torch.zeros(0, dtype=torch.long, device=self.device)
         rewind_ids = torch.zeros(0, dtype=torch.long, device=self.device)
@@ -897,6 +942,24 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
                 infos, self._hold_obs, actions=actions
             )
             return self._hold_obs, step_reward, terminations, truncations, infos
+
+        if (
+            self._cri_exceed_mode == "soft"
+            and actions is not None
+            and self._last_q is not None
+            and self._cri_obs_cache is not None
+        ):
+            free = ~self._chunk_hold
+            if hold_after_done:
+                free = free & ~was_frozen
+            actions = apply_cri_soft_arm_limit(
+                actions,
+                self._last_q,
+                self._cri_obs_cache,
+                limit=self._cri_ovf_term_limits(),
+                sigma=self._cri_penalty_sigma,
+                row_mask=free,
+            )
 
         obs, step_reward, terminations, truncations, infos = self.env.step(actions)
 
@@ -927,17 +990,22 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         ovf = None
         if self._compute_cri:
             cri_pre = self._solve_cri_from_obs(obs)
-            ovf = cri_ovf_exp(
-                cri_pre,
-                limit=self._cri_penalty_limit,
-                sigma=self._cri_penalty_sigma,
-                ovf_threshold=self._cri_ovf_threshold,
-            )
+            cri_limits = self._cri_ovf_term_limits()
+            if self._cri_exceed_mode == "soft":
+                # y = 1 + (CRI - limit) on and past the limit, else 0.
+                ovf = cri_exceed_linear(cri_pre, limit=cri_limits)
+            else:
+                ovf = cri_ovf_exp(
+                    cri_pre,
+                    limit=cri_limits,
+                    sigma=self._cri_penalty_sigma,
+                    ovf_threshold=self._cri_ovf_threshold,
+                )
+            ovf = self._waive_cri_penalty_near_handle(ovf)
             if self._cri_penalty_weight != 0.0:
                 step_reward = r_task + self._cri_penalty_weight * ovf.to(
                     device=r_task.device, dtype=r_task.dtype
                 )
-            cri_limits = self._cri_ovf_term_limits()
             cri_hit = cri_ovf_violated(cri_pre, threshold=cri_limits).reshape(-1)
             self._last_cri_ovf_term = cri_hit.clone()
             # Keep the pre-rewind reading. A rewind replaces ``cri_pre`` with
@@ -997,6 +1065,7 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             until_horizon=bool(getattr(self, "_time_penalty_until_horizon", False)),
             device=self.device,
         )
+        live_mask = live_mask & ~self._reward_pause.to(device=live_mask.device)
         time_pen = None
         if self._time_penalty_weight != 0.0:
             time_pen = step_reward.new_zeros(self.num_envs)
@@ -1014,6 +1083,7 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         step_reward, terminations = self._augment_step_reward(
             step_reward, terminations, was_frozen
         )
+        step_reward = zero_paused_reward(step_reward, self._reward_pause)
         if self._last_cri_ovf_term is not None:
             self._cri_ovf_term_count = self._cri_ovf_term_count + (
                 self._last_cri_ovf_term.to(dtype=self._cri_ovf_term_count.dtype)
@@ -1048,6 +1118,8 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
                 obs["states"],
                 post_reset_ids,
             )
+        if (not hold_after_done) and int(isaac_reset_ids.numel()) > 0:
+            self._post_success_gap[isaac_reset_ids.to(device=self.device)] = True
         if cri_pre is not None:
             self._store_cri_pre(cri_pre)
             if int(post_reset_ids.numel()) > 0:
@@ -1078,4 +1150,56 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             self._hold_obs = clone_obs(obs)
             self._frozen = was_frozen | dones.to(device=was_frozen.device)
 
+        self._trace_step_reward(step_reward, terminations, truncations)
         return obs, step_reward, terminations, truncations, infos
+
+    def _trace_step_reward(self, step_reward, terminations, truncations) -> None:
+        """Append one reward row per env when ``RLINF_REWARD_TRACE`` is set."""
+        path = os.environ.get("RLINF_REWARD_TRACE")
+        if not path:
+            return
+        step = int(self.elapsed_steps.reshape(-1)[0].item())
+        reward = step_reward.detach().reshape(-1).float().cpu()
+        terminated = terminations.detach().reshape(-1).bool().cpu()
+        truncated = truncations.detach().reshape(-1).bool().cpu()
+        paused = self._reward_pause.detach().reshape(-1).bool().cpu()
+        gap = self._post_success_gap.detach().reshape(-1).bool().cpu()
+        success = self.success_once.detach().reshape(-1).bool().cpu()
+        ret = self.returns.detach().reshape(-1).float().cpu()
+        time_pen = getattr(self, "_last_time_penalty", None)
+        if time_pen is None:
+            time_pen = torch.zeros_like(reward)
+        else:
+            time_pen = time_pen.detach().reshape(-1).float().cpu()
+        door = getattr(self, "_last_door_openness", None)
+        if door is None:
+            door = torch.zeros_like(reward)
+        else:
+            door = door.detach().reshape(-1).float().cpu()
+        task = getattr(self, "_last_task_success", None)
+        if task is None:
+            task = torch.zeros_like(terminated)
+        else:
+            task = task.detach().reshape(-1).bool().cpu()
+        reach = getattr(self, "reach_once", None)
+        if reach is None:
+            reach = torch.zeros_like(terminated)
+        else:
+            reach = reach.detach().reshape(-1).bool().cpu()
+        new_file = not os.path.exists(path)
+        with open(path, "a", encoding="utf-8") as handle:
+            if new_file:
+                handle.write(
+                    "step,env,reward,time_penalty,door_openness,terminated,"
+                    "truncated,paused,gap,task_success,success_once,reach_once,"
+                    "return\n"
+                )
+            for env_id in range(int(reward.shape[0])):
+                handle.write(
+                    f"{step},{env_id},{reward[env_id].item():.8f},"
+                    f"{time_pen[env_id].item():.8f},{door[env_id].item():.8f},"
+                    f"{int(terminated[env_id])},{int(truncated[env_id])},"
+                    f"{int(paused[env_id])},{int(gap[env_id])},"
+                    f"{int(task[env_id])},{int(success[env_id])},"
+                    f"{int(reach[env_id])},{ret[env_id].item():.8f}\n"
+                )

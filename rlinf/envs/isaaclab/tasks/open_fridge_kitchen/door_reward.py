@@ -125,6 +125,25 @@ def cri_limit_near_handle(
     return torch.where(near, limits.new_tensor(float(near_limit)), limits)
 
 
+def waive_cri_penalty_near_handle(
+    penalty: torch.Tensor,
+    distance: torch.Tensor,
+    segment_valid: torch.Tensor,
+    *,
+    near_distance_m: float,
+) -> torch.Tensor:
+    """Zero the CRI penalty inside the handle radius.
+
+    A missing handle prim reports distance 0 and stays charged. Rows inside
+    ``near_distance_m`` pay nothing, whatever their CRI is.
+    """
+    near = segment_valid.reshape(-1).bool() & (
+        distance.reshape(-1) <= float(near_distance_m)
+    )
+    term = torch.as_tensor(penalty, dtype=torch.float32)
+    return torch.where(near.to(device=term.device), torch.zeros_like(term), term)
+
+
 def handle_reach_distance(
     reach: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:

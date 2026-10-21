@@ -99,6 +99,24 @@ def reference_kl_loss(
     return (divergence * weights).sum() / denominator
 
 
+def keep_through_first_done(step_dones: torch.Tensor) -> torch.Tensor:
+    """Keep steps up to and including the first done along the last dimension.
+
+    A success inside an action chunk ends that episode. Later steps in the
+    same chunk are hold padding and must not enter the return or the loss.
+
+    Args:
+        step_dones: Bool tensor, done flags for each step in a chunk.
+
+    Returns:
+        Bool tensor of the same shape. True on steps that still belong to
+        the episode that the chunk started.
+    """
+    done = step_dones.bool()
+    seen = done.cumsum(dim=-1)
+    return (seen == 0) | (done & (seen == 1))
+
+
 def preprocess_embodied_advantages_inputs(
     rewards: torch.Tensor,
     dones: torch.Tensor,
@@ -114,6 +132,14 @@ def preprocess_embodied_advantages_inputs(
     if kwargs["reward_type"] == "chunk_level":
         # TODO: need check
         # rewards, dones, loss_mask, loss_mask_sum: [n_chunk_steps, bsz, num_action_chunks] -> [n_chunk_steps, bsz, 1]
+        # Dones are stored with one leading bootstrap row. Drop rewards after
+        # the first done in the chunk so the reset hold is not part of the
+        # episode that just succeeded, and GAE does not pull in the next chunk.
+        step_dones = dones[1:] if dones.shape[0] == rewards.shape[0] + 1 else dones
+        if step_dones.shape == rewards.shape and rewards.shape[-1] > 1:
+            keep = keep_through_first_done(step_dones)
+            rewards = rewards * keep.to(dtype=rewards.dtype)
+            kwargs["step_loss_mask"] = keep
         rewards = rewards.sum(dim=-1, keepdim=True)
         dones = dones.max(dim=-1, keepdim=True)[0]
         if loss_mask is not None:
@@ -333,10 +359,14 @@ def preprocess_loss_inputs(
     **kwargs,
 ) -> dict:
     if reward_type == "chunk_level":
+        # A mask shaped like the action chunk (one flag per step) must stay
+        # that shape so steps after a mid-chunk success are dropped. A mask
+        # with one flag per chunk flattens with the advantage.
+        advantage_count = advantages.numel()
         advantages = advantages.flatten()
-        if loss_mask is not None:
+        if loss_mask is not None and loss_mask.numel() == advantage_count:
             loss_mask = loss_mask.flatten()
-        if loss_mask_sum is not None:
+        if loss_mask_sum is not None and loss_mask_sum.numel() == advantage_count:
             loss_mask_sum = loss_mask_sum.flatten()
         if values is not None:
             values = values.flatten()

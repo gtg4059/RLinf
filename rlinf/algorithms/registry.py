@@ -116,6 +116,9 @@ def calculate_adv_and_returns(**kwargs) -> tuple[torch.Tensor, Optional[torch.Te
             res = postprocess_embodied_advantages_outputs(
                 advantages=advantages, returns=returns, **kwargs
             )
+            step_loss_mask = kwargs.get("step_loss_mask")
+            if step_loss_mask is not None:
+                res["step_loss_mask"] = step_loss_mask
     else:
         # reasoning tasks
         kwargs = preprocess_reasoning_advantages_inputs(**kwargs)
