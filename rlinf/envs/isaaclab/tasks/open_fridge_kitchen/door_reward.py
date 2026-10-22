@@ -378,6 +378,30 @@ def capped_closing_reward(
 ISAAC_EE_POSITION_STEP_WEIGHT = -0.4 / 15.0
 
 
+def gripper_past_handle(
+    distance: torch.Tensor,
+    segment_valid: torch.Tensor,
+    *,
+    max_distance_m: float,
+) -> torch.Tensor:
+    """True when the gripper is farther than ``max_distance_m`` from the bar.
+
+    A missing handle prim is not past the bar. The comparison is strict, so
+    a distance equal to the limit stays in the attempt.
+
+    Args:
+        distance: Gripper-to-handle distance in meters, shape ``(N,)``.
+        segment_valid: True where the handle segment has nonzero length.
+        max_distance_m: Distance that ends the attempt, in meters.
+
+    Returns:
+        Bool tensor, shape ``(N,)``.
+    """
+    return segment_valid.reshape(-1).bool() & (
+        distance.reshape(-1) > float(max_distance_m)
+    )
+
+
 def ee_bar_distance_penalty(
     distance: torch.Tensor,
     weight: float = ISAAC_EE_POSITION_STEP_WEIGHT,

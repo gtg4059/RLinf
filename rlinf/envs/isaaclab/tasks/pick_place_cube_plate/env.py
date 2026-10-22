@@ -477,6 +477,13 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._reward_pause = self._post_success_gap
         self._init_cri_buffers()
 
+    def _hand_left_scene_mask(self) -> torch.Tensor | None:
+        """Rows that should end and reset because the hand left the scene.
+
+        The fridge task overrides this. Other tasks keep the attempt.
+        """
+        return None
+
     def _augment_step_reward(
         self,
         step_reward: torch.Tensor,
@@ -917,6 +924,7 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         isaac_reset_ids = torch.zeros(0, dtype=torch.long, device=self.device)
         cri_reset_ids = torch.zeros(0, dtype=torch.long, device=self.device)
         rewind_ids = torch.zeros(0, dtype=torch.long, device=self.device)
+        far_reset_ids = torch.zeros(0, dtype=torch.long, device=self.device)
         self._last_cri_ovf_term = None
         # Spawn rewind and success-hold both pin absolute joint targets.
         # Rewind hold applies in training too: hold_after_done only freezes
@@ -1107,9 +1115,25 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
                     )
                 )
 
+        # Past the handle-bar limit the attempt ends without a success bonus.
+        # The termination is applied after ``_augment_step_reward``, which
+        # treats an earlier done as the door-open signal.
+        far = self._hand_left_scene_mask()
+        if far is not None:
+            far = far.reshape(-1).bool().to(device=self.device)
+            if hold_after_done:
+                far = far & ~was_frozen.reshape(-1).to(device=far.device)
+            if bool(far.any()):
+                far_reset_ids = torch.nonzero(far, as_tuple=False).reshape(-1)
+                terminations = terminations | far.reshape_as(terminations)
+                reset_obs_raw, _ = self.env.reset(env_ids=far_reset_ids)
+                reset_obs = self._wrap_obs(reset_obs_raw)
+                obs = overwrite_frozen_obs(obs, reset_obs, far)
+                self._sync_after_isaac_reset(far_reset_ids)
+
         self._remember_q(obs)
         post_reset_ids = merge_hold_row_ids(
-            isaac_reset_ids, cri_reset_ids, rewind_ids
+            isaac_reset_ids, cri_reset_ids, rewind_ids, far_reset_ids
         )
         if int(post_reset_ids.numel()) > 0 and obs.get("states") is not None:
             self._chunk_hold, self._chunk_hold_actions = set_chunk_hold(
@@ -1118,8 +1142,9 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
                 obs["states"],
                 post_reset_ids,
             )
-        if (not hold_after_done) and int(isaac_reset_ids.numel()) > 0:
-            self._post_success_gap[isaac_reset_ids.to(device=self.device)] = True
+        gap_ids = merge_hold_row_ids(isaac_reset_ids, far_reset_ids)
+        if (not hold_after_done) and int(gap_ids.numel()) > 0:
+            self._post_success_gap[gap_ids.to(device=self.device)] = True
         if cri_pre is not None:
             self._store_cri_pre(cri_pre)
             if int(post_reset_ids.numel()) > 0:

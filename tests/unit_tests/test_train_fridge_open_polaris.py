@@ -112,12 +112,12 @@ def test_train_script_accepts_config_name_then_overrides() -> None:
     assert "runner.max_epochs=2" in completed.stdout
 
 
-def test_ppo_yaml_uses_all_gpus_at_32_train_envs_per_gpu() -> None:
-    """Yaml default is this 2-GPU host: 32 train / 4 eval envs per GPU."""
+def test_ppo_yaml_uses_all_gpus_at_64_train_envs_per_gpu() -> None:
+    """Yaml default is this 2-GPU host: 64 train / 4 eval envs per GPU."""
     text = (REPO_ROOT / "examples/embodiment/config" / f"{CONFIG_NAME}.yaml").read_text()
     train_block, eval_block = text.split("\n  eval:\n", 1)
     assert "actor,env,rollout: all" in text
-    assert "total_num_envs: 64" in train_block
+    assert "total_num_envs: 128" in train_block
     assert "rollout_epoch: 1" in train_block
     assert "max_episode_steps: 900" in train_block
     assert "episode_length_s: 60.0" in train_block
@@ -134,7 +134,7 @@ def test_ppo_yaml_uses_all_gpus_at_32_train_envs_per_gpu() -> None:
     assert "total_num_envs: 8" in eval_block
     assert "max_episode_steps: 900" in eval_block
     assert "episode_length_s: 60.0" in eval_block
-    assert "global_batch_size: 3840" in text
+    assert "global_batch_size: 7680" in text
     assert "val_check_interval: 50" in text
     assert "save_interval: 50" in text
     assert "adv_type: episode_success" in text
@@ -159,7 +159,7 @@ def test_ppo_yaml_uses_all_gpus_at_32_train_envs_per_gpu() -> None:
     assert "update_epoch: 2" in text
     assert "sharding_strategy: \"no_shard\"" in text
     assert "gradient_checkpointing: True" in text
-    assert "micro_batch_size: 8" in text
+    assert "micro_batch_size: 16" in text
 
 
 def test_train_script_scales_envs_to_visible_gpus() -> None:
@@ -178,10 +178,10 @@ def test_train_script_scales_envs_to_visible_gpus() -> None:
     )
     assert completed.returncode == 0, completed.stderr
     assert "VISIBLE_GPUS=8" in completed.stdout
-    assert "env.train.total_num_envs=256" in completed.stdout
+    assert "env.train.total_num_envs=512" in completed.stdout
     assert "env.eval.total_num_envs=32" in completed.stdout
-    assert "HORIZON_STEPS=900" in completed.stdout
-    assert "actor.global_batch_size=15360" in completed.stdout
+    assert "HORIZON_STEPS=600" in completed.stdout
+    assert "actor.global_batch_size=20480" in completed.stdout
 
 
 def test_train_script_honors_explicit_env_count() -> None:
@@ -205,10 +205,10 @@ def test_train_script_honors_explicit_env_count() -> None:
     )
     assert completed.returncode == 0, completed.stderr
     assert "env.train.total_num_envs=16" in completed.stdout
-    assert "env.train.total_num_envs=64" not in completed.stdout
+    assert "env.train.total_num_envs=128" not in completed.stdout
     assert "env.eval.total_num_envs=8" in completed.stdout
-    # 16 envs / 2 GPUs * (900/15) chunks. Batch follows the env override.
-    assert "actor.global_batch_size=960" in completed.stdout
+    # 16 envs / 2 GPUs * (600/15) chunks. Batch follows the env override.
+    assert "actor.global_batch_size=640" in completed.stdout
 
 
 def test_train_script_rejects_unknown_config() -> None:

@@ -5,10 +5,10 @@
 # Host entry: bind-mounts this checkout into the local embodied-isaaclab
 # image and launches the named Hydra config. First positional is the config
 # (same style as run_embodiment.sh); later tokens are Hydra overrides.
-# Collocated actor+env+rollout on all visible GPUs, 32 train / 4 eval
-# envs per GPU. The train horizon is read from the config (900 steps,
-# 15-step chunks): chunks/rank = 32*1*(900/15) = 1920.
-# This host is 2× Blackwell → 64 train / 8 eval / global_batch 3840.
+# Collocated actor+env+rollout on all visible GPUs, 64 train / 4 eval
+# envs per GPU. The train horizon is read from the config (600 steps,
+# 15-step chunks): chunks/rank = 64*1*(600/15) = 2560.
+# This host is 2× Blackwell → 128 train / 8 eval / global_batch 5120.
 # Override RLINF_NUM_GPUS or pass Hydra env.train.total_num_envs=… to pin.
 # Stop a previous fridge PPO / eval container first (they share GPUs).
 # Do not resume a collapsed language-binned 10000 CRI run.
@@ -56,10 +56,11 @@ if [ ! -f "${CONFIG_YAML}" ]; then
   exit 1
 fi
 
-# 32 train / 4 eval envs per GPU. Chunks follow the train horizon in the
+# 64 train / 4 eval envs per GPU. Chunks follow the train horizon in the
 # config: envs/rank * rollout_epoch * (max_steps / num_action_chunks).
-# 900 steps and 15-step chunks → 60 chunks/env. global_batch = that * n_gpus.
-TRAIN_ENVS_PER_GPU=32
+# 600 steps and 15-step chunks → 40 chunks/env. global_batch = that * n_gpus.
+# 2 GPUs → env.train.total_num_envs=128. Pass that Hydra key to pin another count.
+TRAIN_ENVS_PER_GPU=64
 EVAL_ENVS_PER_GPU=4
 
 _visible_gpu_count() {

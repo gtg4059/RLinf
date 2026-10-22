@@ -212,7 +212,7 @@ def calculate_scores(
             "dones": dones,
         }
     )
-    if kwargs.get("adv_type") == "episode_success":
+    if kwargs.get("adv_type") in ("episode_success", "grouped_return"):
         kwargs["step_rewards"] = step_rewards
 
     return kwargs

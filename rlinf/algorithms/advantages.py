@@ -467,6 +467,109 @@ def compute_episode_success_advantages(
     return advantages, None
 
 
+def _attempt_index(ended: torch.Tensor) -> torch.Tensor:
+    """Attempt id of each step. The done step still belongs to the attempt it ends."""
+    seen = ended.long().cumsum(dim=0)
+    return seen - ended.long()
+
+
+def _return_to_go_by_attempt(
+    step_rewards: torch.Tensor, ended: torch.Tensor
+) -> torch.Tensor:
+    """Remaining reward inside the current attempt, including this step."""
+    remaining = torch.zeros_like(step_rewards)
+    running = torch.zeros(
+        step_rewards.shape[-1],
+        dtype=step_rewards.dtype,
+        device=step_rewards.device,
+    )
+    for step in reversed(range(step_rewards.shape[0])):
+        if bool(ended[step].any()):
+            running = torch.where(ended[step], torch.zeros_like(running), running)
+        running = running + step_rewards[step]
+        remaining[step] = running
+    return remaining
+
+
+def _center_selected(values: torch.Tensor, selected: torch.Tensor) -> torch.Tensor:
+    """Subtract the per-step mean of the selected batch entries."""
+    selected_f = selected.to(dtype=values.dtype)
+    count = selected_f.sum(dim=-1, keepdim=True)
+    safe_count = count.clamp(min=1.0)
+    mean = (values * selected_f).sum(dim=-1, keepdim=True) / safe_count
+    return (values - mean) * selected_f
+
+
+@register_advantage("grouped_return")
+def compute_grouped_return_advantages(
+    rewards: torch.Tensor,
+    loss_mask: torch.Tensor | None = None,
+    success_chunk_reward_min: float = 0.5,
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+    """Center each attempt's return-to-go inside its own outcome group.
+
+    An attempt runs until its done. A chunk reward above
+    ``success_chunk_reward_min`` (the +1 open) marks that attempt as a
+    success. Successes are centered only with other successes that are
+    live at the same chunk, and misses only with other misses. The +1 is
+    common to the success group, so the sign ranks the remaining dense
+    cost: a faster, closer open stays positive. A miss that keeps the
+    hand nearer the handle stays positive against a miss that moves away.
+    The two groups are not centered together, so a miss is not made
+    negative merely for lacking +1. A later attempt in the same horizon is
+    its own episode. There is no critic return.
+
+    Args:
+        rewards: Episode scores from ``calculate_scores``. Unused; the
+            per-chunk rewards arrive in ``step_rewards``.
+        loss_mask: Optional trainable steps, shape ``[n_steps, batch]``.
+        success_chunk_reward_min: Chunk reward that marks an open.
+
+    Returns:
+        Advantages with shape ``[n_steps, batch]``, and no returns.
+    """
+    del rewards
+    step_rewards = kwargs.get("step_rewards")
+    dones = kwargs.get("dones")
+    if step_rewards is None:
+        raise ValueError("grouped_return advantages require step_rewards.")
+    if dones is None:
+        raise ValueError("grouped_return advantages require dones.")
+    rewards_f = step_rewards.to(dtype=torch.float32)
+    steps, _batch = rewards_f.shape
+    ended = dones[1 : 1 + steps].bool()
+    if ended.shape != rewards_f.shape:
+        raise ValueError(
+            "dones steps "
+            f"{tuple(ended.shape)} do not match rewards {tuple(rewards_f.shape)}"
+        )
+    trainable = torch.ones_like(ended)
+    if loss_mask is not None:
+        trainable = loss_mask.bool()
+        if trainable.shape != rewards_f.shape:
+            raise ValueError(
+                "loss_mask shape "
+                f"{tuple(trainable.shape)} does not match rewards "
+                f"{tuple(rewards_f.shape)}"
+            )
+    attempt = _attempt_index(ended)
+    live_rewards = rewards_f * trainable.to(dtype=rewards_f.dtype)
+    remaining = _return_to_go_by_attempt(live_rewards, ended)
+    opened_step = torch.zeros_like(ended)
+    n_attempts = int(attempt.max().item()) + 1 if steps else 0
+    open_mark = rewards_f > float(success_chunk_reward_min)
+    for attempt_id in range(n_attempts):
+        in_attempt = (attempt == attempt_id) & trainable
+        opened = (open_mark & in_attempt).any(dim=0)
+        opened_step = opened_step | (in_attempt & opened.view(1, -1))
+    miss_step = trainable & ~opened_step
+    advantages = _center_selected(remaining, opened_step) + _center_selected(
+        remaining, miss_step
+    )
+    return advantages, None
+
+
 @register_advantage("min_time")
 def compute_min_time_advantages(
     rewards: torch.Tensor,

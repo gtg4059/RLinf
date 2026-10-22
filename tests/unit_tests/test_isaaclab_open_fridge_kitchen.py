@@ -42,6 +42,7 @@ from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.door_reward import (
     FRIDGE_HANDLE_LOCAL_END,
     FRIDGE_HANDLE_LOCAL_START,
     ee_bar_distance_penalty,
+    gripper_past_handle,
     front_face_segment,
     handle_reach_distance,
     hinge_handle_segment,
@@ -161,6 +162,20 @@ def test_cri_penalty_is_zero_inside_the_handle_radius():
         near_distance_m=0.08,
     )
     assert float(missing[0]) == pytest.approx(5.0)
+
+
+def test_gripper_past_40cm_ends_the_attempt():
+    """40 cm is still in the attempt. Farther, with a real handle, ends it."""
+    distance = torch.tensor([0.39, 0.40, 0.41])
+    valid = torch.tensor([True, True, True])
+    past = gripper_past_handle(distance, valid, max_distance_m=0.40)
+    assert past.tolist() == [False, False, True]
+    missing = gripper_past_handle(
+        torch.tensor([1.0]),
+        torch.tensor([False]),
+        max_distance_m=0.40,
+    )
+    assert missing.tolist() == [False]
 
 
 def test_cri_limit_is_left_out_of_env_metrics():
