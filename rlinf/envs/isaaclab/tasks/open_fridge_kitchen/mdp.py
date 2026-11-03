@@ -29,6 +29,7 @@ from isaaclab.managers import SceneEntityCfg
 
 from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.door import (
     compute_door_openness,
+    door_hinge_angle_rad,
     door_reached_from_rest,
 )
 from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.door_reward import (
@@ -154,6 +155,19 @@ def fridge_door_openness(
     lower = fridge.data.soft_joint_pos_limits[:, idx, 0]
     upper = fridge.data.soft_joint_pos_limits[:, idx, 1]
     return compute_door_openness(pos, lower, upper)
+
+
+def fridge_door_angle_rad(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("fridge"),
+    joint_name: str = _FRIDGE_DOOR_JOINT,
+) -> torch.Tensor:
+    """Hinge radians past the closed soft limit. Not a fraction of the span."""
+    fridge = env.scene[asset_cfg.name]
+    idx = _fridge_door_index(fridge, joint_name)
+    pos = fridge.data.joint_pos[:, idx]
+    lower = fridge.data.soft_joint_pos_limits[:, idx, 0]
+    return door_hinge_angle_rad(pos, lower)
 
 
 def fridge_door_reached(

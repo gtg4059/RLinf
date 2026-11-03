@@ -24,10 +24,16 @@ from torch.distributed.tensor import DTensor
 from torch.multiprocessing.reductions import reduce_tensor
 
 import rlinf.algorithms  # noqa: F401
-from rlinf.algorithms.adaptive_lr import adapt_learning_rate
+from rlinf.algorithms.adaptive_lr import adapt_learning_rate, kl_for_adaptive_lr
 from rlinf.algorithms.expert import build_expert_model_config
 from rlinf.algorithms.registry import calculate_adv_and_returns, policy_loss
+from rlinf.algorithms.success_replay import (
+    SuccessReplay,
+    hold_policy_update,
+    open_columns,
+)
 from rlinf.algorithms.utils import (
+    advantage_update_shift,
     kl_penalty,
     reference_kl_loss,
     resolve_update_epoch,
@@ -196,6 +202,19 @@ def compute_rollout_train_kl(
     recomputed_logprobs = m_batch["recomputed_logprobs"]
     kl = torch.abs(recomputed_logprobs - rollout_logprobs)
     return masked_mean(kl, loss_mask)
+
+
+def _tree_to_device(value, device):
+    """Copy a nested tensor structure onto ``device`` without aliasing."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device=device).contiguous()
+    if isinstance(value, dict):
+        return {key: _tree_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_tree_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_tree_to_device(item, device) for item in value)
+    return value
 
 
 class FSDPActor(FSDPModelManager, Worker):
@@ -1385,6 +1404,69 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         return rollout_batch
 
+    def _mix_success_replay(self) -> None:
+        """Swap a few low-return misses for recent opens before the advantage.
+
+        An empty buffer leaves the current rollout unchanged, so the first
+        update trains on the successes already in that rollout.
+        """
+        self._hold_policy = False
+        self._positive_only = False
+        fraction = float(self.cfg.algorithm.get("success_replay_fraction", 0.0))
+        floor_cfg = self.cfg.algorithm.get("policy_update_min_open_fraction", None)
+        if self.rollout_batch is None or (fraction <= 0.0 and floor_cfg is None):
+            return
+        floor = 0.05 if floor_cfg is None else float(floor_cfg)
+        replay = getattr(self, "_success_replay", None)
+        if replay is None:
+            replay = SuccessReplay(
+                fraction=fraction,
+                capacity=int(self.cfg.algorithm.get("success_replay_capacity", 32)),
+                success_reward_min=float(
+                    self.cfg.algorithm.get("success_chunk_reward_min", 0.5)
+                ),
+            )
+            self._success_replay = replay
+        rewards = self.rollout_batch.get("rewards")
+        live_open_fraction = 1.0
+        if isinstance(rewards, torch.Tensor) and rewards.ndim >= 2:
+            opened = open_columns(rewards, replay.success_reward_min)
+            live_open_fraction = float(opened.float().mean())
+        mixed = replay.mix(self.rollout_batch, floor_fraction=floor)
+        open_after = live_open_fraction
+        rewards_after = self.rollout_batch.get("rewards")
+        if isinstance(rewards_after, torch.Tensor) and rewards_after.ndim >= 2:
+            open_after = float(
+                open_columns(rewards_after, replay.success_reward_min).float().mean()
+            )
+        self._hold_policy = hold_policy_update(
+            live_open_fraction,
+            len(replay),
+            floor,
+            open_fraction_after_mix=open_after,
+        )
+        # A negative on the miss cut reach 60% → 49% by step 187. Once the
+        # live rate is under the floor, keep the restored opens and drop
+        # the miss gradient.
+        self._positive_only = (
+            floor > 0.0 and live_open_fraction < floor and open_after > 0.0
+        )
+        if self._hold_policy:
+            self.log_info(
+                "hold policy update: open fraction "
+                f"{open_after:.3f} after replay, live {live_open_fraction:.3f}"
+            )
+        elif self._positive_only:
+            self.log_info(
+                "success replay kept opens only: live "
+                f"{live_open_fraction:.3f} below {floor:.3f}, mixed {mixed}"
+            )
+        elif mixed:
+            self.log_info(
+                f"success replay mixed {mixed} columns "
+                f"from a buffer of {len(replay)}"
+            )
+
     @Worker.timer("actor/compute_adv")
     def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
         """
@@ -1392,12 +1474,17 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         if self.cfg.algorithm.adv_type == "opd":
             self.compute_opd_teacher_logprobs()
+        self._mix_success_replay()
 
         kwargs = {
             "task_type": self.cfg.runner.task_type,
             "adv_type": self.cfg.algorithm.adv_type,
             "rewards": self.rollout_batch["rewards"],
             "dones": self.rollout_batch["dones"],
+            "terminations": self.rollout_batch.get("terminations", None),
+            "bootstrap_truncation": bool(
+                self.cfg.algorithm.get("bootstrap_truncation", False)
+            ),
             "values": self.rollout_batch.get("prev_values", None),
             "prev_logprobs": self.rollout_batch.get("prev_logprobs", None),
             "teacher_logprobs": self.rollout_batch.get("teacher_logprobs", None),
@@ -1411,13 +1498,32 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "normalize_advantages": self.cfg.algorithm.get(
                 "normalize_advantages", True
             ),
+            "advantage_baseline": self.cfg.algorithm.get("advantage_baseline", None),
+            "zero_failure_prefix": self.cfg.algorithm.get(
+                "zero_failure_prefix", False
+            ),
+            "advantage_after_reach": self.cfg.algorithm.get(
+                "advantage_after_reach", False
+            ),
+            "reach_chunk_reward_min": self.cfg.algorithm.get(
+                "reach_chunk_reward_min", 0.1
+            ),
             "success_return_threshold": self.cfg.algorithm.get(
                 "success_return_threshold", 0.8
             ),
             "success_chunk_reward_min": self.cfg.algorithm.get(
                 "success_chunk_reward_min", 0.0
             ),
+            "isolate_failure_terminal": bool(
+                self.cfg.algorithm.get("isolate_failure_terminal", False)
+            ),
+            "failure_advantage_scale": self.cfg.algorithm.get(
+                "failure_advantage_scale", None
+            ),
             "success_advantage": self.cfg.algorithm.get("success_advantage", 0.5),
+            "miss_advantage_fraction": self.cfg.algorithm.get(
+                "miss_advantage_fraction", 0.5
+            ),
             "approach_advantage": self.cfg.algorithm.get("approach_advantage", 0.0),
             "approach_return_max": self.cfg.algorithm.get("approach_return_max", 0.2),
             "speed_horizon_chunks": self.cfg.algorithm.get(
@@ -1438,8 +1544,9 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
         if step_loss_mask is not None:
             # Steps after the success inside a chunk were not executed as
-            # policy actions. Keep them out of the token loss. The next
-            # policy chunk is a new episode and is unchanged.
+            # policy actions. An attempt that follows an open and then
+            # neither opens nor times out is out of the loss as well. A
+            # miss that starts the horizon stays.
             current = self.rollout_batch.get("loss_mask")
             if current is None:
                 self.rollout_batch["loss_mask"] = step_loss_mask
@@ -1614,6 +1721,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         """
         Run the training process using the received rollout batch.
         """
+        self._update_probe = None
         if self.is_weight_offloaded:
             self.load_param_and_grad(self.device)
         if self.is_optimizer_offloaded:
@@ -1723,22 +1831,18 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 break
         self.optimizer.zero_grad()
         clear_memory()
+        self._append_update_shift_metrics(metrics)
         explained_variance_stats = pop_critic_explained_variance_stats(metrics)
         mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
         mean_metric_dict = all_reduce_dict(
             mean_metric_dict, op=torch.distributed.ReduceOp.AVG
         )
         if str(self.cfg.actor.optim.get("lr_scheduler", "constant")) == "adaptive":
-            # kl_loss is the distance from the opening checkpoint. It is ~0
-            # before any update, ~0.2 while the door still opens, and ~4
-            # after the policy has collapsed. update_kl stays large from the
-            # flow ratio mismatch even when the weights have not moved.
-            kl_for_lr = mean_metric_dict.get("actor/kl_loss")
-            if kl_for_lr is None:
-                kl_for_lr = mean_metric_dict.get(
-                    "actor/update_kl", mean_metric_dict.get("actor/approx_kl", 0.0)
-                )
-            self._adapt_actor_lr(float(kl_for_lr))
+            kl_for_lr = kl_for_adaptive_lr(
+                mean_metric_dict,
+                float(self.cfg.algorithm.get("kl_beta", 0.0)),
+            )
+            self._adapt_actor_lr(kl_for_lr)
         else:
             self.lr_scheduler.step()
         if explained_variance_stats:
@@ -1829,6 +1933,63 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             return cri_pos
         return None
 
+    def _append_update_shift_metrics(self, metrics: dict[str, list[float]]) -> None:
+        """Replay one micro-batch after the step and log the advantage split.
+
+        ``actor/ratio`` is 1 because π_old is the detached pre-step replay.
+        The logged shift is log π_after − log π_before on that same chain.
+        """
+        probe = getattr(self, "_update_probe", None)
+        self._update_probe = None
+        if not probe or probe.get("forward_inputs") is None:
+            return
+        module = unwrap_fsdp_module(self.model)
+        disabled = False
+        shift = None
+        if hasattr(module, "gradient_checkpointing_disable"):
+            module.gradient_checkpointing_disable()
+            disabled = True
+        try:
+            inputs = _tree_to_device(probe["forward_inputs"], self.device)
+            with torch.no_grad():
+                output = self.model(
+                    forward_inputs=inputs,
+                    compute_logprobs=True,
+                    compute_entropy=False,
+                    compute_values=False,
+                    use_cache=False,
+                )
+            shift = advantage_update_shift(
+                probe["logprobs"].to(self.device),
+                output["logprobs"],
+                probe["advantages"].to(self.device),
+                logprob_type=str(self.cfg.algorithm.logprob_type),
+                reward_type=str(self.cfg.algorithm.reward_type),
+                single_action_dim=int(self.cfg.actor.model.get("action_dim", 7)),
+                loss_mask=(
+                    None
+                    if probe["loss_mask"] is None
+                    else probe["loss_mask"].to(self.device)
+                ),
+            )
+        except Exception as exc:
+            self.log_warning(f"update shift probe failed: {exc}")
+        finally:
+            if disabled and hasattr(module, "gradient_checkpointing_enable"):
+                use_reentrant = bool(
+                    self.cfg.actor.fsdp_config.get(
+                        "gradient_checkpointing_use_reentrant", True
+                    )
+                )
+                if use_reentrant:
+                    module.gradient_checkpointing_enable()
+                else:
+                    module.gradient_checkpointing_enable(
+                        gradient_checkpointing_kwargs={"use_reentrant": False}
+                    )
+        if shift is not None:
+            append_to_dict(metrics, shift)
+
     def train_micro_batch(
         self,
         micro_batch: dict[str, torch.Tensor],
@@ -1880,6 +2041,14 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         ]:
             prev_logprobs = output_dict["prev_logprobs"]
 
+        # Flow-SDE stores the rollout engine's gaussian logprob and the actor
+        # replays that chain. The two numbers differ at identical weights, so
+        # the chunk ratio leaves [0.8, 1.2] before the optimizer step. Use the
+        # replay as π_old. This pass still has the rollout weights, so the
+        # ratio is 1.
+        if bool(self.cfg.algorithm.get("replay_old_logprob", False)):
+            prev_logprobs = output_dict["logprobs"].detach()
+
         loss_kwargs = {
             "loss_type": self.cfg.algorithm.loss_type,
             "logprob_type": self.cfg.algorithm.logprob_type,
@@ -1905,6 +2074,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             ),
             "trust_log_ratio_min": self.cfg.algorithm.get("trust_log_ratio_min", None),
             "trust_log_ratio_max": self.cfg.algorithm.get("trust_log_ratio_max", None),
+            "positive_advantage_only": bool(
+                self.cfg.algorithm.get("positive_advantage_only", False)
+            )
+            or bool(getattr(self, "_positive_only", False)),
+            "hold_policy_update": bool(getattr(self, "_hold_policy", False)),
         }
 
         if SupportedModel(self.cfg.actor.model.model_type) in [
@@ -1974,6 +2148,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         metrics_data["actor/total_loss"] = loss.detach().item()
         append_to_dict(metrics, metrics_data)
+        if is_last and bool(self.cfg.algorithm.get("replay_old_logprob", False)):
+            # One micro-batch is enough to show the sign of the step. The
+            # full batch's second forward would repeat the 84s update.
+            self._update_probe = {
+                "forward_inputs": _tree_to_device(forward_inputs, "cpu"),
+                "logprobs": output_dict["logprobs"].detach().to(device="cpu"),
+                "advantages": advantages.detach().to(device="cpu"),
+                "loss_mask": (
+                    None
+                    if loss_mask is None
+                    else loss_mask.detach().to(device="cpu")
+                ),
+            }
 
     def _keep_value_head_in_graph(
         self, loss: torch.Tensor, compute_values: bool

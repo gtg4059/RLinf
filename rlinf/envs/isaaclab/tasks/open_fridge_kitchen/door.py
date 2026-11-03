@@ -38,6 +38,22 @@ def compute_door_openness(
     return ((joint_pos - lower) / span).clamp(0.0, 1.0)
 
 
+def door_hinge_angle_rad(
+    joint_pos: torch.Tensor,
+    lower: torch.Tensor,
+) -> torch.Tensor:
+    """Radians the hinge has traveled past the closed joint limit.
+
+    Args:
+        joint_pos: Door joint position, shape ``(N,)``.
+        lower: Soft lower (closed) limit, shape ``(N,)``.
+
+    Returns:
+        Angle in radians, clamped at 0, shape ``(N,)``.
+    """
+    return (joint_pos - lower).clamp(min=0.0)
+
+
 def door_reached_from_rest(
     openness: torch.Tensor,
     rest_openness: float = 0.0,

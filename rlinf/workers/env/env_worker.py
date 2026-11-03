@@ -1437,13 +1437,32 @@ class EnvWorker(Worker):
             "loss_mask_sum": rollout_batch.get("loss_mask_sum", None),
             "normalize_advantages": self.cfg.algorithm.get("normalize_advantages", True)
             and not self.use_training_pipeline,
+            "advantage_baseline": self.cfg.algorithm.get("advantage_baseline", None),
+            "zero_failure_prefix": self.cfg.algorithm.get(
+                "zero_failure_prefix", False
+            ),
+            "advantage_after_reach": self.cfg.algorithm.get(
+                "advantage_after_reach", False
+            ),
+            "reach_chunk_reward_min": self.cfg.algorithm.get(
+                "reach_chunk_reward_min", 0.1
+            ),
             "success_return_threshold": self.cfg.algorithm.get(
                 "success_return_threshold", 0.8
             ),
             "success_chunk_reward_min": self.cfg.algorithm.get(
                 "success_chunk_reward_min", 0.0
             ),
+            "isolate_failure_terminal": bool(
+                self.cfg.algorithm.get("isolate_failure_terminal", False)
+            ),
+            "failure_advantage_scale": self.cfg.algorithm.get(
+                "failure_advantage_scale", None
+            ),
             "success_advantage": self.cfg.algorithm.get("success_advantage", 0.5),
+            "miss_advantage_fraction": self.cfg.algorithm.get(
+                "miss_advantage_fraction", 0.5
+            ),
             "approach_advantage": self.cfg.algorithm.get("approach_advantage", 0.0),
             "approach_return_max": self.cfg.algorithm.get("approach_return_max", 0.2),
             "speed_horizon_chunks": self.cfg.algorithm.get(

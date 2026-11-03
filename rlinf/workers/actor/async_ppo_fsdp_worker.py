@@ -183,6 +183,7 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
 
     @torch.inference_mode()
     def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
+        self._mix_success_replay()
         proximal_values = self.rollout_batch.get("proximal_values", None)
         prev_values = self.rollout_batch.get("prev_values", None)
 
@@ -191,6 +192,10 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             "adv_type": self.cfg.algorithm.adv_type,
             "rewards": self.rollout_batch["rewards"],
             "dones": self.rollout_batch["dones"],
+            "terminations": self.rollout_batch.get("terminations", None),
+            "bootstrap_truncation": bool(
+                self.cfg.algorithm.get("bootstrap_truncation", False)
+            ),
             "values": proximal_values if proximal_values is not None else prev_values,
             "gamma": self.cfg.algorithm.get("gamma", 1),
             "gae_lambda": self.cfg.algorithm.get("gae_lambda", 1),
@@ -198,13 +203,32 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
             "reward_type": self.cfg.algorithm.reward_type,
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
+            "advantage_baseline": self.cfg.algorithm.get("advantage_baseline", None),
+            "zero_failure_prefix": self.cfg.algorithm.get(
+                "zero_failure_prefix", False
+            ),
+            "advantage_after_reach": self.cfg.algorithm.get(
+                "advantage_after_reach", False
+            ),
+            "reach_chunk_reward_min": self.cfg.algorithm.get(
+                "reach_chunk_reward_min", 0.1
+            ),
             "success_return_threshold": self.cfg.algorithm.get(
                 "success_return_threshold", 0.8
             ),
             "success_chunk_reward_min": self.cfg.algorithm.get(
                 "success_chunk_reward_min", 0.0
             ),
+            "isolate_failure_terminal": bool(
+                self.cfg.algorithm.get("isolate_failure_terminal", False)
+            ),
+            "failure_advantage_scale": self.cfg.algorithm.get(
+                "failure_advantage_scale", None
+            ),
             "success_advantage": self.cfg.algorithm.get("success_advantage", 0.5),
+            "miss_advantage_fraction": self.cfg.algorithm.get(
+                "miss_advantage_fraction", 0.5
+            ),
             "approach_advantage": self.cfg.algorithm.get("approach_advantage", 0.0),
             "approach_return_max": self.cfg.algorithm.get("approach_return_max", 0.2),
             "speed_horizon_chunks": self.cfg.algorithm.get(
@@ -459,6 +483,12 @@ class AsyncPPOEmbodiedFSDPActor(EmbodiedFSDPActor):
                         ),
                         "trust_log_ratio_max": self.cfg.algorithm.get(
                             "trust_log_ratio_max", None
+                        ),
+                        "positive_advantage_only": bool(
+                            self.cfg.algorithm.get("positive_advantage_only", False)
+                        ),
+                        "hold_policy_update": bool(
+                            getattr(self, "_hold_policy", False)
                         ),
                     }
 

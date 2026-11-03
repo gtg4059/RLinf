@@ -15,6 +15,7 @@
 import math
 import random
 from collections.abc import Sequence
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -31,6 +32,7 @@ from torch.utils._pytree import tree_map
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
 from rlinf.models.embodiment.modules.explore_noise_net import ExploreNoiseNet
 from rlinf.models.embodiment.modules.value_head import ValueHead
+from rlinf.models.embodiment.openpi.rollout_eval import use_rollout_eval_mode
 from rlinf.models.embodiment.openpi.rtc_guidance import (
     RTCGuidanceContext,
 )
@@ -766,18 +768,25 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         images = [img.to(device) for img in images]
         img_masks = [img_mask.to(device) for img_mask in img_masks]
         state = state.to(device)
-        # get log prob
-        log_probs, value_t, entropy = self.get_log_prob_value(
-            images,
-            img_masks,
-            lang_tokens,
-            lang_masks,
-            state,
-            chains,
-            denoise_inds,
-            compute_values,
-            cri=cri,
+        # get log prob. align_rollout_mean recomputes the flow-SDE gaussian in
+        # eval mode, the same mode the rollout used when it stored the chain.
+        logprob_ctx = (
+            use_rollout_eval_mode(self)
+            if bool(getattr(self.config, "align_rollout_mean", False))
+            else nullcontext()
         )
+        with logprob_ctx:
+            log_probs, value_t, entropy = self.get_log_prob_value(
+                images,
+                img_masks,
+                lang_tokens,
+                lang_masks,
+                state,
+                chains,
+                denoise_inds,
+                compute_values,
+                cri=cri,
+            )
         log_probs = log_probs[
             :, :, : self.config.action_chunk, : self.config.action_env_dim
         ]

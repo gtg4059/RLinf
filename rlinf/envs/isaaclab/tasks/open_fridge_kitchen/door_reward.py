@@ -111,9 +111,9 @@ def cri_limit_near_handle(
     Args:
         distance: Gripper-to-handle distance in meters, shape ``(N,)``.
         segment_valid: True where the handle segment has nonzero length.
-        base_limit: CRI rewind level away from the handle.
+        base_limit: CRI reset level away from the handle.
         near_distance_m: Inclusive radius around the handle bar, in meters.
-        near_limit: CRI rewind level inside that radius.
+        near_limit: CRI reset level inside that radius.
 
     Returns:
         Per-env CRI limits, shape ``(N,)``.
@@ -123,25 +123,6 @@ def cri_limit_near_handle(
     )
     limits = torch.full_like(distance.reshape(-1), float(base_limit))
     return torch.where(near, limits.new_tensor(float(near_limit)), limits)
-
-
-def waive_cri_penalty_near_handle(
-    penalty: torch.Tensor,
-    distance: torch.Tensor,
-    segment_valid: torch.Tensor,
-    *,
-    near_distance_m: float,
-) -> torch.Tensor:
-    """Zero the CRI penalty inside the handle radius.
-
-    A missing handle prim reports distance 0 and stays charged. Rows inside
-    ``near_distance_m`` pay nothing, whatever their CRI is.
-    """
-    near = segment_valid.reshape(-1).bool() & (
-        distance.reshape(-1) <= float(near_distance_m)
-    )
-    term = torch.as_tensor(penalty, dtype=torch.float32)
-    return torch.where(near.to(device=term.device), torch.zeros_like(term), term)
 
 
 def handle_reach_distance(
@@ -402,6 +383,113 @@ def gripper_past_handle(
     )
 
 
+# Positive distance reward reaches 0 at 40 cm and stays 0 past that.
+EE_BAR_DISTANCE_BONUS_MAX_M = 0.4
+
+
+def ee_bar_distance_bonus(
+    distance: torch.Tensor,
+    weight: float,
+    max_distance_m: float = EE_BAR_DISTANCE_BONUS_MAX_M,
+) -> torch.Tensor:
+    """Pay ``weight`` per meter of closeness, and 0 past ``max_distance_m``.
+
+    ``weight`` is the pre-exp linear scale, per meter per step. On the bar
+    the step pays ``weight * max_distance_m``. At 40 cm with weight 0.0025
+    that is 0.001, so 600 steps on the bar sum to 0.6, below the sparse
+    success bonus. A gap of 40 cm or more pays 0.
+
+    Args:
+        distance: Meters to the handle segment, shape ``(N,)``.
+        weight: Reward per meter inside the cutoff.
+        max_distance_m: Gap at which the bonus reaches 0, in meters.
+
+    Returns:
+        Step reward, shape ``(N,)``.
+    """
+    gap = distance.reshape(-1).clamp(min=0.0)
+    remaining = (float(max_distance_m) - gap).clamp(min=0.0)
+    return float(weight) * remaining
+
+
+def capped_cri_penalty(
+    exceed_chunks: torch.Tensor,
+    chunk_penalty: float,
+    max_abs: float = 1.0,
+) -> torch.Tensor:
+    """CRI charge of ``chunk_penalty`` per chunk, stopped at ``-max_abs``.
+
+    Five chunks at −0.2 is −1. Chunks past that do not make it lower.
+
+    Args:
+        exceed_chunks: Chunks in this attempt that crossed, shape ``(N,)``.
+        chunk_penalty: Amount per chunk. Negative.
+        max_abs: Largest charge magnitude. ``1`` with −0.2 stops at five chunks.
+
+    Returns:
+        Charge in ``[-max_abs, 0]``, shape ``(N,)``.
+    """
+    counts = torch.as_tensor(exceed_chunks, dtype=torch.float32).reshape(-1)
+    step = abs(float(chunk_penalty))
+    if step == 0.0:
+        return torch.zeros_like(counts)
+    cap = float(max_abs) / step
+    used = counts.clamp(min=0.0, max=cap)
+    return -step * used
+
+
+def success_pay_after_cri(
+    success_bonus: float | torch.Tensor,
+    exceed_chunks: torch.Tensor,
+    chunk_penalty: float,
+) -> torch.Tensor:
+    """Reduce the success payment by each chunk that crossed the CRI limit.
+
+    ``chunk_penalty`` is negative. The result stays at or above 0, so the
+    discount changes the success reward and is not written on the
+    exceeding step.
+
+    Args:
+        success_bonus: Payment before the CRI discount. A scalar or ``(N,)``.
+        exceed_chunks: How many chunks in this attempt crossed, shape ``(N,)``.
+        chunk_penalty: Amount added per exceeding chunk.
+
+    Returns:
+        Success payment, shape ``(N,)``.
+    """
+    counts = torch.as_tensor(exceed_chunks, dtype=torch.float32).reshape(-1)
+    bonus = torch.as_tensor(
+        success_bonus, dtype=torch.float32, device=counts.device
+    )
+    if bonus.ndim == 0:
+        bonus = bonus.expand_as(counts)
+    else:
+        bonus = bonus.reshape(-1)
+    return (bonus + float(chunk_penalty) * counts).clamp(min=0.0)
+
+
+def sparse_success_reward(
+    success_bonus: float,
+    elapsed_steps: torch.Tensor,
+    time_cost: float,
+) -> torch.Tensor:
+    """Sparse success bonus with the elapsed time taken out of it.
+
+    ``elapsed_steps`` is the count before this step, so the success step
+    itself is included. The result stays at or above 0.
+
+    Args:
+        success_bonus: Payment before the time deduction.
+        elapsed_steps: Steps already taken in this episode, shape ``(N,)``.
+        time_cost: Amount removed per step, including the success step.
+
+    Returns:
+        Bonus for an env that opens on this step, shape ``(N,)``.
+    """
+    steps = elapsed_steps.reshape(-1).to(dtype=torch.float32) + 1.0
+    return (float(success_bonus) - float(time_cost) * steps).clamp(min=0.0)
+
+
 def ee_bar_distance_penalty(
     distance: torch.Tensor,
     weight: float = ISAAC_EE_POSITION_STEP_WEIGHT,
@@ -452,10 +540,78 @@ def repeat_open_crossing(
     return fresh & (opened | done)
 
 
+# 0 rad pays the full step weight. 0.2 rad pays 0. Past that the factor
+# stays 0, so a negative weight cannot flip into a bonus.
+CLOSED_HINGE_FULL_RAD = 0.2
+
+
+def closed_hinge_penalty(
+    angle_rad: torch.Tensor,
+    weight: float = -0.00025,
+    full_open_rad: float = CLOSED_HINGE_FULL_RAD,
+) -> torch.Tensor:
+    """Pay ``weight * max(0, 1 - angle_rad / full_open_rad)`` per step.
+
+    With the default 0.2 rad span this is ``weight * max(0, 1 - 5 * angle)``.
+    ``weight`` is the charge at a shut door (negative). At ``full_open_rad``
+    and beyond the term is 0.
+
+    Args:
+        angle_rad: Hinge angle from the closed limit, radians, shape ``(N,)``.
+        weight: Step scale at 0 rad.
+        full_open_rad: Angle where the factor reaches 0.
+
+    Returns:
+        Step reward, shape ``(N,)``.
+    """
+    angle = angle_rad.reshape(-1).to(dtype=torch.float32)
+    span = float(full_open_rad)
+    if span <= 0.0:
+        factor = torch.zeros_like(angle)
+    else:
+        factor = (1.0 - angle / span).clamp(min=0.0)
+    return float(weight) * factor
+
+
+def unopened_timeout_mask(
+    elapsed_steps: torch.Tensor,
+    max_episode_steps: int,
+    opened: torch.Tensor,
+) -> torch.Tensor:
+    """True only on the step an unopened episode first hits its own limit.
+
+    Later steps stay past the limit when auto-reset is off, and those do
+    not match. An episode that already opened, including an open on this
+    step, does not match. A rollout cutoff before the limit does not match.
+
+    Args:
+        elapsed_steps: Steps taken in the current episode, shape ``(N,)``.
+        max_episode_steps: This split's horizon.
+        opened: True where this episode has crossed the open threshold.
+
+    Returns:
+        ``(N,)`` bool.
+    """
+    at_limit = elapsed_steps.reshape(-1) == int(max_episode_steps)
+    return at_limit & ~opened.reshape(-1).bool()
+
+
 def success_crossing(
     openness: torch.Tensor,
     already_succeeded: torch.Tensor,
     threshold: float = 0.2,
+    incoming_done: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """True on the first step where openness is strictly above ``threshold``."""
-    return (openness > float(threshold)) & ~already_succeeded.bool()
+    """True on the first step that opens the door.
+
+    Isaac's success term resets the hinge shut before this step's
+    observation is read, so ``openness`` can already be closed.
+    ``incoming_done`` is that success termination, taken before a later
+    CRI failure is added. A row that already succeeded does not cross again.
+    """
+    fresh = ~already_succeeded.reshape(-1).bool()
+    opened = openness.reshape(-1) > float(threshold)
+    if incoming_done is None:
+        return opened & fresh
+    done = incoming_done.reshape(-1).bool()
+    return fresh & (opened | done)

@@ -178,10 +178,10 @@ def test_train_script_scales_envs_to_visible_gpus() -> None:
     )
     assert completed.returncode == 0, completed.stderr
     assert "VISIBLE_GPUS=8" in completed.stdout
-    assert "env.train.total_num_envs=512" in completed.stdout
+    assert "env.train.total_num_envs=640" in completed.stdout
     assert "env.eval.total_num_envs=32" in completed.stdout
-    assert "HORIZON_STEPS=600" in completed.stdout
-    assert "actor.global_batch_size=20480" in completed.stdout
+    assert "HORIZON_STEPS=450" in completed.stdout
+    assert "actor.global_batch_size=19200" in completed.stdout
 
 
 def test_train_script_honors_explicit_env_count() -> None:
@@ -207,8 +207,8 @@ def test_train_script_honors_explicit_env_count() -> None:
     assert "env.train.total_num_envs=16" in completed.stdout
     assert "env.train.total_num_envs=128" not in completed.stdout
     assert "env.eval.total_num_envs=8" in completed.stdout
-    # 16 envs / 2 GPUs * (600/15) chunks. Batch follows the env override.
-    assert "actor.global_batch_size=640" in completed.stdout
+    # 16 envs / 2 GPUs * (450/15) chunks. Batch follows the env override.
+    assert "actor.global_batch_size=480" in completed.stdout
 
 
 def test_train_script_rejects_unknown_config() -> None:

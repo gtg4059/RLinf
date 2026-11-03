@@ -21,6 +21,223 @@ from rlinf.algorithms.utils import kl_penalty, safe_normalize
 from rlinf.utils.utils import masked_mean
 
 
+def _distributed_mean(values: torch.Tensor) -> torch.Tensor:
+    """Mean of ``values`` across ranks when distributed is initialized.
+
+    The default process group is NCCL, so the reduction runs on the current
+    CUDA device even when ``values`` were gathered on CPU. The scalar comes
+    back on ``values``' device.
+    """
+    total = values.detach().to(dtype=torch.float32).sum()
+    count = torch.tensor(
+        float(values.numel()), device=total.device, dtype=torch.float32
+    )
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        reduce_device = total.device
+        if reduce_device.type == "cpu" and torch.cuda.is_available():
+            reduce_device = torch.device("cuda", torch.cuda.current_device())
+        total = total.to(reduce_device)
+        count = count.to(reduce_device)
+        torch.distributed.all_reduce(total)
+        torch.distributed.all_reduce(count)
+    mean = total / count.clamp(min=1.0)
+    return mean.to(device=values.device, dtype=values.dtype)
+
+
+def _center_by_episode_return(
+    returns: torch.Tensor,
+    dones: torch.Tensor,
+    loss_mask: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Subtract the mean episode return from every return-to-go.
+
+    An episode starts at step 0 and again on the step after a done. The
+    baseline is the mean of those start returns, so a long miss does not
+    outweigh a short open just by having more chunks. The critic target
+    stays the uncentered return.
+    """
+    steps = returns.shape[0]
+    ended = dones[1 : 1 + steps].bool()
+    if ended.shape != returns.shape:
+        raise ValueError(
+            "dones steps "
+            f"{tuple(ended.shape)} do not match returns {tuple(returns.shape)}"
+        )
+    start = torch.zeros_like(ended)
+    start[0] = True
+    if steps > 1:
+        start[1:] = ended[:-1]
+    if loss_mask is not None:
+        start = start & loss_mask.bool()
+    selected = returns[start]
+    if selected.numel() == 0 and not (
+        torch.distributed.is_available() and torch.distributed.is_initialized()
+    ):
+        return returns
+    baseline = _distributed_mean(selected)
+    return returns - baseline.to(device=returns.device, dtype=returns.dtype)
+
+
+def _zero_unopened_prefix(
+    advantages: torch.Tensor,
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    success_chunk_reward_min: float,
+    reach_chunk_reward_min: float,
+) -> torch.Tensor:
+    """Zero a miss's actor advantage before the door first moves.
+
+    A chunk reward above ``success_chunk_reward_min`` marks that attempt as
+    a success, and its advantages stay. On a miss, chunks before the first
+    reward above ``reach_chunk_reward_min`` become 0. The move chunk and
+    the chunks after it keep the centered advantage. A miss that never
+    moves the door is all zeros. This does not change the critic target.
+
+    Args:
+        advantages: Centered actor advantages, shape ``[n_steps, batch]``.
+        rewards: Per-chunk rewards, same shape as ``advantages``.
+        dones: Done flags with one leading bootstrap row.
+        success_chunk_reward_min: Chunk reward that marks an open.
+        reach_chunk_reward_min: Chunk reward that marks the first door move.
+            Must be below ``success_chunk_reward_min``.
+
+    Returns:
+        Advantages with the unopened miss prefix set to 0.
+    """
+    if float(reach_chunk_reward_min) >= float(success_chunk_reward_min):
+        raise ValueError(
+            "reach_chunk_reward_min must be below success_chunk_reward_min, "
+            f"got {reach_chunk_reward_min} and {success_chunk_reward_min}."
+        )
+    steps = advantages.shape[0]
+    ended = dones[1 : 1 + steps].bool()
+    if ended.shape != advantages.shape or rewards.shape != advantages.shape:
+        raise ValueError(
+            "advantage shape "
+            f"{tuple(advantages.shape)} does not match rewards "
+            f"{tuple(rewards.shape)} or dones steps {tuple(ended.shape)}."
+        )
+    attempt = _attempt_index(ended)
+    opened = rewards > float(success_chunk_reward_min)
+    moved = rewards > float(reach_chunk_reward_min)
+    out = advantages
+    n_attempts = int(attempt.max().item()) + 1 if steps else 0
+    for attempt_id in range(n_attempts):
+        in_attempt = attempt == attempt_id
+        if not bool(in_attempt.any()):
+            continue
+        miss = in_attempt.any(dim=0) & ~(opened & in_attempt).any(dim=0)
+        if not bool(miss.any()):
+            continue
+        seen = (moved & in_attempt).to(dtype=torch.long).cumsum(dim=0)
+        prefix = in_attempt & (seen == 0) & miss.unsqueeze(0)
+        out = torch.where(prefix, torch.zeros_like(out), out)
+    return out
+
+
+def _zero_before_reach(
+    advantages: torch.Tensor,
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    reach_chunk_reward_min: float,
+    success_chunk_reward_min: Optional[float] = None,
+) -> torch.Tensor:
+    """Zero every attempt's actor advantage before the door first moves.
+
+    The move chunk and the chunks after it keep their advantage. When
+    ``success_chunk_reward_min`` is set, only an attempt that opens has
+    its prefix zeroed, so a miss keeps the grasp reward. Otherwise a
+    trajectory that never moves the door is all zeros. Returns are unchanged.
+
+    Args:
+        advantages: Actor advantages, shape ``[n_steps, batch]``.
+        rewards: Per-chunk rewards, same shape as ``advantages``.
+        dones: Done flags with one leading bootstrap row.
+        reach_chunk_reward_min: Chunk reward that marks the first door move.
+        success_chunk_reward_min: When set, only attempts that open are masked.
+
+    Returns:
+        Advantages with the pre-move prefix set to 0.
+    """
+    steps = advantages.shape[0]
+    ended = dones[1 : 1 + steps].bool()
+    if ended.shape != advantages.shape or rewards.shape != advantages.shape:
+        raise ValueError(
+            "advantage shape "
+            f"{tuple(advantages.shape)} does not match rewards "
+            f"{tuple(rewards.shape)} or dones steps {tuple(ended.shape)}."
+        )
+    attempt = _attempt_index(ended)
+    moved = rewards > float(reach_chunk_reward_min)
+    opened = None
+    if success_chunk_reward_min is not None:
+        opened = rewards > float(success_chunk_reward_min)
+    out = advantages
+    n_attempts = int(attempt.max().item()) + 1 if steps else 0
+    for attempt_id in range(n_attempts):
+        in_attempt = attempt == attempt_id
+        if not bool(in_attempt.any()):
+            continue
+        seen = (moved & in_attempt).to(dtype=torch.long).cumsum(dim=0)
+        prefix = in_attempt & (seen == 0)
+        if opened is not None:
+            is_open = (opened & in_attempt).any(dim=0)
+            prefix = prefix & is_open.unsqueeze(0)
+        out = torch.where(prefix, torch.zeros_like(out), out)
+    return out
+
+
+def _scale_unopened_advantages(
+    advantages: torch.Tensor,
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    success_chunk_reward_min: float,
+    scale: float,
+) -> torch.Tensor:
+    """Multiply a miss attempt's actor advantage by ``scale``.
+
+    An attempt with any chunk above ``success_chunk_reward_min`` keeps its
+    advantage. The critic target is unchanged.
+
+    Args:
+        advantages: Actor advantages, shape ``[n_steps, batch]``.
+        rewards: Per-chunk rewards, same shape as ``advantages``.
+        dones: Done flags with one leading bootstrap row.
+        success_chunk_reward_min: Chunk reward that marks an open.
+        scale: Fraction in ``[0, 1]`` applied to every miss chunk.
+
+    Returns:
+        Advantages with miss attempts scaled.
+    """
+    scale_f = float(scale)
+    if scale_f < 0.0 or scale_f > 1.0:
+        raise ValueError(
+            f"failure_advantage_scale must be in [0, 1], got {scale_f}."
+        )
+    steps = advantages.shape[0]
+    ended = dones[1 : 1 + steps].bool()
+    if ended.shape != advantages.shape or rewards.shape != advantages.shape:
+        raise ValueError(
+            "advantage shape "
+            f"{tuple(advantages.shape)} does not match rewards "
+            f"{tuple(rewards.shape)} or dones steps {tuple(ended.shape)}."
+        )
+    attempt = _attempt_index(ended)
+    opened = rewards > float(success_chunk_reward_min)
+    out = advantages
+    n_attempts = int(attempt.max().item()) + 1 if steps else 0
+    for attempt_id in range(n_attempts):
+        in_attempt = attempt == attempt_id
+        if not bool(in_attempt.any()):
+            continue
+        miss = in_attempt.any(dim=0) & ~(opened & in_attempt).any(dim=0)
+        if not bool(miss.any()):
+            continue
+        mask = in_attempt & miss.unsqueeze(0)
+        out = torch.where(mask, out * scale_f, out)
+    return out
+
+
 @register_advantage("gae")
 def compute_gae_advantages_and_returns(
     rewards: torch.Tensor,
@@ -58,28 +275,115 @@ def compute_gae_advantages_and_returns(
     returns = torch.zeros_like(rewards)
     gae = 0
 
+    baseline = kwargs.get("advantage_baseline", None)
+    if baseline not in (None, "none", "batch_mean"):
+        raise ValueError(
+            f"advantage_baseline must be none or batch_mean, got {baseline!r}."
+        )
+    # batch_mean ignores the value head for the actor. Zeros keep gamma.
+    if baseline == "batch_mean":
+        if values is None:
+            values = torch.zeros(
+                (rewards.shape[0] + 1, *rewards.shape[1:]),
+                dtype=rewards.dtype,
+                device=rewards.device,
+            )
+        else:
+            values = torch.zeros_like(values)
+
     critic_free = values is None
     if critic_free:
         gae_lambda = 1
         gamma = 1
 
+    # Terminations (CRI reset, open) end the backup. A timeout is only a
+    # truncation: ``terminals`` stays false there so the final value remains.
+    cut = kwargs.get("terminals", dones)
+    if cut is None:
+        cut = dones
+    # A failure end (CRI reset) keeps its penalty on this chunk. The value
+    # and the advantage of that chunk do not enter earlier chunks. A success
+    # above ``success_chunk_reward_min`` still backs up. A timeout is not a
+    # cut, so its final value still bootstraps.
+    isolate_failure = bool(kwargs.get("isolate_failure_terminal", False))
+    success_min = float(kwargs.get("success_chunk_reward_min", 0.5))
+    block = torch.zeros(
+        rewards.shape[1:], dtype=torch.bool, device=rewards.device
+    )
+
     for step in reversed(range(T)):
+        bootstrap = ~cut[step + 1]
+        if isolate_failure:
+            bootstrap = bootstrap & ~block
         if critic_free:
             delta = rewards[step]
         else:
             delta = (
                 rewards[step]
-                + gamma * values[step + 1] * (~dones[step + 1])
+                + gamma * values[step + 1] * bootstrap
                 - values[step]
             )
 
-        gae = delta + gamma * gae_lambda * (~dones[step + 1]) * gae
+        gae = delta + gamma * gae_lambda * bootstrap * gae
         returns[step] = gae if critic_free else gae + values[step]
+        if isolate_failure:
+            ended = cut[step + 1]
+            if ended.dtype != torch.bool:
+                ended = ended != 0
+            while ended.ndim > rewards[step].ndim and ended.shape[-1] == 1:
+                ended = ended.squeeze(-1)
+            failed = ended & (rewards[step] <= success_min)
+            block = failed
+            gae = torch.where(failed, torch.zeros_like(gae), gae)
 
     advantages = returns - values[:-1] if not critic_free else returns
+    if baseline == "batch_mean":
+        advantages = _center_by_episode_return(returns, dones, loss_mask)
 
     if normalize_advantages:
         advantages = safe_normalize(advantages, loss_mask=loss_mask)
+    scale = kwargs.get("failure_advantage_scale", None)
+    scale_misses = scale is not None and float(scale) != 1.0
+    if kwargs.get("zero_failure_prefix", False) or kwargs.get(
+        "advantage_after_reach", False
+    ):
+        if dones is None:
+            raise ValueError("reach advantage masking requires dones.")
+        reach_min = float(kwargs.get("reach_chunk_reward_min", 0.1))
+        if kwargs.get("advantage_after_reach", False):
+            advantages = _zero_before_reach(
+                advantages,
+                rewards,
+                dones,
+                reach_min,
+                success_chunk_reward_min=(
+                    float(kwargs.get("success_chunk_reward_min", 0.5))
+                    if scale_misses
+                    else None
+                ),
+            )
+        elif kwargs.get("zero_failure_prefix", False):
+            advantages = _zero_unopened_prefix(
+                advantages,
+                rewards,
+                dones,
+                success_chunk_reward_min=float(
+                    kwargs.get("success_chunk_reward_min", 0.5)
+                ),
+                reach_chunk_reward_min=reach_min,
+            )
+    if scale_misses:
+        if dones is None:
+            raise ValueError("failure advantage scaling requires dones.")
+        advantages = _scale_unopened_advantages(
+            advantages,
+            rewards,
+            dones,
+            success_chunk_reward_min=float(
+                kwargs.get("success_chunk_reward_min", 0.5)
+            ),
+            scale=float(scale),
+        )
     if normalize_returns:
         returns = safe_normalize(returns, loss_mask=loss_mask)
 
@@ -491,6 +795,45 @@ def _return_to_go_by_attempt(
     return remaining
 
 
+def _keep_finished_after_success(
+    rewards: torch.Tensor,
+    ended: torch.Tensor,
+    trainable: torch.Tensor,
+    success_min: float,
+) -> torch.Tensor:
+    """Drop an attempt that follows a success and never finishes.
+
+    A finish is this attempt's own open, or a done that is not that open
+    (the timeout). The rollout ending the attempt early is neither, so
+    those steps leave the loss and the mean. Their time penalty is already
+    0. The open that came before stays. A miss that starts the horizon
+    stays, including its penalty.
+    """
+    if rewards.numel() == 0:
+        return trainable
+    attempt = _attempt_index(ended)
+    opened = rewards > float(success_min)
+    n_attempts = int(attempt.max().item()) + 1
+    success_rows = []
+    closed_rows = []
+    for attempt_id in range(n_attempts):
+        in_attempt = attempt == attempt_id
+        success_rows.append((opened & in_attempt).any(dim=0))
+        closed_rows.append((ended & in_attempt).any(dim=0))
+    success_mat = torch.stack(success_rows, dim=0)
+    closed_mat = torch.stack(closed_rows, dim=0)
+    prior_success = torch.zeros_like(success_mat)
+    if n_attempts > 1:
+        prior_success[1:] = success_mat.cumsum(dim=0)[:-1] > 0
+    drop_attempt = prior_success & ~success_mat & ~closed_mat
+    drop = torch.zeros_like(trainable)
+    for attempt_id in range(n_attempts):
+        drop = drop | (
+            (attempt == attempt_id) & drop_attempt[attempt_id].view(1, -1)
+        )
+    return trainable & ~drop
+
+
 def _center_selected(values: torch.Tensor, selected: torch.Tensor) -> torch.Tensor:
     """Subtract the per-step mean of the selected batch entries."""
     selected_f = selected.to(dtype=values.dtype)
@@ -505,6 +848,7 @@ def compute_grouped_return_advantages(
     rewards: torch.Tensor,
     loss_mask: torch.Tensor | None = None,
     success_chunk_reward_min: float = 0.5,
+    outcome_groups: bool = True,
     **kwargs,
 ) -> tuple[torch.Tensor, None]:
     """Center each attempt's return-to-go inside its own outcome group.
@@ -525,6 +869,7 @@ def compute_grouped_return_advantages(
             per-chunk rewards arrive in ``step_rewards``.
         loss_mask: Optional trainable steps, shape ``[n_steps, batch]``.
         success_chunk_reward_min: Chunk reward that marks an open.
+        outcome_groups: When False, center every live attempt together.
 
     Returns:
         Advantages with shape ``[n_steps, batch]``, and no returns.
@@ -556,6 +901,8 @@ def compute_grouped_return_advantages(
     attempt = _attempt_index(ended)
     live_rewards = rewards_f * trainable.to(dtype=rewards_f.dtype)
     remaining = _return_to_go_by_attempt(live_rewards, ended)
+    if not outcome_groups:
+        return _center_selected(remaining, trainable), None
     opened_step = torch.zeros_like(ended)
     n_attempts = int(attempt.max().item()) + 1 if steps else 0
     open_mark = rewards_f > float(success_chunk_reward_min)
@@ -567,6 +914,205 @@ def compute_grouped_return_advantages(
     advantages = _center_selected(remaining, opened_step) + _center_selected(
         remaining, miss_step
     )
+    return advantages, None
+
+
+@register_advantage("global_return")
+def compute_global_return_advantages(
+    rewards: torch.Tensor,
+    loss_mask: torch.Tensor | None = None,
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+    """Center return-to-go across every live attempt.
+
+    Opens and misses share one mean at each chunk. The sparse bonus stays
+    in an open's return, so that open is positive against a miss. When the
+    open rate falls, those higher returns are still above the batch and the
+    policy can climb back. A batch of only misses ranks the higher return
+    above the lower one. An attempt that starts after an open and then
+    stops before its own open or timeout has its reward cleared to 0 and
+    is left out of the mean and the loss. A miss from the start stays.
+    There is no critic return.
+
+    Args:
+        rewards: Episode scores from ``calculate_scores``. Unused.
+        loss_mask: Optional trainable steps, shape ``[n_steps, batch]``.
+
+    Returns:
+        Advantages with shape ``[n_steps, batch]``, and no returns.
+    """
+    success_min = float(kwargs.pop("success_chunk_reward_min", 0.5))
+    step_rewards = kwargs.get("step_rewards")
+    dones = kwargs.get("dones")
+    if step_rewards is not None and dones is not None:
+        rewards_f = step_rewards.to(dtype=torch.float32)
+        ended = dones[1 : 1 + rewards_f.shape[0]].bool()
+        if ended.shape == rewards_f.shape:
+            if loss_mask is None:
+                trainable = torch.ones_like(ended)
+            else:
+                trainable = loss_mask.bool()
+            kept = _keep_finished_after_success(
+                rewards_f,
+                ended,
+                trainable,
+                success_min,
+            )
+            # The stored step reward of that tail is already 0. Zero the
+            # copy used for return-to-go as well, then drop the steps.
+            kwargs["step_rewards"] = torch.where(
+                kept.to(device=step_rewards.device),
+                step_rewards,
+                torch.zeros_like(step_rewards),
+            )
+            loss_mask = kept
+            step_loss_mask = kwargs.get("step_loss_mask")
+            if (
+                step_loss_mask is not None
+                and step_loss_mask.shape[:2] == kept.shape
+            ):
+                extra = step_loss_mask.ndim - 2
+                view = kept.view(*kept.shape, *([1] * extra))
+                step_loss_mask &= view.expand_as(step_loss_mask)
+    return compute_grouped_return_advantages(
+        rewards,
+        loss_mask=loss_mask,
+        outcome_groups=False,
+        success_chunk_reward_min=success_min,
+        **kwargs,
+    )
+
+
+@register_advantage("success_first")
+def compute_success_first_advantages(
+    rewards: torch.Tensor,
+    loss_mask: torch.Tensor | None = None,
+    success_chunk_reward_min: float = 0.5,
+    success_advantage: float = 0.5,
+    miss_advantage_fraction: float = 0.5,
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+    """Reinforce every open, then prefer the shorter open.
+
+    An attempt runs until its done. A chunk reward above
+    ``success_chunk_reward_min`` marks that attempt as a success. Every
+    success scores at least ``success_advantage``. Centering the attempt
+    return among successes at the same attempt index keeps the time gap,
+    so a shorter open scores higher, and the lowest open is lifted back to
+    ``success_advantage``. CRI resets share a negative budget of
+    ``miss_advantage_fraction`` times the success total, so the reward-0
+    resets are pulled toward an open but cannot outweigh the opens. A
+    batch with no open gives those resets zero. When ``terminals`` is set,
+    a horizon timeout is not a reset: its advantage stays 0 and it does
+    not take any of the miss budget. Either score is spread evenly over
+    the attempt, so a longer attempt does not gain weight just by having
+    more chunks. There is no critic return.
+
+    Args:
+        rewards: Episode scores from ``calculate_scores``. Unused; the
+            per-chunk rewards arrive in ``step_rewards``.
+        loss_mask: Optional trainable steps, shape ``[n_steps, batch]``.
+        success_chunk_reward_min: Chunk reward that marks an open.
+        success_advantage: Floor on a success attempt's total advantage.
+        miss_advantage_fraction: Share of the success total assigned to
+            CRI-reset attempts, split across those attempts. Clamped to
+            ``[0, 1]``.
+
+    Returns:
+        Advantages with shape ``[n_steps, batch]``, and no returns.
+    """
+    del rewards
+    step_rewards = kwargs.get("step_rewards")
+    dones = kwargs.get("dones")
+    if step_rewards is None:
+        raise ValueError("success_first advantages require step_rewards.")
+    if dones is None:
+        raise ValueError("success_first advantages require dones.")
+    rewards_f = step_rewards.to(dtype=torch.float32)
+    steps, _batch = rewards_f.shape
+    ended = dones[1 : 1 + steps].bool()
+    if ended.shape != rewards_f.shape:
+        raise ValueError(
+            "dones steps "
+            f"{tuple(ended.shape)} do not match rewards {tuple(rewards_f.shape)}"
+        )
+    # ``terminals`` marks a CRI reset or an open. A timeout is only in
+    # ``dones``. Without ``terminals``, every non-open attempt stays a miss.
+    terminals = kwargs.get("terminals")
+    if terminals is None:
+        cri_end = None
+    else:
+        cri_end = terminals[1 : 1 + steps].bool()
+        if cri_end.shape != rewards_f.shape:
+            raise ValueError(
+                "terminals steps "
+                f"{tuple(cri_end.shape)} do not match rewards "
+                f"{tuple(rewards_f.shape)}"
+            )
+    trainable = torch.ones_like(ended)
+    if loss_mask is not None:
+        trainable = loss_mask.bool()
+        if trainable.shape != rewards_f.shape:
+            raise ValueError(
+                "loss_mask shape "
+                f"{tuple(trainable.shape)} does not match rewards "
+                f"{tuple(rewards_f.shape)}"
+            )
+    attempt = _attempt_index(ended)
+    live_rewards = rewards_f * trainable.to(dtype=rewards_f.dtype)
+    open_mark = rewards_f > float(success_chunk_reward_min)
+    advantages = torch.zeros_like(rewards_f)
+    floor = rewards_f.new_tensor(float(success_advantage))
+    fraction = min(max(float(miss_advantage_fraction), 0.0), 1.0)
+    n_attempts = int(attempt.max().item()) + 1 if steps else 0
+    records: list[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+    ] = []
+    for attempt_id in range(n_attempts):
+        in_span = attempt == attempt_id
+        in_attempt = in_span & trainable
+        present = in_attempt.any(dim=0)
+        if not bool(present.any()):
+            continue
+        opened = (open_mark & in_attempt).any(dim=0)
+        # The reset step itself can be masked out of the loss. It still
+        # belongs to this attempt, so the CRI end is read on the full span.
+        if cri_end is None:
+            failed = present & ~opened
+        else:
+            failed = (
+                present
+                & ~opened
+                & (cri_end & in_span).any(dim=0)
+            )
+        score = torch.zeros(
+            rewards_f.shape[-1], dtype=rewards_f.dtype, device=rewards_f.device
+        )
+        if bool(opened.any()):
+            selected = opened.to(dtype=rewards_f.dtype)
+            attempt_return = (
+                live_rewards * in_attempt.to(dtype=rewards_f.dtype)
+            ).sum(dim=0)
+            count = selected.sum().clamp(min=1.0)
+            mean = (attempt_return * selected).sum() / count
+            centered = (attempt_return - mean) * selected
+            lifted = centered + (floor - centered[opened].min())
+            score = torch.where(opened, lifted, score)
+        records.append((in_attempt, present, opened, failed, score))
+    total_pos = rewards_f.new_zeros(())
+    n_miss = rewards_f.new_zeros(())
+    for _in_attempt, _present, _opened, failed, score in records:
+        total_pos = total_pos + score.sum()
+        n_miss = n_miss + failed.to(dtype=rewards_f.dtype).sum()
+    miss_each = rewards_f.new_zeros(())
+    if float(total_pos) > 0.0 and float(n_miss) > 0.0:
+        miss_each = -total_pos * fraction / n_miss
+    for in_attempt, _present, _opened, failed, score in records:
+        score = torch.where(failed, miss_each, score)
+        length = in_attempt.to(dtype=rewards_f.dtype).sum(dim=0).clamp(min=1.0)
+        advantages = advantages + in_attempt.to(dtype=rewards_f.dtype) * (
+            score / length
+        ).view(1, -1)
     return advantages, None
 
 

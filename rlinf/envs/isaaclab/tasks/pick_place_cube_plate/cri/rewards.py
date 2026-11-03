@@ -26,16 +26,19 @@ from .constants import TIME_PENALTY_WEIGHT
 
 
 def resolve_cri_exceed_mode(mode: str | None) -> str | None:
-    """Return ``soft``, ``hard``, or ``None`` when the trigger is unset.
+    """Return ``soft``, ``hard``, ``reset``, or ``None`` when unset.
 
     ``soft`` slows the arm near the CRI limit and adds the barrier penalty.
-    ``hard`` rewinds the arm to the last scene-reset pose and adds no penalty.
+    ``hard`` rewinds to the last scene-reset pose and drops that penalty.
+    ``reset`` ends the attempt, restores the scene, and leaves the reward at 0.
     """
     if mode is None:
         return None
     name = str(mode).strip().lower()
-    if name not in ("soft", "hard"):
-        raise ValueError(f"cri_exceed_mode must be 'soft' or 'hard', got {mode!r}")
+    if name not in ("soft", "hard", "reset"):
+        raise ValueError(
+            f"cri_exceed_mode must be 'soft', 'hard', or 'reset', got {mode!r}"
+        )
     return name
 
 
@@ -49,13 +52,18 @@ def cri_exceed_settings(
     """Resolve the exceedance trigger into rewind, termination, and penalty.
 
     An unset trigger leaves the three flags as configured. ``soft`` turns
-    rewind and termination off. ``hard`` rewinds and drops the penalty.
+    rewind off and keeps the penalty. Termination follows the flag, so a
+    failure can reset. ``hard`` rewinds, turns termination off, and drops
+    the dense penalty. ``reset`` turns rewind off, ends the attempt, and
+    drops the dense penalty so the trajectory reward stays 0.
     """
     resolved = resolve_cri_exceed_mode(mode)
     if resolved == "soft":
-        return resolved, False, False, float(penalty_weight)
+        return resolved, False, bool(termination), float(penalty_weight)
     if resolved == "hard":
         return resolved, True, False, 0.0
+    if resolved == "reset":
+        return resolved, False, True, 0.0
     return None, bool(boundary_rewind), bool(termination), float(penalty_weight)
 
 
@@ -72,7 +80,7 @@ def cri_ovf_exp(
     row. Returns a non-negative ``(B,)`` term: 0 at CRI=0, ~1 at ``limit``,
     then linear up to 1 at ``ovf_threshold``. Apply a negative reward weight.
     A row limit above ``ovf_threshold`` keeps the same linear span as the
-    scalar 0.96 limit, so a near-handle limit of 3 does not explode.
+    scalar 0.96 limit.
     """
     values = torch.as_tensor(cri, dtype=torch.float32)
     if values.ndim == 0:
@@ -210,6 +218,28 @@ def cri_ovf_violated(
     return values >= limit_t.reshape(values.shape)
 
 
+def apply_cri_chunk_penalty(
+    rewards: torch.Tensor,
+    exceeded: torch.Tensor,
+    penalty: float,
+) -> torch.Tensor:
+    """Add ``penalty`` once to each chunk that crossed the CRI limit.
+
+    ``rewards`` is ``[num_envs, chunk_steps]``. The charge is written on the
+    last step, so a chunk-level sum counts it one time even when several
+    steps in the chunk are over the limit.
+    """
+    charge = float(penalty)
+    if charge == 0.0:
+        return rewards
+    hit = exceeded.reshape(-1).bool()
+    if hit.shape[0] != rewards.shape[0] or not bool(hit.any()):
+        return rewards
+    out = rewards.clone()
+    out[hit, -1] = out[hit, -1] + charge
+    return out
+
+
 def cri_ovf_termination_step_penalty() -> float:
     """One-shot hard termination penalty: success step reward (dt * weight 1.0) / 3."""
     return float(CRI_OVF_TERM_PENALTY)
@@ -233,11 +263,11 @@ def time_penalty_live_mask(
 ) -> torch.Tensor:
     """Rows that still pay the living cost this step.
 
-    Charge until the first RLinf-cycle success. The success step still
-    pays (``success_once`` is updated after the reward). Leftover Isaac
-    episodes after that success do not. Frozen hold-after-done rows
-    also do not pay. ``until_horizon`` keeps the charge on every row
-    through the timeout, including after the door is open.
+    Charge until this attempt's success. The success step still pays
+    (``success_once`` is updated after the reward). A later attempt pays
+    again once that latch is cleared. Frozen hold-after-done rows do not
+    pay. ``until_horizon`` keeps the charge on every row through the
+    timeout, including after the door is open.
     """
     if device is None:
         if success_once is not None:
@@ -259,7 +289,28 @@ def time_penalty_live_mask(
 # Isaac Lab extras key: ``log["Episode_Reward/<term>"]`` is the episode sum
 # of ``weight * term``. TensorBoard shows it under ``env/Episode_Reward/``.
 CRI_OVF_REWARD_KEY: str = "Episode_Reward/cri_ovf"
+CRI_REWIND_REWARD_KEY: str = "Episode_Reward/cri_rewind"
 TIME_PENALTY_REWARD_KEY: str = "Episode_Reward/time_penalty"
+ACTION_RATE_REWARD_KEY: str = "Episode_Reward/action_rate"
+
+
+def cri_rewind_penalty_reward(
+    rewind: torch.Tensor, penalty: float
+) -> torch.Tensor:
+    """One charge of ``penalty`` on each row that rewound this step.
+
+    ``penalty`` is the step value, negative when a rewind should cost.
+    Rows that did not rewind pay 0.
+
+    Args:
+        rewind: ``(N,)`` bool, true on rows rewound this step.
+        penalty: Reward added once for each rewind.
+
+    Returns:
+        Step reward, shape ``(N,)``.
+    """
+    hit = rewind.reshape(-1).to(dtype=torch.float32)
+    return float(penalty) * hit
 
 
 def cri_ovf_reward(ovf: torch.Tensor, weight: float) -> torch.Tensor:
@@ -300,3 +351,17 @@ def accumulate_time_episode_reward(
 def time_episode_reward_logs(penalty_sum: torch.Tensor) -> dict[str, torch.Tensor]:
     """Isaac Lab-style episode time-penalty curve."""
     return {TIME_PENALTY_REWARD_KEY: penalty_sum.clone()}
+
+
+def action_rate_l2(action: torch.Tensor, prev_action: torch.Tensor) -> torch.Tensor:
+    """Squared L2 change of the command, matching IsaacLab ``action_rate_l2``.
+
+    Args:
+        action: Command this step, shape ``(N, A)``.
+        prev_action: Command last step, same shape.
+
+    Returns:
+        Non-negative rate, shape ``(N,)``.
+    """
+    delta = (action - prev_action).reshape(action.shape[0], -1)
+    return torch.sum(torch.square(delta), dim=-1)

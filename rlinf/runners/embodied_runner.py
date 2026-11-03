@@ -27,7 +27,11 @@ from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.logging import get_logger
 from rlinf.utils.metric_logger import MetricLogger
-from rlinf.utils.metric_utils import compute_evaluate_metrics, print_metrics_table
+from rlinf.utils.metric_utils import (
+    compute_evaluate_metrics,
+    displayed_global_step,
+    print_metrics_table,
+)
 from rlinf.utils.runner_utils import (
     check_progress,
     should_eval_at_start,
@@ -410,6 +414,9 @@ class EmbodiedRunner:
         env_results_list = [results for results in env_results if results is not None]
         env_metrics = compute_evaluate_metrics(env_results_list)
         env_metrics = {f"env/{k}": v for k, v in env_metrics.items()}
+        # Keep env/reward on the metric table's Global Step. The other series
+        # stay on the zero-based loop index.
+        env_reward = env_metrics.pop("env/reward", None)
         ranked_env_results = [
             {"rank": rank, "env": rank_metrics}
             for rank, rank_metrics in enumerate(env_results)
@@ -418,6 +425,10 @@ class EmbodiedRunner:
         _, env_metrics_per_rank = self._process_ranked_eval_results(
             ranked_env_results, metric_field="env"
         )
+        rank_rewards = [
+            metrics.pop("reward", None) if metrics else None
+            for metrics in env_metrics_per_rank
+        ]
 
         rollout_metrics = {
             f"rollout/{k}": v
@@ -429,6 +440,11 @@ class EmbodiedRunner:
         }
 
         self.metric_logger.log(env_metrics, step)
+        if env_reward is not None:
+            self.metric_logger.log(
+                {"env/reward": env_reward}, displayed_global_step(step)
+            )
+            env_metrics["env/reward"] = env_reward
         self.metric_logger.log(rollout_metrics, step)
         self.metric_logger.log(time_metrics, step)
         self.metric_logger.log(training_metrics, step)
@@ -468,6 +484,17 @@ class EmbodiedRunner:
             prefix="env",
             worker_group_name=self.env.worker_group_name,
         )
+        if self.enable_per_worker_metric_log:
+            reward_step = displayed_global_step(step)
+            for rank, reward in enumerate(rank_rewards):
+                if reward is None:
+                    continue
+                self.metric_logger.log(
+                    {"env/reward": reward},
+                    reward_step,
+                    worker_group_name=self.env.worker_group_name,
+                    rank=rank,
+                )
         if self.reward is not None:
             self._log_ranked_metrics(
                 metrics_list=reward_time_metrics_per_rank,

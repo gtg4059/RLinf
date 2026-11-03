@@ -326,6 +326,9 @@ class ObservationsCfg:
             },
         )
         door_openness = ObsTerm(func=mdp.fridge_door_openness)
+        # Radians from the closed limit. The closed-door penalty reads this.
+        # The policy state stays the 8-D joint vector.
+        door_angle_rad = ObsTerm(func=mdp.fridge_door_angle_rad)
         # Gripper xyz and the long handle centerline. Not fed to the policy.
         handle_reach = ObsTerm(func=mdp.fridge_handle_reach)
 
@@ -354,11 +357,11 @@ class EventCfg:
 
 @configclass
 class RewardsCfg:
-    """Sparse success reward (RLinf-style)."""
+    """No manager reward. RLinf adds the success bonus and the time penalty."""
 
     success = RewTerm(
         func=mdp.is_terminated_term,
-        weight=1.0,
+        weight=0.0,
         params={"term_keys": "success"},
     )
 

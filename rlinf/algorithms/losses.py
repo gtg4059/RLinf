@@ -261,6 +261,21 @@ def compute_ppo_actor_loss(
 
     if loss_mask is None:
         loss_mask = torch.ones_like(logprobs).bool()
+    # CRR: the policy climbs only above-mean chunks. The value loss keeps
+    # the original mask, and the KL term is applied by the caller on it too.
+    policy_mask = loss_mask
+    if kwargs.get("positive_advantage_only", False):
+        positive = (advantages > 0).bool()
+        while positive.ndim < loss_mask.ndim:
+            positive = positive.unsqueeze(-1)
+        if (
+            positive.ndim == loss_mask.ndim
+            and positive.shape[:-1] == loss_mask.shape[:-1]
+            and positive.shape[-1] != loss_mask.shape[-1]
+        ):
+            positive = positive.any(dim=-1, keepdim=True)
+        positive = torch.broadcast_to(positive, loss_mask.shape)
+        policy_mask = loss_mask.bool() & positive
 
     assert logprobs.dtype == torch.float32, (
         "logprobs must be float32 to keep numerical stability"
@@ -320,10 +335,10 @@ def compute_ppo_actor_loss(
             dual_clip_mask = torch.zeros_like(raw_clip_mask)
 
     metric_policy_loss_abs = loss_agg_func(
-        policy_loss.abs(), loss_mask, loss_mask_ratio
+        policy_loss.abs(), policy_mask, loss_mask_ratio
     )
     policy_loss = loss_agg_func(
-        policy_loss, loss_mask, loss_mask_ratio
+        policy_loss, policy_mask, loss_mask_ratio
     )  # default max_episode_steps is None
 
     dual_clip_mask = (dual_clip_mask * loss_mask).bool()
@@ -333,8 +348,9 @@ def compute_ppo_actor_loss(
 
     dual_cliped_ratio = torch.where(dual_clip_mask, ratio, 0)
 
-    if critic_warmup:
-        # Keep grad_fn so actor-only PPO can backward; scale is 0 so actor grads vanish.
+    if kwargs.get("hold_policy_update", False) or critic_warmup:
+        # Keep grad_fn so the backward still runs. Scale is 0, so a dropped
+        # reward does not move the policy. The value loss and KL stay.
         policy_loss = policy_loss * 0.0
 
     # Compile metrics for logging

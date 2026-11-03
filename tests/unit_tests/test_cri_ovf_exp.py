@@ -29,19 +29,30 @@ from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.rewards import (
     TIME_PENALTY_REWARD_KEY,
     accumulate_cri_episode_reward,
     accumulate_time_episode_reward,
+    apply_cri_chunk_penalty,
     apply_cri_soft_arm_limit,
     cri_episode_reward_logs,
     cri_exceed_linear,
     cri_exceed_settings,
     cri_ovf_exp,
     cri_ovf_reward,
+    cri_rewind_penalty_reward,
     cri_ovf_termination_step_penalty,
     cri_ovf_violated,
+    action_rate_l2,
     cri_soft_approach_scale,
     time_episode_reward_logs,
     time_penalty_live_mask,
     time_step_penalty,
 )
+
+
+def test_action_rate_l2_is_squared_command_change():
+    prev = torch.zeros(2, 3)
+    action = torch.tensor([[1.0, 0.0, 0.0], [0.0, 2.0, 0.0]])
+    rate = action_rate_l2(action, prev)
+    assert rate.tolist() == pytest.approx([1.0, 4.0])
+    assert (-0.05 * rate).tolist() == pytest.approx([-0.05, -0.2])
 
 
 def test_cri_ovf_exp_zero_at_rest():
@@ -92,20 +103,52 @@ def test_cri_exceed_linear_is_one_plus_excess_past_the_limit():
     assert float(per_row[1]) == pytest.approx(0.0)
 
 
+def test_cri_chunk_penalty_is_once_per_exceeding_chunk():
+    rewards = torch.tensor(
+        [
+            [0.1, 0.1, 0.1],
+            [0.2, 0.2, 0.2],
+            [0.0, 0.0, 0.0],
+        ]
+    )
+    charged = apply_cri_chunk_penalty(
+        rewards, torch.tensor([True, False, True]), -0.1
+    )
+    assert charged[0].sum().item() == pytest.approx(0.2)
+    assert charged[1].tolist() == pytest.approx([0.2, 0.2, 0.2])
+    assert charged[2].sum().item() == pytest.approx(-0.1)
+    assert charged[0, -1].item() == pytest.approx(0.0)
+    assert rewards[0].sum().item() == pytest.approx(0.3)
+    untouched = apply_cri_chunk_penalty(
+        rewards, torch.tensor([False, False, False]), -0.1
+    )
+    assert untouched is rewards
+
+
 def test_cri_exceed_mode_trigger():
     assert cri_exceed_settings(
         "soft", boundary_rewind=True, termination=True, penalty_weight=-0.01
-    ) == ("soft", False, False, -0.01)
+    ) == ("soft", False, True, -0.01)
     assert cri_exceed_settings(
         "hard", boundary_rewind=False, termination=True, penalty_weight=-0.01
     ) == ("hard", True, False, 0.0)
+    assert cri_exceed_settings(
+        "reset", boundary_rewind=True, termination=False, penalty_weight=-0.01
+    ) == ("reset", False, True, 0.0)
     assert cri_exceed_settings(
         None, boundary_rewind=True, termination=False, penalty_weight=0.0
     ) == (None, True, False, 0.0)
     with pytest.raises(ValueError):
         cri_exceed_settings(
-            "reset", boundary_rewind=True, termination=False, penalty_weight=0.0
+            "nope", boundary_rewind=True, termination=False, penalty_weight=0.0
         )
+
+
+def test_cri_rewind_penalty_charges_only_the_rewound_rows():
+    """Each rewind pays -0.1. A row that stays put pays nothing."""
+    rewind = torch.tensor([True, False, True])
+    charge = cri_rewind_penalty_reward(rewind, -0.1)
+    assert charge.tolist() == pytest.approx([-0.1, 0.0, -0.1])
 
 
 def test_cri_soft_approach_scale_slows_before_the_limit():

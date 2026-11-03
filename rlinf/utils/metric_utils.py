@@ -356,6 +356,31 @@ def omit_cri_limit_metric(env_info: dict) -> None:
     env_info.pop("cri_limit_outside", None)
 
 
+def values_aligned_to_returns(
+    prev_values: torch.Tensor,
+    returns: torch.Tensor | None,
+) -> torch.Tensor:
+    """Drop the bootstrap value so each V lines up with a return.
+
+    GAE keeps one extra value after the last chunk and subtracts
+    ``values[:-1]``. The logged value is that same prefix.
+
+    Args:
+        prev_values: Rollout value estimates. Time is axis 0.
+        returns: Per-chunk returns, or None when they are absent.
+
+    Returns:
+        Values with the same time length as ``returns`` when the extra
+        bootstrap row is present.
+    """
+    if (
+        isinstance(returns, torch.Tensor)
+        and prev_values.shape[0] == returns.shape[0] + 1
+    ):
+        return prev_values[:-1]
+    return prev_values
+
+
 def align_loss_mask(loss_mask: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
     """Match a loss mask to ``values`` for metric reductions.
 
@@ -380,6 +405,70 @@ def align_loss_mask(loss_mask: torch.Tensor, values: torch.Tensor) -> torch.Tens
     if mask.shape != values.shape:
         mask = torch.broadcast_to(mask, values.shape)
     return mask
+
+
+def finished_episode_returns(
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    success_min: float = 0.5,
+) -> torch.Tensor:
+    """Sum every configured step reward inside each finished attempt.
+
+    A short open keeps a smaller time penalty than a long open, and the
+    success bonus stays in the same sum. An attempt that starts after an
+    open and then reaches neither its own open nor a timeout is left out.
+    A timeout that never opens keeps its penalty.
+
+    Args:
+        rewards: Step rewards, ``[n_steps, batch]`` or
+            ``[n_chunks, batch, chunk]``.
+        dones: Done flags aligned with ``rewards``, or one bootstrap row
+            longer on the time axis.
+        success_min: A step above this counts as the open.
+
+    Returns:
+        One return per kept attempt, shape ``[n_episodes]``.
+    """
+    rewards = rewards.detach().to(dtype=torch.float32)
+    dones = dones.detach().bool()
+    if rewards.ndim == 3:
+        if dones.shape[0] == rewards.shape[0] + 1:
+            dones = dones[1:]
+        if dones.shape[-1] == 1 and rewards.shape[-1] > 1:
+            dones = dones.expand_as(rewards)
+        rewards = rewards.transpose(1, 2).reshape(-1, rewards.shape[1])
+        dones = dones.transpose(1, 2).reshape(-1, dones.shape[1])
+    elif dones.shape[0] == rewards.shape[0] + 1:
+        dones = dones[1:]
+    if rewards.ndim != 2 or dones.shape != rewards.shape:
+        raise ValueError(
+            f"rewards shape {tuple(rewards.shape)} does not match "
+            f"dones shape {tuple(dones.shape)}"
+        )
+    steps, _batch = rewards.shape
+    if steps == 0:
+        return rewards.new_zeros(0)
+    attempt = dones.long().cumsum(dim=0) - dones.long()
+    n_attempts = int(attempt.max().item()) + 1
+    prior_open = torch.zeros(
+        rewards.shape[-1], dtype=torch.bool, device=rewards.device
+    )
+    kept: list[torch.Tensor] = []
+    for attempt_id in range(n_attempts):
+        in_attempt = attempt == attempt_id
+        present = in_attempt.any(dim=0)
+        if not bool(present.any()):
+            continue
+        opened = ((rewards > float(success_min)) & in_attempt).any(dim=0)
+        closed = (dones & in_attempt).any(dim=0)
+        keep = present & ~(prior_open & ~(opened | closed))
+        if bool(keep.any()):
+            total = (rewards * in_attempt.to(dtype=rewards.dtype)).sum(dim=0)
+            kept.append(total[keep])
+        prior_open = prior_open | opened
+    if not kept:
+        return rewards.new_zeros(0)
+    return torch.cat(kept)
 
 
 def compute_rollout_metrics(data_buffer: dict) -> dict:
@@ -436,6 +525,11 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
         rewards_metrics = {
             "rewards": mean_rewards,
         }
+        dones = data_buffer.get("dones", None)
+        if isinstance(dones, torch.Tensor):
+            episode_returns = finished_episode_returns(data_buffer["rewards"], dones)
+            mean_episode_return, _, _ = reduce_metrics(episode_returns)
+            rewards_metrics["episode_return"] = mean_episode_return
         rollout_metrics.update(rewards_metrics)
 
     if "advantages" in data_buffer:
@@ -461,6 +555,21 @@ def compute_rollout_metrics(data_buffer: dict) -> dict:
             "returns_min": min_ret,
         }
         rollout_metrics.update(returns_metrics)
+
+    prev_values = data_buffer.get("prev_values", None)
+    if isinstance(prev_values, torch.Tensor):
+        prev_values = values_aligned_to_returns(
+            prev_values, data_buffer.get("returns", None)
+        )
+        prev_values = valid_values(prev_values)
+        mean_value, min_value, max_value = reduce_metrics(prev_values)
+        rollout_metrics.update(
+            {
+                "values_mean": mean_value,
+                "values_max": max_value,
+                "values_min": min_value,
+            }
+        )
 
     return rollout_metrics
 
@@ -494,6 +603,23 @@ def compute_loss_mask(dones):
     loss_mask_sum = loss_mask_sum.expand_as(loss_mask)
 
     return loss_mask, loss_mask_sum
+
+
+def displayed_global_step(step: int) -> int:
+    """Index shown as Global Step, and the TensorBoard step for env/reward.
+
+    The training loop counts from 0. The metric table titles that rollout
+    ``step + 1``. ``env/reward`` is written on this index so it lines up with
+    the other columns of that row. The remaining TensorBoard series stay on
+    the loop index.
+
+    Args:
+        step: Zero-based loop index for this rollout.
+
+    Returns:
+        One-based step matching the metric table.
+    """
+    return int(step) + 1
 
 
 def print_metrics_table(
@@ -565,7 +691,7 @@ def print_metrics_table(
     _print_section_title("Metric Table")
 
     # First line: Global Step and Progress
-    step_str = f"Global Step: {step + 1:4d}/{total_steps}"
+    step_str = f"Global Step: {displayed_global_step(step):4d}/{total_steps}"
     progress_str = f"Progress: {bar} │ {progress:5.1f}%"
     line1 = f"│ {step_str} │ {progress_str}"
     line1 = _fit_line(line1, total_width - 2)

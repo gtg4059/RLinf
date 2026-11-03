@@ -99,6 +99,71 @@ def reference_kl_loss(
     return (divergence * weights).sum() / denominator
 
 
+def clear_unfinished_tail_rewards(
+    rewards: torch.Tensor,
+    dones: torch.Tensor,
+    success_min: float = 0.5,
+) -> None:
+    """Zero an attempt that follows an open and then never finishes.
+
+    A finish is this attempt's own open, or a done that is not that open.
+    The open that came before keeps its bonus and its time penalty. A
+    trajectory that fails from the start keeps its penalty and stays in
+    the update. The cleared steps are the ones a 600-step horizon still
+    has left after the success reset.
+
+    Args:
+        rewards: Step rewards, ``[n_steps, batch]`` or
+            ``[n_chunks, batch, chunk]``. Cleared in place.
+        dones: Done flags aligned with ``rewards``, or one bootstrap row
+            longer on the time axis.
+        success_min: A step above this counts as the open.
+    """
+    if rewards.numel() == 0:
+        return
+    done = dones.detach().to(device=rewards.device).bool()
+    if rewards.ndim == 3:
+        if done.shape[0] == rewards.shape[0] + 1:
+            done = done[1:]
+        if done.shape[-1] == 1 and rewards.shape[-1] > 1:
+            done = done.expand(rewards.shape)
+        flat_rewards = rewards.transpose(1, 2).reshape(-1, rewards.shape[1])
+        flat_done = done.transpose(1, 2).reshape(-1, done.shape[1])
+    else:
+        if done.shape[0] == rewards.shape[0] + 1:
+            done = done[1:]
+        flat_rewards = rewards
+        flat_done = done
+    if flat_rewards.ndim != 2 or flat_done.shape != flat_rewards.shape:
+        raise ValueError(
+            f"rewards shape {tuple(rewards.shape)} does not match "
+            f"dones shape {tuple(dones.shape)}"
+        )
+    attempt = flat_done.long().cumsum(dim=0) - flat_done.long()
+    opened = flat_rewards > float(success_min)
+    n_attempts = int(attempt.max().item()) + 1
+    drop = torch.zeros_like(flat_done)
+    prior_open = torch.zeros(
+        flat_rewards.shape[-1], dtype=torch.bool, device=flat_rewards.device
+    )
+    for attempt_id in range(n_attempts):
+        in_attempt = attempt == attempt_id
+        present = in_attempt.any(dim=0)
+        if not bool(present.any()):
+            continue
+        success = (opened & in_attempt).any(dim=0)
+        closed = (flat_done & in_attempt).any(dim=0)
+        drop_row = prior_open & ~success & ~closed
+        drop = drop | (in_attempt & drop_row.view(1, -1))
+        prior_open = prior_open | success
+    if not bool(drop.any()):
+        return
+    if rewards.ndim == 3:
+        n_chunk, _batch, chunk = rewards.shape
+        drop = drop.reshape(n_chunk, chunk, _batch).transpose(1, 2)
+    rewards.masked_fill_(drop.to(device=rewards.device), 0)
+
+
 def keep_through_first_done(step_dones: torch.Tensor) -> torch.Tensor:
     """Keep steps up to and including the first done along the last dimension.
 
@@ -117,6 +182,34 @@ def keep_through_first_done(step_dones: torch.Tensor) -> torch.Tensor:
     return (seen == 0) | (done & (seen == 1))
 
 
+def loss_mask_through_first_done(
+    step_dones: torch.Tensor,
+    rewards: torch.Tensor,
+    success_min: float = 0.5,
+) -> torch.Tensor:
+    """Drop the failure-reset step and the hold tail after the first done.
+
+    The return still includes the reset step, so earlier tokens in the
+    chunk carry its penalty. That step's own tokens, and every later token
+    in the chunk, stay out of the loss. A done at or above ``success_min``
+    is an open and stays.
+
+    Args:
+        step_dones: Bool tensor, done flags for each step in a chunk.
+        rewards: Step rewards, same shape as ``step_dones``.
+        success_min: A done at or below this reward is a failure reset.
+
+    Returns:
+        Bool tensor of the same shape. True where tokens may enter the loss.
+    """
+    keep = keep_through_first_done(step_dones)
+    done = step_dones.bool()
+    seen = done.cumsum(dim=-1)
+    first = done & (seen == 1)
+    failure = first & (rewards <= float(success_min))
+    return keep & ~failure
+
+
 def preprocess_embodied_advantages_inputs(
     rewards: torch.Tensor,
     dones: torch.Tensor,
@@ -129,19 +222,48 @@ def preprocess_embodied_advantages_inputs(
     Preprocess inputs before computing advantages & returns.
     Unify names & formats, align with math interfaces.
     """
+    if kwargs.get("adv_type") == "global_return":
+        # The unfinished attempt after an open is not a training episode.
+        # Its time penalty is cleared here, before the chunk sum, and the
+        # advantage mask drops those steps. A miss from the start is kept.
+        clear_unfinished_tail_rewards(
+            rewards,
+            dones,
+            success_min=float(kwargs.get("success_chunk_reward_min", 0.5)),
+        )
+
+    terminations = kwargs.get("terminations")
+    bootstrap_truncation = bool(kwargs.get("bootstrap_truncation", False))
+    # A horizon timeout is a truncation, not a CRI end. The chunk cut and the
+    # failure-step mask follow terminations, so the timeout step stays.
+    cut_flags = (
+        terminations
+        if bootstrap_truncation and terminations is not None
+        else dones
+    )
     if kwargs["reward_type"] == "chunk_level":
         # TODO: need check
         # rewards, dones, loss_mask, loss_mask_sum: [n_chunk_steps, bsz, num_action_chunks] -> [n_chunk_steps, bsz, 1]
         # Dones are stored with one leading bootstrap row. Drop rewards after
         # the first done in the chunk so the reset hold is not part of the
         # episode that just succeeded, and GAE does not pull in the next chunk.
-        step_dones = dones[1:] if dones.shape[0] == rewards.shape[0] + 1 else dones
+        step_dones = (
+            cut_flags[1:]
+            if cut_flags.shape[0] == rewards.shape[0] + 1
+            else cut_flags
+        )
         if step_dones.shape == rewards.shape and rewards.shape[-1] > 1:
             keep = keep_through_first_done(step_dones)
             rewards = rewards * keep.to(dtype=rewards.dtype)
-            kwargs["step_loss_mask"] = keep
+            kwargs["step_loss_mask"] = loss_mask_through_first_done(
+                step_dones,
+                rewards,
+                success_min=float(kwargs.get("success_chunk_reward_min", 0.5)),
+            )
         rewards = rewards.sum(dim=-1, keepdim=True)
         dones = dones.max(dim=-1, keepdim=True)[0]
+        if bootstrap_truncation and terminations is not None:
+            terminations = terminations.max(dim=-1, keepdim=True)[0]
         if loss_mask is not None:
             loss_mask = loss_mask.max(dim=-1, keepdim=True)[0]
         if loss_mask_sum is not None:
@@ -172,6 +294,11 @@ def preprocess_embodied_advantages_inputs(
         (num_chunk + 1) * chunk_size, bsz
     )
     dones = flattened_dones_full[-(n_steps + 1) :]
+    if bootstrap_truncation and terminations is not None:
+        flat_terminals = terminations.transpose(1, 2).reshape(
+            (num_chunk + 1) * chunk_size, bsz
+        )
+        kwargs["terminals"] = flat_terminals[-(n_steps + 1) :]
 
     if kwargs["adv_type"] == "gae":
         flattened_values_full = values.transpose(1, 2).reshape(
@@ -212,7 +339,12 @@ def calculate_scores(
             "dones": dones,
         }
     )
-    if kwargs.get("adv_type") in ("episode_success", "grouped_return"):
+    if kwargs.get("adv_type") in (
+        "episode_success",
+        "grouped_return",
+        "global_return",
+        "success_first",
+    ):
         kwargs["step_rewards"] = step_rewards
 
     return kwargs
@@ -418,6 +550,16 @@ def preprocess_loss_inputs(
             ).sum(dim=[1, 2])
         if versions is not None:
             versions = versions.reshape(bsz, -1, single_action_dim)[:, 0, 0]
+        # One ratio covers the chunk. A mask with one flag per action step
+        # (the hold tail after a mid-chunk open) cannot broadcast onto it:
+        # [micro_batch, 15] against a [micro_batch] ratio, and 15 hits the
+        # micro-batch size 16. Keep the sample when any step is still live.
+        if loss_mask is not None and tuple(loss_mask.shape) != tuple(logprobs.shape):
+            loss_mask = loss_mask.reshape(bsz, -1).any(dim=-1)
+        if loss_mask_sum is not None and tuple(loss_mask_sum.shape) != tuple(
+            logprobs.shape
+        ):
+            loss_mask_sum = loss_mask_sum.reshape(bsz, -1)[..., -1]
 
     target_shape = logprobs.shape
     advantages = expand_to_target_dim(advantages, target_shape)
@@ -489,6 +631,75 @@ def expand_to_target_dim(tensor, target_shape):
         while len(tensor.shape) < len(target_shape):
             tensor = tensor.unsqueeze(-1)
     return tensor
+
+
+def advantage_update_shift(
+    logprobs_before: torch.Tensor,
+    logprobs_after: torch.Tensor,
+    advantages: torch.Tensor,
+    logprob_type: str,
+    reward_type: str,
+    single_action_dim: int,
+    loss_mask: Optional[torch.Tensor] = None,
+) -> dict[str, float]:
+    """Log-probability change of one optimizer step, split by advantage sign.
+
+    ``actor/ratio`` stays 1 when π_old is the detached replay from the same
+    forward. This compares that replay with a second forward after the step.
+    A positive advantage should raise the log-probability, so
+    ``update_log_ratio_pos`` is positive and ``update_log_ratio_neg`` is
+    negative when the step follows the advantage.
+
+    Args:
+        logprobs_before: Actor replay log-probabilities from before the step.
+        logprobs_after: Log-probabilities of the same chains after the step.
+        advantages: Advantages aligned with those chains.
+        logprob_type: ``chunk_level``, ``action_level``, or ``token_level``.
+        reward_type: Reward reduction used by the policy loss.
+        single_action_dim: Environment action dimension.
+        loss_mask: Optional mask in the rollout layout.
+
+    Returns:
+        Means of the log-ratio and the advantage on each sign.
+    """
+    processed = preprocess_loss_inputs(
+        logprobs=logprobs_after,
+        old_logprobs=logprobs_before,
+        advantages=advantages,
+        logprob_type=logprob_type,
+        reward_type=reward_type,
+        single_action_dim=single_action_dim,
+        loss_mask=loss_mask,
+    )
+    delta = (processed["logprobs"] - processed["old_logprobs"]).detach().float()
+    adv = processed["advantages"].detach().float()
+    mask = processed["loss_mask"]
+    delta = delta.reshape(-1)
+    adv = adv.reshape(-1)
+    if mask is None:
+        mask = torch.ones(delta.shape[0], dtype=torch.bool, device=delta.device)
+    else:
+        mask = mask.detach().bool().reshape(-1)
+    if delta.numel() != adv.numel() or delta.numel() != mask.numel():
+        raise ValueError(
+            "Update-shift tensors must align after the policy-loss reduction, "
+            f"got log-ratio {tuple(delta.shape)}, advantage {tuple(adv.shape)}, "
+            f"mask {tuple(mask.shape)}."
+        )
+
+    def _mean(values: torch.Tensor, selected: torch.Tensor) -> float:
+        if int(selected.sum().item()) == 0:
+            return 0.0
+        return float(values[selected].mean().item())
+
+    positive = mask & (adv > 0)
+    negative = mask & (adv < 0)
+    return {
+        "actor/update_log_ratio_pos": _mean(delta, positive),
+        "actor/update_log_ratio_neg": _mean(delta, negative),
+        "actor/advantage_pos": _mean(adv, positive),
+        "actor/advantage_neg": _mean(adv, negative),
+    }
 
 
 def safe_normalize(array, loss_mask):
