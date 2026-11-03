@@ -332,9 +332,6 @@ actor:
       # time ranking. 0.1 widens the flow std about 5× and started at 48% success.
       noise_level: 0.5
       joint_logprob: False
-      # Replay the flow-SDE gaussian in eval mode, matching the rollout.
-      # Train-mode checkpointing was a different velocity mean at the same weights.
-      align_rollout_mean: True
       num_steps: ${actor.model.num_steps}
       # CRI prefix makes prefix_mask length != VLM tokens; mean-pool the
       # last dim instead of indexing with the language mask.

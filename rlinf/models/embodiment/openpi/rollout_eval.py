@@ -24,12 +24,11 @@ from torch import nn
 def use_rollout_eval_mode(module: nn.Module) -> Iterator[None]:
     """Run ``module`` in eval mode, then restore its training flag.
 
-    Rollout samples the flow-SDE gaussian under ``eval()`` and ``no_grad``.
-    The actor replay otherwise stays in ``train()``, where gradient
-    checkpointing is on. Those two forwards produce different velocity means
-    at the same weights, so the chunk ratio leaves ``[0.8, 1.2]`` before the
-    optimizer step. Eval mode uses the rollout kernels. Gradients still flow
-    because this does not enter ``no_grad``.
+    Rollout samples the flow-SDE gaussian under ``eval()``. The actor log-prob
+    replay uses this context so it does not stay in ``train()``, where
+    gradient checkpointing changes the velocity mean at the same weights.
+    Eval mode uses the rollout kernels. Gradients still flow because this
+    does not enter ``no_grad``.
 
     Args:
         module: Policy whose forward computes the flow-SDE mean.

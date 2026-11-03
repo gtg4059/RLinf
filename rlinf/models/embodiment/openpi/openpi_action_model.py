@@ -15,7 +15,6 @@
 import math
 import random
 from collections.abc import Sequence
-from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -768,14 +767,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         images = [img.to(device) for img in images]
         img_masks = [img_mask.to(device) for img_mask in img_masks]
         state = state.to(device)
-        # get log prob. align_rollout_mean recomputes the flow-SDE gaussian in
-        # eval mode, the same mode the rollout used when it stored the chain.
-        logprob_ctx = (
-            use_rollout_eval_mode(self)
-            if bool(getattr(self.config, "align_rollout_mean", False))
-            else nullcontext()
-        )
-        with logprob_ctx:
+        # Replay the flow-SDE gaussian in eval mode. Rollout stored the chain
+        # under eval(); train-mode checkpointing is a different velocity mean
+        # at the same weights, so the chunk ratio leaves [0.8, 1.2] before
+        # the optimizer step. Gradients still flow: this is not no_grad.
+        with use_rollout_eval_mode(self):
             log_probs, value_t, entropy = self.get_log_prob_value(
                 images,
                 img_masks,
