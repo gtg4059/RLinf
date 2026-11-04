@@ -71,3 +71,5 @@ rlinf/envs/maniskill/assets
 PKG-INFO
 *.egg-info/
 .claude/settings.json
+# Cursor chats copied from the AWS training machine
+.cursor/agent-transcripts/

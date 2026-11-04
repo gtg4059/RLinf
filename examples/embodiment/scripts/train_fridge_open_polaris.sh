@@ -23,6 +23,9 @@
 #
 # Dry-run:
 #   RLINF_TRAIN_FRIDGE_DRY_RUN=1 bash examples/embodiment/scripts/train_fridge_open_polaris.sh
+#
+# One-time install (external zip already unpacked at the repo root):
+#   bash examples/embodiment/scripts/prepare_fridge_open_polaris.sh
 
 set -euo pipefail
 
@@ -30,7 +33,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 DEFAULT_CONFIG_NAME="isaaclab_kitchen_open_fridge_ppo_openpi_pi05"
 
 _usage() {
-  sed -n '2,21p' "$0"
+  sed -n '2,28p' "$0"
 }
 
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
