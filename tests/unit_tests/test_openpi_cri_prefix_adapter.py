@@ -24,6 +24,7 @@ from rlinf.models.embodiment.openpi.cri_prefix import (
     CRIPositionalEmbedding,
     cri_pos_weight,
     encode_cri_prefix_tokens,
+    ensure_cri_prefix_modules,
     normalize_cri_prefix_state_dict,
     vlm_value_prefix_mask,
     wrap_bare_cri_pos_parameter,
@@ -34,6 +35,16 @@ ADAPTER_CKPT = (
     / "checkpoint"
     / "pi05_droid_jointpos_polaris_cri_adapter_rlinf_19999"
 )
+
+
+def test_ensure_cri_prefix_modules_matches_adapter_layout() -> None:
+    host = torch.nn.Module()
+    ensure_cri_prefix_modules(host)
+    assert host.use_cri_prefix is True
+    assert host.num_cri_tokens == 9
+    assert tuple(host.cri_in_proj.weight.shape) == (256, 9)
+    assert tuple(host.cri_out_proj.weight.shape) == (18432, 256)
+    assert tuple(host.cri_pos.shape) == (9, 2048)
 
 
 def test_normalize_cri_prefix_state_dict_remaps_bare_pos() -> None:

@@ -967,18 +967,29 @@ class IsaaclabOpenFridgeKitchenEnv(IsaaclabPickPlaceCubePlateEnv):
             import os
 
             os.environ.pop("DISPLAY", None)
+            # Kit aborts in rtx.scenedb while createHydraEngine runs if
+            # CUDA_VISIBLE_DEVICES is set: Vulkan and CUDA then number the
+            # GPUs differently. Remember the physical device, then drop the
+            # mask before SimulationApp starts.
+            assigned = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0].strip()
+            if not assigned.isdigit():
+                assigned = "0"
+            os.environ.pop("CUDA_VISIBLE_DEVICES", None)
 
             from isaaclab.app import AppLauncher
 
-            # The descriptor pools are fixed when Kit starts. A later carb set
-            # cannot grow them. Per-env eval CameraCfg views plus a cloned
-            # kitchen exhausted the default pools at 96 envs/GPU. These sizes
-            # are the Isaac Sim 5.1 camera-extension test args.
+            # Descriptor pools are fixed at Kit start. 80 kitchen envs with
+            # tiled cameras exhaust the defaults ("Unable to allocate
+            # descriptor sets"). These sizes are the Isaac Sim 5.1
+            # camera-extension test args. One worker owns one GPU.
             sim_app = AppLauncher(
                 headless=True,
                 enable_cameras=True,
+                device=f"cuda:{assigned}",
+                multi_gpu=False,
                 kit_args=(
-                    "--/rtx/descriptorSets=360000 --/rtx/reservedDescriptors=900000"
+                    "--/rtx/descriptorSets=360000 "
+                    "--/rtx/reservedDescriptors=900000"
                 ),
             ).app
             # DLSS / post-AA each allocate RTX ParameterBlocks per camera.

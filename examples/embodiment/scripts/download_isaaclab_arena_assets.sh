@@ -29,6 +29,8 @@ KITCHEN_S3_PATHS=(
   "object_library/srl_robolab_assets/robots/franka_stand_grey.usda"
   "object_library/srl_robolab_assets/robots/franka_robotiq_2f_85_flattened.usd"
   "object_library/srl_robolab_assets/fixtures/stand_instanceable.usd"
+  "object_library/srl_robolab_assets/fixtures/franka_table.usd"
+  "object_library/srl_robolab_assets/fixtures/Props/instaceable_meshes.usd"
 )
 
 # Arena USD/HDR used by the DROID maple-table pick-place task.
@@ -36,6 +38,7 @@ MAPLE_S3_PATHS=(
   "robot_library/droid/franka_robotiq_2f_85_flattened.usd"
   "object_library/srl_robolab_assets/fixtures/stand_instanceable.usd"
   "object_library/srl_robolab_assets/fixtures/franka_table.usd"
+  "object_library/srl_robolab_assets/fixtures/Props/instaceable_meshes.usd"
   "object_library/srl_robolab_assets/fixtures/table_maple.usd"
   "object_library/srl_robolab_assets/fixtures/table_maple.usda"
   "object_library/srl_robolab_assets/scenes/maple_table.usda"
@@ -243,6 +246,8 @@ main() {
   local required=(
     "robot_library/droid/franka_robotiq_2f_85_flattened.usd"
     "object_library/srl_robolab_assets/robots/franka_stand_grey.usda"
+    "object_library/srl_robolab_assets/fixtures/franka_table.usd"
+    "object_library/srl_robolab_assets/fixtures/Props/instaceable_meshes.usd"
     "${KITCHEN_NAMED_REL}/scene.usd"
     "${KITCHEN_SDK_REL}/scene.usd"
   )

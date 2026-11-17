@@ -57,6 +57,31 @@ class CRIPositionalEmbedding(torch.nn.Module):
         return super().to(*args, **kwargs)
 
 
+def ensure_cri_prefix_modules(
+    model: torch.nn.Module,
+    *,
+    num_tokens: int = 9,
+    cri_dim: int = 9,
+    hidden: int = 256,
+    width: int = 2048,
+) -> None:
+    """Add the TacVLA prefix linears when this OpenPI build has none.
+
+    Stock ``PI0Pytorch`` has no ``cri_in_proj``. The adapter checkpoint stores
+    ``cri_in_proj`` as ``(256, 9)``, ``cri_out_proj`` as ``(9 * 2048, 256)``,
+    and ``cri_pos`` as ``(9, 2048)``.
+    """
+    if getattr(model, "cri_in_proj", None) is not None:
+        model.use_cri_prefix = True
+        model.num_cri_tokens = int(getattr(model, "num_cri_tokens", num_tokens))
+        return
+    model.num_cri_tokens = int(num_tokens)
+    model.use_cri_prefix = True
+    model.cri_in_proj = torch.nn.Linear(cri_dim, hidden)
+    model.cri_out_proj = torch.nn.Linear(hidden, int(num_tokens) * width)
+    model.cri_pos = torch.nn.Parameter(torch.zeros(int(num_tokens), width))
+
+
 def wrap_bare_cri_pos_parameter(model: torch.nn.Module) -> None:
     """Replace a root ``cri_pos`` Parameter with ``CRIPositionalEmbedding``.
 

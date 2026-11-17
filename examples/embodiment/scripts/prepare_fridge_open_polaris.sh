@@ -51,6 +51,8 @@ REQUIRED=(
   "${ARENA}/lightwheel_sdk/floorplan/robocasa-robocasakitchen-1-1/scene.usd"
   "${ARENA}/robot_library/droid/franka_robotiq_2f_85_flattened.usd"
   "${ARENA}/object_library/srl_robolab_assets/robots/franka_stand_grey.usda"
+  "${ARENA}/object_library/srl_robolab_assets/fixtures/franka_table.usd"
+  "${ARENA}/object_library/srl_robolab_assets/fixtures/Props/instaceable_meshes.usd"
   "${CRI_DIR}/lib/libSFD_CoreService.so"
   "${CRI_DIR}/Engine/Chest_Shape5_Cover_off_Force/model.onnx"
   "${CRI_DIR}/Engine/Chest_Shape5_Cover_off_Pressure/model.onnx"

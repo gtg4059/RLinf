@@ -119,6 +119,9 @@ class OpenPi0Config(Pi0Config):
     rlt_image_only: bool = True
     rlt_use_mask: bool = False
     state_indices: list[int] | None = None
+    # TacVLA CRI prefix. The installed Pi0Config often has no such fields.
+    use_cri_prefix: bool = False
+    num_cri_tokens: int = 9
 
 
 class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
@@ -306,6 +309,17 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 output_dim=1,
             ).to(dtype=_dsrl_dtype)
 
+        if getattr(self.config, "use_cri_prefix", False) and not hasattr(
+            self, "cri_in_proj"
+        ):
+            from rlinf.models.embodiment.openpi.cri_prefix import (
+                ensure_cri_prefix_modules,
+            )
+
+            ensure_cri_prefix_modules(
+                self, num_tokens=int(getattr(self.config, "num_cri_tokens", 9))
+            )
+
         for name, module in self.named_modules():
             # Set _fsdp_wrap_name to the last part of the path (e.g., "model.action_in_proj" -> "action_in_proj")
             path_parts = name.split(".")
@@ -452,7 +466,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     def _sft_forward_with_rlt_prefix(self, observation, actions):
         images, img_masks, lang_tokens, lang_masks, state, cri = (
             self._split_processed_obs(
-                self._preprocess_observation(observation, train=True)
+                self._preprocess_observation_with_cri(observation, train=True)
             )
         )
 
@@ -524,7 +538,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     def _build_rlt_prefix_cache(self, observation, *, train: bool):
         images, img_masks, lang_tokens, lang_masks, state, cri = (
             self._split_processed_obs(
-                self._preprocess_observation(observation, train=train)
+                self._preprocess_observation_with_cri(observation, train=train)
             )
         )
         device = next(self.parameters()).device
@@ -593,7 +607,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         to_process_obs = self.obs_processor(env_obs)
         processed_obs = self.input_transform(to_process_obs, transpose=False)
         processed_obs = self.precision_processor(processed_obs)
-        observation = _model.Observation.from_dict(processed_obs)
+        observation = self._observation_from_dict(processed_obs)
 
         prefix_output, prefix_pad_masks, past_key_values, lang_tokens, state = (
             self._build_rlt_prefix_cache(observation, train=False)
@@ -664,7 +678,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             )
             processed_obs = self.input_transform(obs_dict, transpose=False)
             processed_obs = self.precision_processor(processed_obs)
-            observation = _model.Observation.from_dict(processed_obs)
+            observation = self._observation_from_dict(processed_obs)
         else:
             obs_dict["actions"] = batch["action"].reshape(
                 bsz, self.config.action_chunk, -1
@@ -676,7 +690,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             if "tokenized_prompt_mask" in batch:
                 processed_obs["tokenized_prompt_mask"] = batch["tokenized_prompt_mask"]
             processed_obs = self.precision_processor(processed_obs)
-            observation = _model.Observation.from_dict(processed_obs)
+            observation = self._observation_from_dict(processed_obs)
             actions = processed_obs["actions"].clone()
             processed_obs.pop("actions")
 
@@ -732,7 +746,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         obs_dict["prompt"] = batch["task"]
         processed_obs = self.input_transform(obs_dict, transpose=False)
         processed_obs = self.precision_processor(processed_obs)
-        observation = _model.Observation.from_dict(processed_obs)
+        observation = self._observation_from_dict(processed_obs)
         actions = processed_obs["actions"].clone()
         processed_obs.pop("actions")
         register_pytree_dataclasses(observation)
@@ -756,10 +770,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         denoise_inds = forward_inputs["denoise_inds"]
         # input transform
         observation = self.input_transform(forward_inputs, transpose=False)
-        observation = _model.Observation.from_dict(observation)
+        observation = self._observation_from_dict(observation)
         images, img_masks, lang_tokens, lang_masks, state, cri = (
             self._split_processed_obs(
-                self._preprocess_observation(observation, train=False)
+                self._preprocess_observation_with_cri(observation, train=False)
             )
         )
         # transfer to device
@@ -809,10 +823,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         """Compute velocity v_theta at explicit (x_t, timesteps) for NFT loss."""
         # obs process
         observation = self.input_transform(forward_inputs, transpose=False)
-        observation = _model.Observation.from_dict(observation)
+        observation = self._observation_from_dict(observation)
         images, img_masks, lang_tokens, lang_masks, state, cri = (
             self._split_processed_obs(
-                self._preprocess_observation(observation, train=False)
+                self._preprocess_observation_with_cri(observation, train=False)
             )
         )
         # move device
@@ -894,7 +908,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         processed_obs = self.precision_processor(
             processed_obs
         )  # obs precision processor
-        observation = _model.Observation.from_dict(processed_obs)
+        observation = self._observation_from_dict(processed_obs)
 
         is_dsrl_active = self.config.use_dsrl
         if is_dsrl_active:
@@ -1028,7 +1042,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
         images, img_masks, lang_tokens, lang_masks, state, cri = (
             self._split_processed_obs(
-                self._preprocess_observation(observation, train=False)
+                self._preprocess_observation_with_cri(observation, train=False)
             )
         )
 
@@ -1297,6 +1311,21 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         v_t = self.action_out_proj(suffix_out)
         return v_t, suffix_out
 
+    def _observation_from_dict(self, data: dict):
+        """Build an Observation and keep CRI, which ``from_dict`` drops."""
+        cri = data.get("cri") if isinstance(data, dict) else None
+        observation = _model.Observation.from_dict(data)
+        if cri is not None:
+            object.__setattr__(observation, "cri", cri)
+        return observation
+
+    def _preprocess_observation_with_cri(self, observation, *, train: bool = True):
+        """Stock preprocess plus the CRI vector stashed on the observation."""
+        processed = self._preprocess_observation(observation, train=train)
+        if len(processed) >= 6:
+            return processed
+        return (*processed, getattr(observation, "cri", None))
+
     def _split_processed_obs(self, processed):
         """Accept both stock 5-tuple and CRI-prefix 6-tuple preprocess output."""
         if len(processed) >= 6:
@@ -1332,10 +1361,16 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         a ``FullyShardedDataParallel``, whose ``to`` returns the wrapper and the
         add raises ``TypeError``.
         """
-        if not getattr(self, "use_cri_prefix", False):
-            return super().embed_prefix(images, img_masks, lang_tokens, lang_masks, cri)
+        # The installed PI0Pytorch.embed_prefix takes images, masks, and
+        # language only. Passing ``cri`` raises TypeError.
+        use_cri = bool(
+            getattr(self, "use_cri_prefix", False)
+            or getattr(self.config, "use_cri_prefix", False)
+        )
+        if not use_cri:
+            return super().embed_prefix(images, img_masks, lang_tokens, lang_masks)
 
-        saved_flag = self.use_cri_prefix
+        saved_flag = getattr(self, "use_cri_prefix", False)
         self.use_cri_prefix = False
         try:
             embs, pad_masks, att_masks = super().embed_prefix(

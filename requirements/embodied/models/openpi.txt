@@ -5,3 +5,5 @@
 jax[cuda12]==0.5.3
 orbax-checkpoint==0.11.13
 tyro==1.0.13
+# PyArrow 26+ requires NumPy 2. Isaac Lab keeps NumPy 1.26 in this venv.
+pyarrow>=14,<26

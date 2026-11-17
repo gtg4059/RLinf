@@ -5,10 +5,11 @@
 # Host entry: bind-mounts this checkout into the local embodied-isaaclab
 # image and launches the named Hydra config. First positional is the config
 # (same style as run_embodiment.sh); later tokens are Hydra overrides.
-# Collocated actor+env+rollout on all visible GPUs, 80 train / 4 eval
+# Collocated actor+env+rollout on all visible GPUs, 72 train / 4 eval
 # envs per GPU. The train horizon is read from the config (450 steps,
-# 15-step chunks): chunks/rank = 80*1*(450/15) = 2400.
-# This host is 2× Blackwell → 160 train / 8 eval / global_batch 4800.
+# 15-step chunks) and train rollout_epoch is 2:
+# chunks/rank = 72*2*(450/15) = 4320.
+# This host is 1× Blackwell → 72 train / 4 eval / global_batch 4320.
 # Override RLINF_NUM_GPUS or pass Hydra env.train.total_num_envs=… to pin.
 # Stop a previous fridge PPO / eval container first (they share GPUs).
 # Do not resume a collapsed language-binned 10000 CRI run.
@@ -59,14 +60,15 @@ if [ ! -f "${CONFIG_YAML}" ]; then
   exit 1
 fi
 
-# 80 train / 4 eval envs per GPU. Chunks follow the train horizon in the
-# config: envs/rank * rollout_epoch * (max_steps / num_action_chunks).
-# 450 steps and 15-step chunks → 30 chunks/env. global_batch = that * n_gpus.
-# 2 GPUs → env.train.total_num_envs=160. Pass that Hydra key to pin another count.
-# 96/GPU filled the card at a 900-step horizon. 80/GPU at 450 steps uses the
-# Isaac headroom measured when dropping to 64, and the shorter horizon
-# shrinks the rollout buffer the actor holds.
-TRAIN_ENVS_PER_GPU=80
+# 72 train / 4 eval envs per GPU, collected twice per update. Chunks follow
+# the train horizon in the config:
+# envs/rank * rollout_epoch * (max_steps / num_action_chunks).
+# 450 steps, 15-step chunks, rollout_epoch 2 → 60 chunks/env.
+# 1 GPU → env.train.total_num_envs=72 and global_batch=4320.
+# Pass that Hydra key to pin another count.
+# 96/GPU filled the card at a 900-step horizon. 80/GPU OOM'd on the actor
+# update after eval. 72/GPU is the current count.
+TRAIN_ENVS_PER_GPU=72
 EVAL_ENVS_PER_GPU=4
 
 _visible_gpu_count() {

@@ -130,6 +130,16 @@ if "${PYTHON}" -c "import importlib.util, sys; sys.exit(0 if importlib.util.find
     fi
 fi
 
+# PyArrow 26+ requires NumPy 2. The OpenPI + Isaac Lab venv stays on NumPy 1.26.
+if ! "${PYTHON}" -c "import pyarrow" >/dev/null 2>&1; then
+    echo "Reinstalling pyarrow<26 (NumPy 1.26 cannot import PyArrow 26)."
+    if command -v uv >/dev/null 2>&1; then
+        uv pip install --python "${PYTHON}" "pyarrow>=14,<26"
+    else
+        "${PYTHON}" -m pip install "pyarrow>=14,<26"
+    fi
+fi
+
 # POLARIS dataset
 export POLARIS_DATA_PATH=${POLARIS_DATA_PATH:-"/path/to/dataset/PolaRiS-Hub"}
 

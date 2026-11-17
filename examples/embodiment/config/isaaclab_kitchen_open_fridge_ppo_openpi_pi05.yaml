@@ -20,7 +20,7 @@ polaris_openpi_ckpt: ${oc.env:POLARIS_OPENPI_CKPT,${oc.env:REPO_PATH,/workspace/
 cluster:
   num_nodes: 1
   # Collocated on every visible GPU. train_fridge_open_polaris.sh rescales
-  # env counts to 64 train / 4 eval per GPU. This host: 2× RTX PRO 6000.
+  # env counts to 72 train / 4 eval per GPU. This host: 1× RTX PRO 6000.
   component_placement:
     actor,env,rollout: all
 
@@ -36,7 +36,7 @@ runner:
   max_steps: -1
 
   only_eval: False
-  # Eval every 20 steps. The save interval has to be a multiple of this.
+  # save_interval must be a multiple of val_check_interval.
   val_check_interval: 20
   eval_at_start: False
   save_interval: 20
@@ -59,8 +59,7 @@ algorithm:
   logprob_type: chunk_level
   entropy_type: token_level
 
-  # One pass. A second pass on the same 128×450 batch was 175s of a
-  # 622s step and added no new samples. Collection stays the long part.
+  # One pass over the collected batch. A second pass adds no new samples.
   update_epoch: 1
   adv_type: gae
   loss_type: actor_critic
@@ -88,15 +87,15 @@ env:
   group_name: "EnvGroup"
 
   train:
-    # 450 steps is 30s at 15 Hz. One pass per update, 80 envs/GPU:
-    # 80*1*(450/15) = 2400 chunks/rank.
-    rollout_epoch: 1
-    # 80 envs/GPU. 2 visible GPUs → 160. 8 GPUs → 640.
+    # 450 steps is 30s at 15 Hz. Two collects per update, 72 envs/GPU:
+    # 72*2*(450/15) = 4320 chunks/rank.
+    rollout_epoch: 2
+    # 72 envs/GPU. 1 visible GPU → 72. 8 GPUs → 576.
     # 96/GPU + micro 16 OOM'd by 53MB at a 900-step horizon: actor 59GB,
-    # Isaac 18.5GB. Isaac follows env count. 64/GPU left about 3.5GB of
-    # that Isaac allocation free. 80/GPU puts it back on the rollout.
-    # The train script overrides this from the visible GPU count.
-    total_num_envs: 160
+    # Isaac 18.5GB. 80/GPU then OOM'd by 62MB on the actor update after
+    # the step-20 eval. The train script overrides this from the visible
+    # GPU count.
+    total_num_envs: 72
     max_episode_steps: 450
     max_steps_per_rollout_epoch: 450
     auto_reset: False
@@ -160,8 +159,8 @@ env:
         height: 224
         width: 224
     video_cfg:
-      # Train rollouts do not write mp4. Eval still records every
-      # runner.val_check_interval (20) steps.
+      # Train rollouts do not write mp4. Eval records every
+      # runner.val_check_interval step.
       save_video: False
       info_on_video: True
       fps: 15
@@ -196,11 +195,11 @@ env:
       video_base_dir: ${runner.logger.log_path}/video/train
 
   eval:
-    # 2 epochs × 4 envs/GPU. 2 GPUs → 16 episodes. 8 GPUs → 64.
+    # 2 epochs × 4 envs/GPU. 1 GPU → 8 episodes. 8 GPUs → 64.
     rollout_epoch: 2
     # Second Isaac Kit stays resident during actor train. Keep this small
-    # (4/GPU). 2 GPUs → 8. 8 GPUs → 32.
-    total_num_envs: 8
+    # (4/GPU). 1 GPU → 4. 8 GPUs → 32.
+    total_num_envs: 4
     # 30s at 15 Hz, same horizon as train.
     max_episode_steps: 450
     max_steps_per_rollout_epoch: 450
@@ -306,13 +305,13 @@ rollout:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  # 4800 % 16 == 0. Micro 32 doubled the update activation and OOM'd.
+  # 4320 % 16 == 0. Micro 32 doubled the update activation and OOM'd.
   # Rollout is already offloaded here; the forward still needs 16.
   micro_batch_size: 16
-  # Per-rank chunks: (envs/GPU)*rollout_epoch*(450/15) = 80*1*30 = 2400.
-  # 2 GPUs → 4800. 8 GPUs → 19200. The train script recomputes this
+  # Per-rank chunks: (envs/GPU)*rollout_epoch*(450/15) = 72*2*30 = 4320.
+  # 1 GPU → 4320. 8 GPUs → 34560. The train script recomputes this
   # from the horizon when actor.global_batch_size is not overridden.
-  global_batch_size: 4800
+  global_batch_size: 4320
   seed: 42
   enable_offload: False
 
@@ -349,7 +348,7 @@ actor:
     weight_decay: 0.01
     critic_warmup_steps: 0
     # update_kl above 0.10 shrinks this rate by 1.5; below 0.025 it grows.
-    # The floor is under the 1e-6 start so a large flow-SDE KL can shrink it.
+    # The floor is under the 5e-6 start so a large flow-SDE KL can shrink it.
     lr_scheduler: adaptive
     desired_kl: 0.016
     adaptive_lr_min: 5.0e-7
