@@ -347,9 +347,9 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._gripper_keys = tuple(
             init_params.get("gripper_keys", _DEFAULT_GRIPPER_KEYS)
         )
-        # IsaacLab CRI-F: one run_cri_filter(q, qd) per env.step from
-        # measured observations (joint_pos, joint_vel). Policy CRI is the
-        # previous-tick cri_pre cache (reset/first obs = 0).
+        # IsaacLab CRI-F: one run_cri_filter(q, qd) per env.step.
+        # cri_filter_enabled changes only the commanded trajectory.
+        # Policy CRI is always the previous step (reset/first obs = 0).
         self._compute_cri = bool(init_params.get("compute_cri", True))
         self._cri_filter = bool(init_params.get("cri_filter", True))
         self._cri_limit = float(init_params.get("cri_limit", 0.96))
@@ -427,6 +427,7 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._cri_step_dt = float(init_params.get("cri_step_dt", DROID_CONTROL_DT))
         self._cri_solver = None
         self._cri_obs_cache = None
+        self._cri_first_obs = None
         self._last_q = None
         self._cri_solve_count = 0
         self._cri_step_count = 0
@@ -749,6 +750,9 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._cri_obs_cache = torch.zeros(
             self.num_envs, NUM_CRI_POINTS, device=self.device, dtype=torch.float32
         )
+        self._cri_first_obs = torch.ones(
+            self.num_envs, device=self.device, dtype=torch.bool
+        )
         self._last_q = torch.zeros(
             self.num_envs, DEFAULT_NUM_JOINTS, device=self.device, dtype=torch.float32
         )
@@ -756,7 +760,7 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._cri_step_count = 0
 
     def _reset_cri_filter_rows(self, env_ids: torch.Tensor | None = None) -> None:
-        """IsaacLab CRI-F reset: CRI obs=0, no solver."""
+        """IsaacLab CRI-F reset. The arm is at rest, so the next CRI observation is 0."""
         if self._cri_obs_cache is None:
             return
         self._last_task_success = None
@@ -766,12 +770,16 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         if env_ids is None:
             self._cri_obs_cache.zero_()
             self._last_q.zero_()
+            if self._cri_first_obs is not None:
+                self._cri_first_obs.fill_(True)
             self._cri_solve_count = 0
             self._cri_step_count = 0
             return
         ids = torch.as_tensor(env_ids, device=self.device).reshape(-1)
         self._cri_obs_cache.index_fill_(0, ids, 0.0)
         self._last_q.index_fill_(0, ids, 0.0)
+        if self._cri_first_obs is not None:
+            self._cri_first_obs[ids] = True
 
     def _remember_q(self, env_obs: dict[str, Any]) -> None:
         if self._last_q is None or env_obs.get("states") is None:
@@ -809,15 +817,32 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             )
         return self._cri_solver
 
-    def _attach_cri(self, env_obs: dict[str, Any]) -> dict[str, Any]:
-        """Attach previous-tick ``cri_filter_pre``. Does not call the solver."""
-        if not self._compute_cri:
-            return env_obs
+    def cri_filter_pre(self) -> torch.Tensor:
+        """CRI from the previous control step.
+
+        The CBF filter only changes the commanded trajectory. The arm starts
+        at rest, so the first observation is 0 at every collision point.
+        """
+        from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.constants import (
+            NUM_CRI_POINTS,
+        )
+
         if self._cri_obs_cache is None:
             self._init_cri_buffers()
-        env_obs["cri"] = self._cri_obs_cache.to(
-            device=self.device, dtype=torch.float32
-        )
+        assert self._cri_obs_cache is not None
+        cri = self._cri_obs_cache.detach().clone()
+        if cri.shape[-1] > NUM_CRI_POINTS:
+            cri = cri[..., :NUM_CRI_POINTS]
+        if self._cri_first_obs is not None and bool(self._cri_first_obs.any()):
+            cri[self._cri_first_obs] = 0
+            self._cri_first_obs[self._cri_first_obs] = False
+        return cri
+
+    def _attach_cri(self, env_obs: dict[str, Any]) -> dict[str, Any]:
+        """Attach :meth:`cri_filter_pre`. Does not call the solver."""
+        if not self._compute_cri:
+            return env_obs
+        env_obs["cri"] = self.cri_filter_pre()
         return env_obs
 
     def _attach_traj_info(
@@ -848,8 +873,10 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         return payload
 
     def _store_cri_pre(self, cri_pre: torch.Tensor) -> None:
+        """Keep this step's CRI for the next :meth:`cri_filter_pre` read."""
         if self._cri_obs_cache is None:
             self._init_cri_buffers()
+        assert self._cri_obs_cache is not None
         cri = cri_pre.to(device=self.device, dtype=torch.float32)
         if cri.dim() == 1:
             cri = cri.unsqueeze(0)
