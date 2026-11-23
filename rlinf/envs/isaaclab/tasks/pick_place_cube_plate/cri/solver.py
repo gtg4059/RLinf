@@ -686,6 +686,8 @@ class _CriSubprocessClient:
             "cbf_alpha": float(reply.get("cbf_alpha", CBF_ALPHA)),
             "approach_limit": float(reply.get("approach_limit", CRI_FILTER_LIMIT * (1.0 - CBF_ALPHA))),
             "enabled": bool(reply.get("enabled", True)),
+            "impact_jacobian": reply.get("impact_jacobian"),
+            "impact_dir": reply.get("impact_dir"),
         }
 
     def close(self) -> None:
@@ -991,6 +993,8 @@ class CriSolver:
             "cbf_alpha": self._cbf_alpha,
             "approach_limit": self._approach_limit,
             "enabled": self._filter_enabled,
+            "impact_jacobian": None,
+            "impact_dir": None,
         }
 
     def run_cri_filter(
@@ -1067,6 +1071,19 @@ class CriSolver:
             qd_cmd = qd_cmd[:batch]
         delta = command_delta(qd_cmd, qd_rl)
 
+        def _geometry(key: str) -> np.ndarray | None:
+            value = result.get(key)
+            if value is None:
+                return None
+            if isinstance(value, torch.Tensor):
+                if value.numel() == 0:
+                    return None
+                value = value.detach().cpu().numpy()
+            array = np.asarray(value)
+            if array.size == 0:
+                return None
+            return array
+
         return {
             "cri_pre": cri_np,
             "qd_cmd": qd_cmd,
@@ -1075,4 +1092,6 @@ class CriSolver:
             "cbf_alpha": _as_float("cbf_alpha", self._cbf_alpha),
             "approach_limit": _as_float("approach_limit", self._approach_limit),
             "enabled": enabled,
+            "impact_jacobian": _geometry("impact_jacobian"),
+            "impact_dir": _geometry("impact_dir"),
         }

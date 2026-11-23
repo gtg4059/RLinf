@@ -296,6 +296,45 @@ def test_enabled_cri_filter_sends_the_linear_velocity_command():
     assert same is actions
 
 
+def test_approach_component_is_removed_before_the_hard_limit():
+    """Under a 0.96 peak, only the joint along dir loses its approach speed."""
+    from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.env import (
+        IsaaclabPickPlaceCubePlateEnv,
+    )
+
+    dt = 1.0 / 15.0
+    actions = torch.zeros(1, 8)
+    actions[0, 0] = 0.12
+    actions[0, 1] = 0.06
+    jac = torch.zeros(1, 8, 6, 7)
+    jac[0, 0, 0, 0] = 1.0
+    direction = torch.zeros(1, 8, 3)
+    direction[0, 0, 0] = 1.0
+    cri = torch.zeros(1, 9)
+    cri[0, 0] = 0.92
+
+    class _Solver:
+        def run_cri_filter(self, q_in, qd_in):
+            del q_in
+            return {
+                "qd_cmd": qd_in.detach().cpu().numpy() * 0.1,
+                "cri_pre": cri,
+                "impact_jacobian": jac,
+                "impact_dir": direction,
+            }
+
+    env = _filter_env(torch.zeros(1, 7), _Solver(), dt)
+    env._cri_limit = 0.96
+    env._cri_filter_target = 0.9
+    out = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(env, actions)
+    assert torch.allclose(out[0, 0], torch.zeros(1))
+    assert torch.allclose(out[0, 1], torch.tensor(0.06))
+
+    cri[0, 0] = 0.96
+    held = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(env, actions)
+    assert torch.allclose(held[0, :7], actions[0, :7])
+
+
 def test_near_handle_row_skips_the_command_filter():
     """A row marked near the handle keeps the policy target. CRI is unread."""
     from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.env import (

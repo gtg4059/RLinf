@@ -349,9 +349,9 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         )
         # Measured CRI is one run_cri_filter after the step, stored for the
         # next observation. When cri_filter_enabled is set, a solve before
-        # the step sends the library qd_cmd. The QP reduces dir · v_lin of
-        # points whose force or pressure exceeds cri_filter_target. The
-        # measured exceed line stays at 0.96.
+        # the step exports J and dir. While the 9-channel peak is under 0.96,
+        # the live command drops only dir · v_lin of points at or above
+        # cri_filter_target. A request already at 0.96 is left for the rewind.
         self._compute_cri = bool(init_params.get("compute_cri", True))
         self._cri_filter = bool(init_params.get("cri_filter", True))
         self._cri_limit = float(init_params.get("cri_limit", 0.96))
@@ -833,8 +833,8 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri import CriSolver
 
             # cri_pre is the forward CRI of the velocity passed in.
-            # The plant command is qd_cmd from the per-point QP. Its barrier
-            # is cri_filter_target (0.8). Measured overflow stays at 0.96.
+            # The plant command removes dir · v_lin while that peak is under
+            # cri_limit (0.96). Points at or above cri_filter_target lose it.
             self._cri_solver = CriSolver(
                 batch_size=max(int(self.num_envs), 1),
                 device=self.device,
@@ -955,19 +955,17 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         return torch.zeros(int(n), dtype=torch.bool, device=device)
 
     def _apply_enabled_cri_filter(self, actions, row_mask=None):
-        """Send the QP command that limits a point's approach linear speed.
+        """Remove ``dir · v_lin`` before the requested CRI peak reaches 0.96.
 
         The policy proposes an absolute joint target. The speed sent to the
         solver is ``(q_tgt - q) / dt`` clipped to the Panda velocity limit.
-        A collision point whose force or pressure exceeds the limit adds the
-        row ``g = J^T dir``. The QP moves ``qd`` only along ``g`` so that the
-        approach speed ``dir · v_lin`` meets the limit. The quantity reduced
-        is that linear speed. When the QP moves the command, the live row
-        takes the whole ``qd_cmd``, because a partial joint rewrite would
-        leave a velocity the linear model did not solve. When no point
-        exceeds the limit, the original absolute target stays. The gripper
-        channel stays as written. A gripper within the handle distance skips
-        this rewrite; that check reads distance only. Hold rows are left alone.
+        The library returns the linear Jacobian and the approach direction.
+        While the 9-channel peak of that request is under ``cri_limit``, each
+        point at or above ``cri_filter_target`` loses only the positive
+        approach ``dir · v_lin``. A row already at 0.96 keeps the request so
+        the rewind still sees it. The gripper channel stays as written. A
+        gripper within the handle distance skips this rewrite. Hold rows are
+        left alone.
         """
         if (
             not self._cri_filter_enabled
@@ -981,6 +979,7 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             apply_filtered_arm_targets,
             clip_arm_velocity,
             joint_command_changed,
+            subtract_approach_velocity,
         )
 
         act = torch.as_tensor(actions, device=self.device, dtype=torch.float32)
@@ -1008,14 +1007,32 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         qd_req = clip_arm_velocity(qd_nom, self._arm_qd_limit())
         result = self._get_cri_solver().run_cri_filter(q[:n], qd_req)
         self._cri_solve_count += 1
-        qd_lib = result.get("qd_cmd") if isinstance(result, dict) else None
-        if qd_lib is None:
-            qd_lib = qd_req[:, :7]
+        cri_pre = result.get("cri_pre") if isinstance(result, dict) else None
+        jac = result.get("impact_jacobian") if isinstance(result, dict) else None
+        dire = result.get("impact_dir") if isinstance(result, dict) else None
+        if jac is not None and dire is not None and cri_pre is not None:
+            # 9채널 최댓값이 0.96 미만일 때만, 넘친 점의 dir · v_lin만 뺀다.
+            qd_lib = subtract_approach_velocity(
+                qd_req[:, :7],
+                jac,
+                dire,
+                cri_pre,
+                hard_limit=float(getattr(self, "_cri_limit", 0.96)),
+                point_limit=float(getattr(self, "_cri_filter_target", 0.9)),
+            )
         else:
-            qd_lib = torch.as_tensor(qd_lib, device=act.device, dtype=torch.float32)
-            if qd_lib.ndim == 1:
-                qd_lib = qd_lib.unsqueeze(0)
-            qd_lib = qd_lib[:n, :7]
+            qd_lib = result.get("qd_cmd") if isinstance(result, dict) else None
+            if qd_lib is None:
+                qd_lib = qd_req[:, :7]
+            else:
+                qd_lib = torch.as_tensor(qd_lib, device=act.device, dtype=torch.float32)
+                if qd_lib.ndim == 1:
+                    qd_lib = qd_lib.unsqueeze(0)
+                qd_lib = qd_lib[:n, :7]
+        qd_lib = torch.as_tensor(qd_lib, device=act.device, dtype=torch.float32)
+        if qd_lib.ndim == 1:
+            qd_lib = qd_lib.unsqueeze(0)
+        qd_lib = qd_lib[:n, :7]
         changed = joint_command_changed(qd_req[:, :7], qd_lib)
         # dir · v_lin is a function of the whole qd. Once the QP moves any
         # joint, the plant must track that full command.

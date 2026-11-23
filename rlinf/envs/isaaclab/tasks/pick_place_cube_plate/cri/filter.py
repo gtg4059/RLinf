@@ -73,6 +73,79 @@ def clip_arm_velocity(
     return qd.clamp(-lim, lim)
 
 
+def subtract_approach_velocity(
+    qd: torch.Tensor,
+    jacobian: torch.Tensor | np.ndarray | None,
+    direction: torch.Tensor | np.ndarray | None,
+    cri: torch.Tensor | np.ndarray | None,
+    *,
+    hard_limit: float = 0.96,
+    point_limit: float = 0.9,
+) -> torch.Tensor:
+    """Remove ``dir · v_lin`` while the 9-channel CRI peak is still under 0.96.
+
+    ``v_lin = J[0:3] @ qd``. A point at or above ``point_limit`` loses the
+    positive approach ``dir · v_lin`` by the joint step ``(g · qd / ||g||^2) g``,
+    with ``g = J^T dir``. Points under ``point_limit`` keep their request.
+    A row whose peak is already at ``hard_limit`` is left unchanged so the
+    rewind path still sees that command.
+
+    Args:
+        qd: Requested joint velocity, ``(N, 7)``.
+        jacobian: Per-point spatial Jacobian, ``(N, P, 6, joints)``.
+        direction: Impact direction, ``(N, P, 3)``.
+        cri: Per-point CRI, ``(N, C)``. The row peak uses every channel.
+        hard_limit: Rewind line. Rows at or above it are not rewritten.
+        point_limit: A point at or above this loses its approach speed.
+
+    Returns:
+        Joint velocity with the approach component removed where required.
+    """
+    out = torch.as_tensor(qd, dtype=torch.float32).clone()
+    if out.ndim == 1:
+        out = out.unsqueeze(0)
+    if jacobian is None or direction is None or cri is None:
+        return out
+    jac = torch.as_tensor(jacobian, dtype=torch.float32, device=out.device)
+    dire = torch.as_tensor(direction, dtype=torch.float32, device=out.device)
+    cri_t = torch.as_tensor(cri, dtype=torch.float32, device=out.device)
+    if jac.ndim == 3:
+        jac = jac.unsqueeze(0)
+    if dire.ndim == 2:
+        dire = dire.unsqueeze(0)
+    if cri_t.ndim == 1:
+        cri_t = cri_t.unsqueeze(0)
+    if jac.ndim != 4 or jac.shape[-2] < 3 or dire.shape[-1] < 3:
+        return out
+    n = out.shape[0]
+    points = min(int(jac.shape[1]), int(dire.shape[1]), int(cri_t.shape[-1]))
+    joints = min(int(out.shape[-1]), int(jac.shape[-1]))
+    if n == 0 or points == 0 or joints == 0:
+        return out
+    peak = cri_t[:n].amax(dim=-1)
+    live = peak < float(hard_limit)
+    if not bool(live.any()):
+        return out
+    j_lin = jac[:n, :points, :3, :joints]
+    direc = dire[:n, :points, :3]
+    direc = direc / direc.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    point_cri = cri_t[:n, :points]
+    hot = live.unsqueeze(-1) & (point_cri >= float(point_limit))
+    qd_j = out[:n, :joints]
+    for p in range(points):
+        use = hot[:, p]
+        if not bool(use.any()):
+            continue
+        g = torch.einsum("nki,nk->ni", j_lin[:, p], direc[:, p])
+        approach = (g * qd_j).sum(dim=-1)
+        denom = (g * g).sum(dim=-1).clamp_min(1e-12)
+        step = (approach / denom).unsqueeze(-1) * g
+        take = use & (approach > 0.0)
+        qd_j = torch.where(take.unsqueeze(-1), qd_j - step, qd_j)
+    out[:n, :joints] = qd_j
+    return out
+
+
 def joint_command_changed(
     qd_req: torch.Tensor,
     qd_cmd: torch.Tensor,

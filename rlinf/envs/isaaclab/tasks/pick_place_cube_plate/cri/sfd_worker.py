@@ -145,6 +145,8 @@ def main() -> int:
                         "cbf_alpha": float(result["cbf_alpha"]),
                         "approach_limit": float(result["approach_limit"]),
                         "enabled": bool(result["enabled"]),
+                        "impact_jacobian": result.get("impact_jacobian"),
+                        "impact_dir": result.get("impact_dir"),
                     }
                 )
                 continue
