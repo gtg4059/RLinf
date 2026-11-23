@@ -19,6 +19,7 @@ from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.filter import (
     abs_joint_to_qd_nom,
     apply_filtered_arm_targets,
     shift_cri_filter_obs,
+    subtract_approach_velocity,
 )
 from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.constants import (
     CRI_OVF_TERM_PENALTY,
@@ -296,6 +297,35 @@ def test_enabled_cri_filter_sends_the_linear_velocity_command():
     assert same is actions
 
 
+def test_peak_point_keeps_tangential_linear_velocity():
+    """Only the highest-CRI point loses dir · v_lin. Its tangent stays."""
+    qd = torch.tensor([[1.0, 0.5, 0.4, 0.0, 0.0, 0.0, 0.0]])
+    jac = torch.zeros(1, 9, 6, 7)
+    jac[0, 3, 0, 0] = 1.0
+    jac[0, 3, 1, 1] = 1.0
+    jac[0, 0, 0, 2] = 1.0
+    direction = torch.zeros(1, 9, 3)
+    direction[0, 3, 0] = 1.0
+    direction[0, 0, 0] = 1.0
+    cri = torch.zeros(1, 9)
+    cri[0, 3] = 0.9
+    cri[0, 0] = 0.85
+
+    out = subtract_approach_velocity(
+        qd, jac, direction, cri, hard_limit=0.96, point_limit=0.8
+    )
+    assert torch.allclose(out[0, 0], torch.tensor(0.0), atol=1e-5)
+    assert torch.allclose(out[0, 1], torch.tensor(0.5), atol=1e-5)
+    assert torch.allclose(out[0, 2], torch.tensor(0.4), atol=1e-5)
+
+    leaving = qd.clone()
+    leaving[0, 0] = -1.0
+    kept = subtract_approach_velocity(
+        leaving, jac, direction, cri, hard_limit=0.96, point_limit=0.8
+    )
+    assert torch.allclose(kept, leaving)
+
+
 def test_approach_component_is_removed_before_the_hard_limit():
     """Under a 0.96 peak, only the joint along dir loses its approach speed."""
     from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.env import (
@@ -326,13 +356,35 @@ def test_approach_component_is_removed_before_the_hard_limit():
     env = _filter_env(torch.zeros(1, 7), _Solver(), dt)
     env._cri_limit = 0.96
     env._cri_filter_target = 0.9
+    env._cri_filter_direction_gain = 1.0
+    env._cri_filter_speed_enabled = False
+    env._cri_filter_strong_cri = 0.95
+    env._cri_filter_strong_target = 0.75
     out = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(env, actions)
     assert torch.allclose(out[0, 0], torch.zeros(1))
     assert torch.allclose(out[0, 1], torch.tensor(0.06))
 
     cri[0, 0] = 0.96
-    held = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(env, actions)
-    assert torch.allclose(held[0, :7], actions[0, :7])
+    direction_only = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(
+        env, actions
+    )
+    assert torch.allclose(direction_only[0, 0], torch.zeros(1))
+    assert torch.allclose(direction_only[0, 1], torch.tensor(0.06))
+
+    env._cri_filter_target = 0.92
+    env._cri_filter_direction_gain = 0.8
+    cri[0, 0] = 0.92
+    weighted = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(env, actions)
+    # At the gate, 80% of the approach delta is applied, so 20% of that joint remains.
+    assert torch.allclose(weighted[0, 0], torch.tensor(0.12 * 0.2))
+    assert torch.allclose(weighted[0, 1], torch.tensor(0.06))
+
+    env._cri_filter_speed_enabled = True
+    cri[0, 0] = 0.96
+    slowed = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(env, actions)
+    # Approach joint goes to 0, then the tangential joint is scaled by 0.75/0.96.
+    assert torch.allclose(slowed[0, 0], torch.zeros(1))
+    assert torch.allclose(slowed[0, 1], torch.tensor(0.06 * 0.75 / 0.96))
 
 
 def test_near_handle_row_skips_the_command_filter():

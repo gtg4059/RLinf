@@ -349,15 +349,31 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         )
         # Measured CRI is one run_cri_filter after the step, stored for the
         # next observation. When cri_filter_enabled is set, a solve before
-        # the step exports J and dir. While the 9-channel peak is under 0.96,
-        # the live command drops only dir · v_lin of points at or above
-        # cri_filter_target. A request already at 0.96 is left for the rewind.
+        # the step reads J and dir. The live command drops dir · v_lin of
+        # the highest-CRI point once the 9-point peak is at or above
+        # cri_filter_target. The direction-change weight is
+        # min(1, cri_filter_direction_gain * peak / cri_filter_target),
+        # including a request already over 0.96.
+        # cri_filter_speed_enabled also scales the arm toward
+        # cri_filter_strong_target once the peak reaches cri_filter_strong_cri.
         self._compute_cri = bool(init_params.get("compute_cri", True))
         self._cri_filter = bool(init_params.get("cri_filter", True))
         self._cri_limit = float(init_params.get("cri_limit", 0.96))
         self._cbf_alpha = float(init_params.get("cbf_alpha", 0.02))
         self._cri_filter_enabled = bool(init_params.get("cri_filter_enabled", False))
-        self._cri_filter_target = float(init_params.get("cri_filter_target", 0.8))
+        self._cri_filter_target = float(init_params.get("cri_filter_target", 0.92))
+        self._cri_filter_direction_gain = float(
+            init_params.get("cri_filter_direction_gain", 0.8)
+        )
+        self._cri_filter_speed_enabled = bool(
+            init_params.get("cri_filter_speed_enabled", False)
+        )
+        self._cri_filter_strong_cri = float(
+            init_params.get("cri_filter_strong_cri", 0.92)
+        )
+        self._cri_filter_strong_target = float(
+            init_params.get("cri_filter_strong_target", 0.0095)
+        )
         self._cri_penalty_weight = float(init_params.get("cri_penalty_weight", -0.02))
         # One charge on each spawn rewind. Hard mode still zeros the dense
         # barrier above; this cost stays.
@@ -833,13 +849,14 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri import CriSolver
 
             # cri_pre is the forward CRI of the velocity passed in.
-            # The plant command removes dir · v_lin while that peak is under
-            # cri_limit (0.96). Points at or above cri_filter_target lose it.
+            # J and dir come back with it. The plant command then removes
+            # dir · v_lin of the highest-CRI point while the 9-channel peak
+            # is under 0.96.
             self._cri_solver = CriSolver(
                 batch_size=max(int(self.num_envs), 1),
                 device=self.device,
                 cri_filter=True,
-                cri_limit=float(getattr(self, "_cri_filter_target", 0.8)),
+                cri_limit=float(getattr(self, "_cri_filter_target", 0.92)),
                 cbf_alpha=self._cbf_alpha,
                 filter_enabled=self._cri_filter_enabled,
             )
@@ -955,17 +972,25 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         return torch.zeros(int(n), dtype=torch.bool, device=device)
 
     def _apply_enabled_cri_filter(self, actions, row_mask=None):
-        """Remove ``dir · v_lin`` before the requested CRI peak reaches 0.96.
+        """Remove ``dir · v_lin`` of the highest-CRI point before 0.96.
 
         The policy proposes an absolute joint target. The speed sent to the
         solver is ``(q_tgt - q) / dt`` clipped to the Panda velocity limit.
-        The library returns the linear Jacobian and the approach direction.
-        While the 9-channel peak of that request is under ``cri_limit``, each
-        point at or above ``cri_filter_target`` loses only the positive
-        approach ``dir · v_lin``. A row already at 0.96 keeps the request so
-        the rewind still sees it. The gripper channel stays as written. A
-        gripper within the handle distance skips this rewrite. Hold rows are
-        left alone.
+        The library returns each point's linear Jacobian and impact direction.
+        The point with the largest CRI supplies ``J`` and ``dir``:
+
+            v_lin = J[..., :3, :] @ qd
+            approach = (dir * v_lin).sum(-1)
+            v_lin_tangential = v_lin - approach * dir
+
+        A 9-point peak at or above ``cri_filter_target`` applies
+        ``min(1, cri_filter_direction_gain * peak / cri_filter_target)`` of
+        the approach removal, including a request already over 0.96. The uniform speed
+        scale runs only when ``cri_filter_speed_enabled`` is set: at or
+        above ``cri_filter_strong_cri`` the remaining joint speed is then
+        multiplied by ``min(1, cri_filter_strong_target / peak)``. The
+        gripper channel stays as written. A gripper within the handle
+        distance skips this rewrite. Hold rows are left alone.
         """
         if (
             not self._cri_filter_enabled
@@ -1011,14 +1036,22 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         jac = result.get("impact_jacobian") if isinstance(result, dict) else None
         dire = result.get("impact_dir") if isinstance(result, dict) else None
         if jac is not None and dire is not None and cri_pre is not None:
-            # 9채널 최댓값이 0.96 미만일 때만, 넘친 점의 dir · v_lin만 뺀다.
+            # 속도 배율은 cri_filter_speed_enabled 일 때만 곱한다.
+            # 9점 최댓값이 cri_filter_target 이상이면 방향 수정 벡터를
+            # min(1, direction_gain * peak / target) 만큼 반영한다.
             qd_lib = subtract_approach_velocity(
                 qd_req[:, :7],
                 jac,
                 dire,
                 cri_pre,
                 hard_limit=float(getattr(self, "_cri_limit", 0.96)),
-                point_limit=float(getattr(self, "_cri_filter_target", 0.9)),
+                point_limit=float(getattr(self, "_cri_filter_target", 0.92)),
+                strong_cri=float(getattr(self, "_cri_filter_strong_cri", 0.92)),
+                strong_target=float(getattr(self, "_cri_filter_strong_target", 0.0095)),
+                apply_speed_scale=bool(
+                    getattr(self, "_cri_filter_speed_enabled", False)
+                ),
+                direction_gain=float(getattr(self, "_cri_filter_direction_gain", 0.8)),
             )
         else:
             qd_lib = result.get("qd_cmd") if isinstance(result, dict) else None
@@ -1034,8 +1067,8 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             qd_lib = qd_lib.unsqueeze(0)
         qd_lib = qd_lib[:n, :7]
         changed = joint_command_changed(qd_req[:, :7], qd_lib)
-        # dir · v_lin is a function of the whole qd. Once the QP moves any
-        # joint, the plant must track that full command.
+        # dir · v_lin depends on the whole qd. Once the approach removal
+        # moves any joint, the plant tracks that full command.
         row_hit = changed.any(dim=-1) & mask
         qd_used = torch.where(row_hit.unsqueeze(-1), qd_lib, qd_req[:, :7])
         IsaaclabPickPlaceCubePlateEnv._note_filter_speed(

@@ -15,9 +15,14 @@
 """CRI-F helpers matching IsaacLab ``articulation_data`` CBF-QP filter mode.
 
 - One ``run_cri_filter(q, qd_RL)`` per tick; policy CRI is ``cri_pre``.
-- Command is library ``qd_cmd``. A point over the force/pressure limit adds
-  one row ``g = J^T dir``, and the QP moves only along that row.
-- A joint the QP leaves on the request keeps its absolute target.
+- The call also returns ``impact_jacobian`` ``{robot, points, 6, joints}``
+  and ``impact_dir`` ``{robot, points, 3}``.
+- The point with the largest CRI supplies ``J`` and ``dir``. Its approach
+  ``dir · v_lin`` is removed and the tangential velocity at that point stays.
+- The uniform speed scale is off unless ``apply_speed_scale`` is set.
+  At or above the point limit the direction-change vector is applied with
+  weight ``min(1, direction_gain * peak / point_limit)``, so the configured
+  gain is the floor and a higher peak uses more of the cut.
 - Time-scale ``s`` is not used. ``delta = ||qd_cmd - qd_RL||``.
 """
 
@@ -80,26 +85,46 @@ def subtract_approach_velocity(
     cri: torch.Tensor | np.ndarray | None,
     *,
     hard_limit: float = 0.96,
-    point_limit: float = 0.9,
+    point_limit: float = 0.8,
+    strong_cri: float = 0.92,
+    strong_target: float = 0.0095,
+    apply_speed_scale: bool = False,
+    direction_gain: float = 1.0,
 ) -> torch.Tensor:
-    """Remove ``dir · v_lin`` while the 9-channel CRI peak is still under 0.96.
+    """Remove approach speed. Scale joint speed only when asked.
 
-    ``v_lin = J[0:3] @ qd``. A point at or above ``point_limit`` loses the
-    positive approach ``dir · v_lin`` by the joint step ``(g · qd / ||g||^2) g``,
-    with ``g = J^T dir``. Points under ``point_limit`` keep their request.
-    A row whose peak is already at ``hard_limit`` is left unchanged so the
-    rewind path still sees that command.
+    That point's linear Jacobian and impact direction give::
+
+        v_lin = impact_jacobian[..., :3, :] @ qd
+        approach = (impact_dir * v_lin).sum(-1)
+        v_lin_tangential = v_lin - approach * impact_dir
+
+    With the speed scale off, a 9-channel peak at or above ``point_limit``
+    applies ``min(1, direction_gain * peak / point_limit)`` of the joint
+    change that removes the highest point's incoming approach. At the limit
+    that weight equals ``direction_gain``; a higher peak uses more, up to the
+    full cut. Tangential speed stays, including a peak already over
+    ``hard_limit``. With the speed scale on, the full cut stays under
+    ``hard_limit`` and, at or above ``strong_cri``, is followed by
+    ``min(1, strong_target / peak)`` on every joint. Motion away from the
+    point keeps its sign. A row under ``point_limit`` keeps ``qd``.
 
     Args:
         qd: Requested joint velocity, ``(N, 7)``.
         jacobian: Per-point spatial Jacobian, ``(N, P, 6, joints)``.
         direction: Impact direction, ``(N, P, 3)``.
         cri: Per-point CRI, ``(N, C)``. The row peak uses every channel.
-        hard_limit: Rewind line. Rows at or above it are not rewritten.
-        point_limit: A point at or above this loses its approach speed.
+        hard_limit: Mild-path ceiling. Rows at or above it skip the mild cut.
+        point_limit: The peak point loses its approach at or above this.
+        strong_cri: 9-channel peak where the speed scale also applies.
+        strong_target: CRI the speed scale aims at once ``strong_cri`` is hit.
+        apply_speed_scale: When false, only the approach component is removed.
+        direction_gain: Floor weight of the approach-removal vector at
+            ``point_limit``. A weight of 1 applies the full cut.
 
     Returns:
-        Joint velocity with the approach component removed where required.
+        Joint velocity with that point's incoming approach removed. The
+        uniform speed scale runs only when ``apply_speed_scale`` is set.
     """
     out = torch.as_tensor(qd, dtype=torch.float32).clone()
     if out.ndim == 1:
@@ -118,31 +143,74 @@ def subtract_approach_velocity(
     if jac.ndim != 4 or jac.shape[-2] < 3 or dire.shape[-1] < 3:
         return out
     n = out.shape[0]
+    if int(cri_t.shape[0]) == 1 and n > 1:
+        cri_t = cri_t.expand(n, -1)
+    if int(jac.shape[0]) == 1 and n > 1:
+        jac = jac.expand(n, -1, -1, -1)
+    elif int(jac.shape[0]) < n:
+        n = int(jac.shape[0])
+    if int(dire.shape[0]) == 1 and n > 1:
+        dire = dire.expand(n, -1, -1)
+    elif int(dire.shape[0]) < n:
+        n = int(dire.shape[0])
+    if int(cri_t.shape[0]) < n:
+        n = int(cri_t.shape[0])
     points = min(int(jac.shape[1]), int(dire.shape[1]), int(cri_t.shape[-1]))
     joints = min(int(out.shape[-1]), int(jac.shape[-1]))
     if n == 0 or points == 0 or joints == 0:
         return out
     peak = cri_t[:n].amax(dim=-1)
-    live = peak < float(hard_limit)
-    if not bool(live.any()):
-        return out
-    j_lin = jac[:n, :points, :3, :joints]
-    direc = dire[:n, :points, :3]
-    direc = direc / direc.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    speed_on = bool(apply_speed_scale)
+    if speed_on:
+        strong = peak >= float(strong_cri)
+        mild = (peak < float(hard_limit)) & ~strong
+        if not bool((strong | mild).any()):
+            return out
+    else:
+        strong = torch.zeros(n, dtype=torch.bool, device=out.device)
+        mild = torch.ones(n, dtype=torch.bool, device=out.device)
     point_cri = cri_t[:n, :points]
-    hot = live.unsqueeze(-1) & (point_cri >= float(point_limit))
+    peak_idx = point_cri.argmax(dim=-1)
+    batch = torch.arange(n, device=out.device)
+    j_lin = jac[:n, :points, :3, :joints]
+    impact_dir = dire[:n, :points, :3][batch, peak_idx]
+    impact_dir = impact_dir / impact_dir.norm(dim=-1, keepdim=True).clamp_min(1e-8)
     qd_j = out[:n, :joints]
-    for p in range(points):
-        use = hot[:, p]
-        if not bool(use.any()):
-            continue
-        g = torch.einsum("nki,nk->ni", j_lin[:, p], direc[:, p])
-        approach = (g * qd_j).sum(dim=-1)
-        denom = (g * g).sum(dim=-1).clamp_min(1e-12)
-        step = (approach / denom).unsqueeze(-1) * g
-        take = use & (approach > 0.0)
-        qd_j = torch.where(take.unsqueeze(-1), qd_j - step, qd_j)
-    out[:n, :joints] = qd_j
+    # v_lin = impact_jacobian[..., :3, :] @ qd
+    # approach = (impact_dir * v_lin).sum(-1)
+    # v_lin_tangential = v_lin - approach * impact_dir
+    v_lin = torch.matmul(j_lin[batch, peak_idx], qd_j.unsqueeze(-1))
+    approach = (impact_dir * v_lin.squeeze(-1)).sum(-1, keepdim=True)
+    v_lin_tangential = v_lin.squeeze(-1) - approach * impact_dir
+    entering = approach.squeeze(-1) > 0.0
+    finite = torch.isfinite(v_lin_tangential).all(dim=-1)
+    point_hot = point_cri[batch, peak_idx] >= float(point_limit)
+    if not speed_on:
+        # The 9-channel peak is the direction gate. Speed scaling stays off.
+        point_hot = peak >= float(point_limit)
+    drop_approach = (strong | (mild & point_hot)) & entering & finite
+    delta_v = (v_lin_tangential - v_lin.squeeze(-1)).unsqueeze(-1)
+    delta_v = torch.where(
+        drop_approach.view(n, 1, 1), delta_v, torch.zeros_like(delta_v)
+    )
+    dq = torch.matmul(torch.linalg.pinv(j_lin[batch, peak_idx]), delta_v).squeeze(-1)
+    if speed_on:
+        qd_new = qd_j + dq
+    else:
+        # At point_limit the weight is direction_gain. Above it the weight rises to 1.
+        gain = (
+            float(direction_gain) * peak / max(float(point_limit), 1e-6)
+        ).clamp(max=1.0)
+        qd_new = qd_j + dq * gain.unsqueeze(-1)
+    if speed_on:
+        speed_scale = (float(strong_target) / peak.clamp_min(1e-6)).clamp(max=1.0)
+        qd_new = torch.where(
+            strong.unsqueeze(-1), qd_new * speed_scale.unsqueeze(-1), qd_new
+        )
+    lim = torch.as_tensor(DEFAULT_ARM_QD_LIMIT, device=out.device, dtype=out.dtype)
+    qd_new = qd_new.clamp(-lim[:joints], lim[:joints])
+    use = drop_approach | strong
+    out[:n, :joints] = torch.where(use.unsqueeze(-1), qd_new, qd_j)
     return out
 
 
@@ -153,17 +221,18 @@ def joint_command_changed(
     rel_tol: float = 1e-3,
     abs_tol: float = 1e-4,
 ) -> torch.Tensor:
-    """True for joints the linear-velocity projection moved.
+    """True for joints the approach removal moved.
 
-    The library projects ``qd_req`` along ``g = J^T dir`` so the reduced
-    quantity is the point's approach speed ``dir · v_lin``. A joint the
-    projection leaves on the request has a zero entry in every active row.
+    The correction realizes ``v_lin - (dir · v_lin) dir`` at the highest-CRI
+    point, so the reduced quantity is that point's approach speed. A joint
+    the correction leaves on the request stays at the absolute target when
+    no joint on the row moves.
 
     Args:
         qd_req: Clipped requested arm velocity, ``(N, 7)``.
-        qd_cmd: Library command, same shape.
-        rel_tol: Relative change that counts as a QP move.
-        abs_tol: Absolute change that counts as a QP move.
+        qd_cmd: Joint velocity after the approach removal, same shape.
+        rel_tol: Relative change that counts as a moved joint.
+        abs_tol: Absolute change that counts as a moved joint.
 
     Returns:
         A boolean mask, ``(N, 7)``.

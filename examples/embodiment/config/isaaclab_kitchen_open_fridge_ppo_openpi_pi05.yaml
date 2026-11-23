@@ -136,13 +136,20 @@ env:
       robot_pos: [4.603651840801024, -1.4710035928444452, 0.8]
       robot_rot: [0.70710678, 0.0, 0.0, 0.70710678]
       # Solver input is measured q and joint_vel after the step.
-      # A point whose force or pressure exceeds 0.8 adds g = J^T dir.
-      # The QP reduces that point's approach speed dir·v_lin, not ||qd||.
+      # Direction only. Once the 9-point peak is at or above 0.92, the
+      # approach-removal vector is applied with weight
+      # min(1, 0.8 * peak / 0.92). At 0.92 that weight is 80%, and a higher
+      # peak uses more of the cut, including a request over 0.96.
+      # cri_filter_speed_enabled is off, so joint speed is not scaled.
       # Measured overflow and rewind stay at 0.96.
       # filter_qd_req / filter_qd_used / filter_keep report the speeds.
       cri_filter: True
       cri_filter_enabled: True
-      cri_filter_target: 0.8
+      cri_filter_target: 0.92
+      cri_filter_direction_gain: 0.8
+      cri_filter_speed_enabled: false
+      cri_filter_strong_cri: 0.92
+      cri_filter_strong_target: 0.0095
       # Crossing the CRI limit rewinds the arm to the spawn pose.
       # The episode clock keeps running and that step pays 0. A door
       # already past 0.2 is left open, so the per-step +1 continues.
@@ -243,13 +250,20 @@ env:
       robot_pos: [4.603651840801024, -1.4710035928444452, 0.8]
       robot_rot: [0.70710678, 0.0, 0.0, 0.70710678]
       # Solver input is measured q and joint_vel after the step.
-      # A point whose force or pressure exceeds 0.8 adds g = J^T dir.
-      # The QP reduces that point's approach speed dir·v_lin, not ||qd||.
+      # Direction only. Once the 9-point peak is at or above 0.92, the
+      # approach-removal vector is applied with weight
+      # min(1, 0.8 * peak / 0.92). At 0.92 that weight is 80%, and a higher
+      # peak uses more of the cut, including a request over 0.96.
+      # cri_filter_speed_enabled is off, so joint speed is not scaled.
       # Measured overflow and rewind stay at 0.96.
       # filter_qd_req / filter_qd_used / filter_keep report the speeds.
       cri_filter: True
       cri_filter_enabled: True
-      cri_filter_target: 0.8
+      cri_filter_target: 0.92
+      cri_filter_direction_gain: 0.8
+      cri_filter_speed_enabled: false
+      cri_filter_strong_cri: 0.92
+      cri_filter_strong_target: 0.0095
       # Crossing the CRI limit rewinds the arm to the spawn pose.
       # The episode clock keeps running and that step pays 0. A door
       # already past 0.2 is left open, so the per-step +1 continues.
