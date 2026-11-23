@@ -249,7 +249,7 @@ def _filter_env(q, solver, dt):
 
 
 def test_enabled_cri_filter_rewrites_live_arm_targets():
-    """A request CRI of 0.96 keeps 0.8/0.96 of the speed. A hold row stays put."""
+    """The arm follows qd_cmd, including a joint the request did not move."""
     from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.env import (
         IsaaclabPickPlaceCubePlateEnv,
     )
@@ -260,18 +260,22 @@ def test_enabled_cri_filter_rewrites_live_arm_targets():
     # 0.12 rad in one control step is 1.8 rad/s, under the 2.175 limit.
     actions[:, 0] = 0.12
     actions[:, 7] = torch.tensor([0.0, 1.0])
-    kept = 0.8 / 0.96
 
     class _Solver:
         def run_cri_filter(self, q_in, qd_in):
             del q_in
+            cmd = qd_in.detach().cpu().numpy().copy()
+            # Not a scalar slowdown: joint 0 is eased, joint 1 is introduced.
+            cmd[:, 0] = 0.9
+            cmd[:, 1] = 0.3
             cri = torch.zeros(qd_in.shape[0], 9)
             cri[:, 0] = 0.96
-            return {"qd_cmd": qd_in.detach().cpu().numpy() * 0.5, "cri_pre": cri}
+            return {"qd_cmd": cmd, "cri_pre": cri}
 
     env = _filter_env(q, _Solver(), dt)
     out = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(env, actions)
-    assert torch.allclose(out[:, 0], torch.full((2,), 0.12 * kept))
+    assert torch.allclose(out[:, 0], torch.full((2,), 0.9 * dt))
+    assert torch.allclose(out[:, 1], torch.full((2,), 0.3 * dt))
     assert torch.equal(out[:, 7], actions[:, 7])
     assert torch.equal(actions[:, 0], torch.full((2,), 0.12))
     assert env._cri_solve_count == 1
@@ -280,8 +284,9 @@ def test_enabled_cri_filter_rewrites_live_arm_targets():
     masked = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(
         env, actions, row_mask=live
     )
-    assert torch.allclose(masked[0, 0], torch.tensor(0.12 * kept))
-    assert torch.allclose(masked[1, 0], torch.tensor(0.12))
+    assert torch.allclose(masked[0, 0], torch.tensor(0.9 * dt))
+    assert torch.allclose(masked[0, 1], torch.tensor(0.3 * dt))
+    assert torch.allclose(masked[1, :7], actions[1, :7])
 
     env._cri_filter_enabled = False
     same = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(env, actions)
@@ -289,7 +294,7 @@ def test_enabled_cri_filter_rewrites_live_arm_targets():
 
 
 def test_low_requested_cri_keeps_the_full_speed():
-    """A request CRI of 0.16 stays under 0.96, so the arm target is unchanged."""
+    """A library command equal to the request leaves the arm target unchanged."""
     from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.env import (
         IsaaclabPickPlaceCubePlateEnv,
     )
@@ -302,7 +307,7 @@ def test_low_requested_cri_keeps_the_full_speed():
         def run_cri_filter(self, q_in, qd_in):
             del q_in
             cri = torch.full((qd_in.shape[0], 9), 0.16)
-            return {"qd_cmd": qd_in.detach().cpu().numpy() * 0.5, "cri_pre": cri}
+            return {"qd_cmd": qd_in.detach().cpu().numpy(), "cri_pre": cri}
 
     env = _filter_env(torch.zeros(1, 7), _Solver(), dt)
     env.num_envs = 1

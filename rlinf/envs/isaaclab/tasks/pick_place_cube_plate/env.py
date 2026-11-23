@@ -349,15 +349,16 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         )
         # Measured CRI is one run_cri_filter after the step, stored for the
         # next observation. When cri_filter_enabled is set, a solve before
-        # the step slows the arm target only if that request's CRI is at or
-        # above cri_filter_trigger, aiming the output near cri_filter_target.
+        # the step replaces the arm target with qd_cmd. The library builds
+        # that command from dF/dv and dP/dv so the barrier sits at
+        # cri_filter_target (0.9). The hard exceed line stays at 0.96.
         self._compute_cri = bool(init_params.get("compute_cri", True))
         self._cri_filter = bool(init_params.get("cri_filter", True))
         self._cri_limit = float(init_params.get("cri_limit", 0.96))
         self._cbf_alpha = float(init_params.get("cbf_alpha", 0.02))
         self._cri_filter_enabled = bool(init_params.get("cri_filter_enabled", False))
         self._cri_filter_trigger = float(init_params.get("cri_filter_trigger", 0.96))
-        self._cri_filter_target = float(init_params.get("cri_filter_target", 0.8))
+        self._cri_filter_target = float(init_params.get("cri_filter_target", 0.9))
         self._cri_penalty_weight = float(init_params.get("cri_penalty_weight", -0.02))
         # One charge on each spawn rewind. Hard mode still zeros the dense
         # barrier above; this cost stays.
@@ -832,11 +833,14 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         if self._cri_solver is None:
             from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri import CriSolver
 
+            # Barrier zero for the force/pressure derivative QP. 0.9 keeps
+            # the command under the 0.96 hard line and pulls the arm less
+            # than a uniform scale down to 0.8.
             self._cri_solver = CriSolver(
                 batch_size=max(int(self.num_envs), 1),
                 device=self.device,
                 cri_filter=True,
-                cri_limit=self._cri_limit,
+                cri_limit=self._cri_filter_target,
                 cbf_alpha=self._cbf_alpha,
                 filter_enabled=self._cri_filter_enabled,
             )
@@ -944,15 +948,16 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         return self._arm_qd_limit_cache
 
     def _apply_enabled_cri_filter(self, actions, row_mask=None):
-        """Slow the arm target when the requested CRI is at least 0.96.
+        """Send the arm along the force/pressure derivative command.
 
         The policy proposes an absolute joint target. The speed sent to the
         solver is ``(q_tgt - q) / dt`` clipped to the Panda velocity limit.
-        ``cri_pre`` is the CRI of that request. A peak below the trigger
-        keeps the request. A peak of 0.96 is scaled by ``0.8 / 0.96``, so a
-        CRI that grows with speed lands near 0.8. The gripper channel stays
-        as written. Hold rows are left alone. With the filter off, the
-        original target is sent.
+        ``run_cri_filter`` evaluates the force and pressure networks, forms
+        ``dF/dv`` and ``dP/dv``, and returns ``qd_cmd``. The barrier for that
+        command is ``cri_filter_target`` (0.9), which stays under the 0.96
+        hard line and distorts the request less than a uniform scale to 0.8.
+        The gripper channel stays as written. Hold rows are left alone. With
+        the filter off, the original target is sent.
         """
         if (
             not self._cri_filter_enabled
@@ -965,7 +970,6 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             abs_joint_to_qd_nom,
             apply_filtered_arm_targets,
             clip_arm_velocity,
-            cri_output_speed_scale,
         )
 
         act = torch.as_tensor(actions, device=self.device, dtype=torch.float32)
@@ -989,17 +993,14 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         qd_req = clip_arm_velocity(qd_nom, self._arm_qd_limit())
         result = self._get_cri_solver().run_cri_filter(q[:n], qd_req)
         self._cri_solve_count += 1
-        cri_pre = result.get("cri_pre") if isinstance(result, dict) else None
-        scale = cri_output_speed_scale(
-            None if cri_pre is None else torch.as_tensor(cri_pre),
-            trigger=float(getattr(self, "_cri_filter_trigger", 0.96)),
-            target=float(getattr(self, "_cri_filter_target", 0.8)),
-        )
-        if scale is None:
-            scale = torch.ones(n, device=act.device, dtype=torch.float32)
+        qd_cmd = result.get("qd_cmd") if isinstance(result, dict) else None
+        if qd_cmd is None:
+            qd_used = qd_req[:, :7]
         else:
-            scale = scale.to(device=act.device, dtype=torch.float32).reshape(-1)[:n]
-        qd_used = qd_req[:, :7] * scale.unsqueeze(-1)
+            qd_used = torch.as_tensor(qd_cmd, device=act.device, dtype=torch.float32)
+            if qd_used.ndim == 1:
+                qd_used = qd_used.unsqueeze(0)
+            qd_used = qd_used[:n, :7]
         IsaaclabPickPlaceCubePlateEnv._note_filter_speed(
             self, qd_req[:, :7], qd_used, mask
         )

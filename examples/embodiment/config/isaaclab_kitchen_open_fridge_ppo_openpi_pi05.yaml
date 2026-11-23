@@ -136,13 +136,14 @@ env:
       robot_pos: [4.603651840801024, -1.4710035928444452, 0.8]
       robot_rot: [0.70710678, 0.0, 0.0, 0.70710678]
       # Solver input is measured q and joint_vel after the step.
-      # A request whose CRI is at least 0.96 is slowed by 0.8 / CRI,
-      # so the command CRI lands near 0.8. Below 0.96 the request is kept.
+      # The command is the library qd_cmd from dF/dv and dP/dv.
+      # The barrier is 0.9, under the 0.96 hard line, so the arm is
+      # pulled less than a uniform scale down to 0.8.
       # filter_qd_req / filter_qd_used / filter_keep report the speeds.
       cri_filter: True
       cri_filter_enabled: True
       cri_filter_trigger: 0.96
-      cri_filter_target: 0.8
+      cri_filter_target: 0.9
       # Crossing the CRI limit rewinds the arm to the spawn pose.
       # The episode clock keeps running and that step pays 0. A door
       # already past 0.2 is left open, so the per-step +1 continues.
@@ -242,13 +243,14 @@ env:
       robot_pos: [4.603651840801024, -1.4710035928444452, 0.8]
       robot_rot: [0.70710678, 0.0, 0.0, 0.70710678]
       # Solver input is measured q and joint_vel after the step.
-      # A request whose CRI is at least 0.96 is slowed by 0.8 / CRI,
-      # so the command CRI lands near 0.8. Below 0.96 the request is kept.
+      # The command is the library qd_cmd from dF/dv and dP/dv.
+      # The barrier is 0.9, under the 0.96 hard line, so the arm is
+      # pulled less than a uniform scale down to 0.8.
       # filter_qd_req / filter_qd_used / filter_keep report the speeds.
       cri_filter: True
       cri_filter_enabled: True
       cri_filter_trigger: 0.96
-      cri_filter_target: 0.8
+      cri_filter_target: 0.9
       # Crossing the CRI limit rewinds the arm to the spawn pose.
       # The episode clock keeps running and that step pays 0. A door
       # already past 0.2 is left open, so the per-step +1 continues.
