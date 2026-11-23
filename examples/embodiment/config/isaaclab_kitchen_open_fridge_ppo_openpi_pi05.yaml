@@ -136,14 +136,13 @@ env:
       robot_pos: [4.603651840801024, -1.4710035928444452, 0.8]
       robot_rot: [0.70710678, 0.0, 0.0, 0.70710678]
       # Solver input is measured q and joint_vel after the step.
-      # The command is the library qd_cmd from dF/dv and dP/dv.
-      # The barrier is 0.9, under the 0.96 hard line, so the arm is
-      # pulled less than a uniform scale down to 0.8.
+      # A point whose force or pressure exceeds 0.8 adds g = J^T dir.
+      # The QP reduces that point's approach speed dir·v_lin, not ||qd||.
+      # Measured overflow and rewind stay at 0.96.
       # filter_qd_req / filter_qd_used / filter_keep report the speeds.
       cri_filter: True
       cri_filter_enabled: True
-      cri_filter_trigger: 0.96
-      cri_filter_target: 0.9
+      cri_filter_target: 0.8
       # Crossing the CRI limit rewinds the arm to the spawn pose.
       # The episode clock keeps running and that step pays 0. A door
       # already past 0.2 is left open, so the per-step +1 continues.
@@ -153,6 +152,7 @@ env:
       cri_chunk_penalty: 0.0
       cri_rewind_penalty: 0.0
       cri_penalty_limit: 0.96
+      # Within this gap the command filter is off. The check is distance only.
       cri_handle_relax_distance_m: 0.12
       cri_handle_relax_limit: 3.0
       cri_boundary_rewind: true
@@ -243,14 +243,13 @@ env:
       robot_pos: [4.603651840801024, -1.4710035928444452, 0.8]
       robot_rot: [0.70710678, 0.0, 0.0, 0.70710678]
       # Solver input is measured q and joint_vel after the step.
-      # The command is the library qd_cmd from dF/dv and dP/dv.
-      # The barrier is 0.9, under the 0.96 hard line, so the arm is
-      # pulled less than a uniform scale down to 0.8.
+      # A point whose force or pressure exceeds 0.8 adds g = J^T dir.
+      # The QP reduces that point's approach speed dir·v_lin, not ||qd||.
+      # Measured overflow and rewind stay at 0.96.
       # filter_qd_req / filter_qd_used / filter_keep report the speeds.
       cri_filter: True
       cri_filter_enabled: True
-      cri_filter_trigger: 0.96
-      cri_filter_target: 0.9
+      cri_filter_target: 0.8
       # Crossing the CRI limit rewinds the arm to the spawn pose.
       # The episode clock keeps running and that step pays 0. A door
       # already past 0.2 is left open, so the per-step +1 continues.
@@ -260,6 +259,7 @@ env:
       cri_chunk_penalty: 0.0
       cri_rewind_penalty: 0.0
       cri_penalty_limit: 0.96
+      # Within this gap the command filter is off. The check is distance only.
       cri_handle_relax_distance_m: 0.12
       cri_handle_relax_limit: 3.0
       cri_boundary_rewind: true

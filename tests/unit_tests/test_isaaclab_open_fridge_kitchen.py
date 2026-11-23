@@ -674,6 +674,25 @@ def test_cri_limit_is_3_within_8cm_of_the_handle():
     assert limits[3].item() == pytest.approx(0.96)
 
 
+def test_command_filter_is_off_within_12cm_of_the_handle():
+    """12 cm and closer skips the filter. Farther and a missing handle do not."""
+    env = IsaaclabOpenFridgeKitchenEnv.__new__(IsaaclabOpenFridgeKitchenEnv)
+    env._cri_handle_relax_distance_m = 0.12
+    # 11 cm gap is inside the radius. 13 cm is outside. A zero-length
+    # segment is not a handle.
+    env._last_handle_reach = torch.tensor(
+        [
+            [0.133, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2],
+            [0.153, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2],
+            [0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    off = env._cri_filter_suppressed(3, torch.device("cpu"))
+    assert off.tolist() == [True, False, False]
+    env._last_handle_reach = None
+    assert not bool(env._cri_filter_suppressed(3, torch.device("cpu")).any())
+
+
 def test_cri_limit_is_3_within_12cm_of_the_handle():
     """12 cm and closer uses 3. 12.1 cm stays at 0.96."""
     distance = torch.tensor([0.12, 0.121])

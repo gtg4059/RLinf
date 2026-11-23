@@ -248,8 +248,8 @@ def _filter_env(q, solver, dt):
     )
 
 
-def test_enabled_cri_filter_rewrites_live_arm_targets():
-    """The arm follows qd_cmd, including a joint the request did not move."""
+def test_enabled_cri_filter_sends_the_linear_velocity_command():
+    """A projected approach speed replaces the whole arm command for that row."""
     from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.env import (
         IsaaclabPickPlaceCubePlateEnv,
     )
@@ -257,40 +257,69 @@ def test_enabled_cri_filter_rewrites_live_arm_targets():
     dt = 1.0 / 15.0
     q = torch.zeros(2, 7)
     actions = torch.zeros(2, 8)
-    # 0.12 rad in one control step is 1.8 rad/s, under the 2.175 limit.
-    actions[:, 0] = 0.12
+    # Joint 0 asks for 15 rad/s and is clipped to 2.175 before the QP.
+    # Joint 3 is the component along g = J^T dir and comes back at 0.4.
+    actions[:, 0] = 1.0
+    actions[:, 3] = 0.12
     actions[:, 7] = torch.tensor([0.0, 1.0])
 
     class _Solver:
         def run_cri_filter(self, q_in, qd_in):
             del q_in
-            cmd = qd_in.detach().cpu().numpy().copy()
-            # Not a scalar slowdown: joint 0 is eased, joint 1 is introduced.
-            cmd[:, 0] = 0.9
-            cmd[:, 1] = 0.3
+            got = qd_in.detach().cpu()
+            assert float(got[0, 0]) <= 2.175 + 1e-5
+            cmd = got.numpy().copy()
+            cmd[:, 3] = 0.4
             cri = torch.zeros(qd_in.shape[0], 9)
-            cri[:, 0] = 0.96
+            cri[:, 0] = 1.70
             return {"qd_cmd": cmd, "cri_pre": cri}
 
     env = _filter_env(q, _Solver(), dt)
     out = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(env, actions)
-    assert torch.allclose(out[:, 0], torch.full((2,), 0.9 * dt))
-    assert torch.allclose(out[:, 1], torch.full((2,), 0.3 * dt))
+    assert torch.allclose(out[:, 0], torch.full((2,), 2.175 * dt))
+    assert torch.allclose(out[:, 3], torch.full((2,), 0.4 * dt))
+    assert torch.allclose(out[:, 1], torch.zeros(2))
     assert torch.equal(out[:, 7], actions[:, 7])
-    assert torch.equal(actions[:, 0], torch.full((2,), 0.12))
+    assert torch.equal(actions[:, 0], torch.full((2,), 1.0))
     assert env._cri_solve_count == 1
 
     live = torch.tensor([True, False])
     masked = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(
         env, actions, row_mask=live
     )
-    assert torch.allclose(masked[0, 0], torch.tensor(0.9 * dt))
-    assert torch.allclose(masked[0, 1], torch.tensor(0.3 * dt))
+    assert torch.allclose(masked[0, 0], torch.tensor(2.175 * dt))
+    assert torch.allclose(masked[0, 3], torch.tensor(0.4 * dt))
     assert torch.allclose(masked[1, :7], actions[1, :7])
 
     env._cri_filter_enabled = False
     same = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(env, actions)
     assert same is actions
+
+
+def test_near_handle_row_skips_the_command_filter():
+    """A row marked near the handle keeps the policy target. CRI is unread."""
+    from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.env import (
+        IsaaclabPickPlaceCubePlateEnv,
+    )
+
+    dt = 1.0 / 15.0
+    actions = torch.zeros(2, 8)
+    actions[:, 0] = 0.12
+
+    class _Solver:
+        def run_cri_filter(self, q_in, qd_in):
+            del q_in
+            cmd = qd_in.detach().cpu().numpy().copy()
+            cmd[:, 0] = 0.2
+            return {"qd_cmd": cmd, "cri_pre": torch.ones(qd_in.shape[0], 9)}
+
+    env = _filter_env(torch.zeros(2, 7), _Solver(), dt)
+    env._cri_filter_suppressed = lambda n, device: torch.tensor(
+        [True, False], device=device
+    )
+    out = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(env, actions)
+    assert torch.allclose(out[0, 0], torch.tensor(0.12))
+    assert torch.allclose(out[1, 0], torch.tensor(0.2 * dt))
 
 
 def test_low_requested_cri_keeps_the_full_speed():

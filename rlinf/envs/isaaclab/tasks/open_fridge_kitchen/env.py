@@ -262,6 +262,24 @@ class IsaaclabOpenFridgeKitchenEnv(IsaaclabPickPlaceCubePlateEnv):
         if opened is not None:
             opened.zero_()
 
+    def _cri_filter_suppressed(self, n: int, device) -> torch.Tensor:
+        """Turn the command filter off when the gripper is near the handle.
+
+        The radius is ``cri_handle_relax_distance_m``. A missing handle
+        segment stays filtered. CRI is not read.
+        """
+        off = torch.zeros(int(n), dtype=torch.bool, device=device)
+        reach = getattr(self, "_last_handle_reach", None)
+        distance_m = getattr(self, "_cri_handle_relax_distance_m", None)
+        if reach is None or distance_m is None or int(reach.shape[-1]) < 9:
+            return off
+        distance, valid = handle_reach_distance(reach)
+        near = valid.reshape(-1) & (distance.reshape(-1) <= float(distance_m))
+        near = near.to(device=device)
+        count = min(int(n), int(near.shape[0]))
+        off[:count] = near[:count]
+        return off
+
     def _cri_ovf_term_limits(self) -> float | torch.Tensor:
         """Raise the reset level near the handle. Farther rows keep 0.96."""
         base = float(self._cri_ovf_term_threshold)

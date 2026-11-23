@@ -349,16 +349,15 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         )
         # Measured CRI is one run_cri_filter after the step, stored for the
         # next observation. When cri_filter_enabled is set, a solve before
-        # the step replaces the arm target with qd_cmd. The library builds
-        # that command from dF/dv and dP/dv so the barrier sits at
-        # cri_filter_target (0.9). The hard exceed line stays at 0.96.
+        # the step sends the library qd_cmd. The QP reduces dir · v_lin of
+        # points whose force or pressure exceeds cri_filter_target. The
+        # measured exceed line stays at 0.96.
         self._compute_cri = bool(init_params.get("compute_cri", True))
         self._cri_filter = bool(init_params.get("cri_filter", True))
         self._cri_limit = float(init_params.get("cri_limit", 0.96))
         self._cbf_alpha = float(init_params.get("cbf_alpha", 0.02))
         self._cri_filter_enabled = bool(init_params.get("cri_filter_enabled", False))
-        self._cri_filter_trigger = float(init_params.get("cri_filter_trigger", 0.96))
-        self._cri_filter_target = float(init_params.get("cri_filter_target", 0.9))
+        self._cri_filter_target = float(init_params.get("cri_filter_target", 0.8))
         self._cri_penalty_weight = float(init_params.get("cri_penalty_weight", -0.02))
         # One charge on each spawn rewind. Hard mode still zeros the dense
         # barrier above; this cost stays.
@@ -833,14 +832,14 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         if self._cri_solver is None:
             from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri import CriSolver
 
-            # Barrier zero for the force/pressure derivative QP. 0.9 keeps
-            # the command under the 0.96 hard line and pulls the arm less
-            # than a uniform scale down to 0.8.
+            # cri_pre is the forward CRI of the velocity passed in.
+            # The plant command is qd_cmd from the per-point QP. Its barrier
+            # is cri_filter_target (0.8). Measured overflow stays at 0.96.
             self._cri_solver = CriSolver(
                 batch_size=max(int(self.num_envs), 1),
                 device=self.device,
                 cri_filter=True,
-                cri_limit=self._cri_filter_target,
+                cri_limit=float(getattr(self, "_cri_filter_target", 0.8)),
                 cbf_alpha=self._cbf_alpha,
                 filter_enabled=self._cri_filter_enabled,
             )
@@ -947,17 +946,28 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         )
         return self._arm_qd_limit_cache
 
+    def _cri_filter_suppressed(self, n: int, device) -> torch.Tensor:
+        """Rows that skip the command filter. The base task suppresses none.
+
+        The fridge task turns the filter off from gripper-to-handle distance.
+        That decision does not read CRI.
+        """
+        return torch.zeros(int(n), dtype=torch.bool, device=device)
+
     def _apply_enabled_cri_filter(self, actions, row_mask=None):
-        """Send the arm along the force/pressure derivative command.
+        """Send the QP command that limits a point's approach linear speed.
 
         The policy proposes an absolute joint target. The speed sent to the
         solver is ``(q_tgt - q) / dt`` clipped to the Panda velocity limit.
-        ``run_cri_filter`` evaluates the force and pressure networks, forms
-        ``dF/dv`` and ``dP/dv``, and returns ``qd_cmd``. The barrier for that
-        command is ``cri_filter_target`` (0.9), which stays under the 0.96
-        hard line and distorts the request less than a uniform scale to 0.8.
-        The gripper channel stays as written. Hold rows are left alone. With
-        the filter off, the original target is sent.
+        A collision point whose force or pressure exceeds the limit adds the
+        row ``g = J^T dir``. The QP moves ``qd`` only along ``g`` so that the
+        approach speed ``dir · v_lin`` meets the limit. The quantity reduced
+        is that linear speed. When the QP moves the command, the live row
+        takes the whole ``qd_cmd``, because a partial joint rewrite would
+        leave a velocity the linear model did not solve. When no point
+        exceeds the limit, the original absolute target stays. The gripper
+        channel stays as written. A gripper within the handle distance skips
+        this rewrite; that check reads distance only. Hold rows are left alone.
         """
         if (
             not self._cri_filter_enabled
@@ -970,6 +980,7 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             abs_joint_to_qd_nom,
             apply_filtered_arm_targets,
             clip_arm_velocity,
+            joint_command_changed,
         )
 
         act = torch.as_tensor(actions, device=self.device, dtype=torch.float32)
@@ -987,33 +998,38 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             if int(mask.numel()) < n:
                 return actions
             mask = mask[:n]
+        suppress = getattr(self, "_cri_filter_suppressed", None)
+        if callable(suppress):
+            near_handle = suppress(n, act.device)
+            mask = mask & ~near_handle.reshape(-1)[:n]
         if not bool(mask.any()):
             return actions
         qd_nom = abs_joint_to_qd_nom(act[:n, :7], q[:n], self._cri_step_dt)
         qd_req = clip_arm_velocity(qd_nom, self._arm_qd_limit())
         result = self._get_cri_solver().run_cri_filter(q[:n], qd_req)
         self._cri_solve_count += 1
-        qd_cmd = result.get("qd_cmd") if isinstance(result, dict) else None
-        if qd_cmd is None:
-            qd_used = qd_req[:, :7]
+        qd_lib = result.get("qd_cmd") if isinstance(result, dict) else None
+        if qd_lib is None:
+            qd_lib = qd_req[:, :7]
         else:
-            qd_used = torch.as_tensor(qd_cmd, device=act.device, dtype=torch.float32)
-            if qd_used.ndim == 1:
-                qd_used = qd_used.unsqueeze(0)
-            qd_used = qd_used[:n, :7]
+            qd_lib = torch.as_tensor(qd_lib, device=act.device, dtype=torch.float32)
+            if qd_lib.ndim == 1:
+                qd_lib = qd_lib.unsqueeze(0)
+            qd_lib = qd_lib[:n, :7]
+        changed = joint_command_changed(qd_req[:, :7], qd_lib)
+        # dir · v_lin is a function of the whole qd. Once the QP moves any
+        # joint, the plant must track that full command.
+        row_hit = changed.any(dim=-1) & mask
+        qd_used = torch.where(row_hit.unsqueeze(-1), qd_lib, qd_req[:, :7])
         IsaaclabPickPlaceCubePlateEnv._note_filter_speed(
             self, qd_req[:, :7], qd_used, mask
         )
         filtered = apply_filtered_arm_targets(
-            act[:n], q[:n], qd_used, self._cri_step_dt
+            act[:n], q[:n], qd_lib, self._cri_step_dt
         )
-        delta = torch.linalg.norm(qd_used - qd_req[:, :7], dim=-1)
-        scale = torch.linalg.norm(qd_req[:, :7], dim=-1).clamp_min(1e-6)
-        intervened = delta > torch.maximum(1e-3 * scale, torch.full_like(scale, 1e-4))
-        use = mask & intervened
         merged = act.clone()
         arm = merged[:n, :7]
-        merged[:n, :7] = torch.where(use.unsqueeze(-1), filtered[:, :7], arm)
+        merged[:n, :7] = torch.where(row_hit.unsqueeze(-1), filtered[:, :7], arm)
         filtered = merged
         if squeeze:
             filtered = filtered.squeeze(0)

@@ -15,8 +15,10 @@
 """CRI-F helpers matching IsaacLab ``articulation_data`` CBF-QP filter mode.
 
 - One ``run_cri_filter(q, qd_RL)`` per tick; policy CRI is ``cri_pre``.
-- Command is library ``qd_cmd`` (``u*``). Time-scale ``s`` is not used.
-- ``delta = ||qd_cmd - qd_RL||``.
+- Command is library ``qd_cmd``. A point over the force/pressure limit adds
+  one row ``g = J^T dir``, and the QP moves only along that row.
+- A joint the QP leaves on the request keeps its absolute target.
+- Time-scale ``s`` is not used. ``delta = ||qd_cmd - qd_RL||``.
 """
 
 from __future__ import annotations
@@ -54,41 +56,6 @@ def abs_joint_to_qd_nom(
 DEFAULT_ARM_QD_LIMIT = (2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61)
 
 
-def cri_output_speed_scale(
-    cri: torch.Tensor | None,
-    *,
-    trigger: float = 0.96,
-    target: float = 0.8,
-) -> torch.Tensor | None:
-    """Scale joint speed so a CRI at or above ``trigger`` lands near ``target``.
-
-    CRI is treated as linear in speed. A peak of 0.96 with a target of 0.8
-    keeps ``0.8 / 0.96`` of the requested speed. Peaks below ``trigger`` keep
-    the full request. ``None`` means the caller has no CRI and should not slow
-    the command.
-
-    Args:
-        cri: Per-row CRI, shape ``(N,)`` or ``(N, K)``. The row peak is used.
-        trigger: Requested CRI at which slowing starts.
-        target: CRI the scaled command should land near.
-
-    Returns:
-        A per-row speed fraction in ``(0, 1]``, or ``None`` when ``cri`` is.
-    """
-    if cri is None:
-        return None
-    peak = torch.as_tensor(cri, dtype=torch.float32)
-    if peak.ndim > 1:
-        peak = peak.amax(dim=-1)
-    peak = peak.clamp(min=0.0)
-    scale = torch.ones_like(peak)
-    if trigger <= 0.0 or target <= 0.0:
-        return scale
-    hot = peak >= float(trigger)
-    slowed = (float(target) / peak.clamp(min=float(trigger))).clamp(max=1.0)
-    return torch.where(hot, slowed, scale)
-
-
 def clip_arm_velocity(
     qd: torch.Tensor,
     limit: torch.Tensor | tuple[float, ...] = DEFAULT_ARM_QD_LIMIT,
@@ -104,6 +71,36 @@ def clip_arm_velocity(
         lim = lim.expand(qd.shape[-1])
     lim = lim[: qd.shape[-1]]
     return qd.clamp(-lim, lim)
+
+
+def joint_command_changed(
+    qd_req: torch.Tensor,
+    qd_cmd: torch.Tensor,
+    *,
+    rel_tol: float = 1e-3,
+    abs_tol: float = 1e-4,
+) -> torch.Tensor:
+    """True for joints the linear-velocity projection moved.
+
+    The library projects ``qd_req`` along ``g = J^T dir`` so the reduced
+    quantity is the point's approach speed ``dir · v_lin``. A joint the
+    projection leaves on the request has a zero entry in every active row.
+
+    Args:
+        qd_req: Clipped requested arm velocity, ``(N, 7)``.
+        qd_cmd: Library command, same shape.
+        rel_tol: Relative change that counts as a QP move.
+        abs_tol: Absolute change that counts as a QP move.
+
+    Returns:
+        A boolean mask, ``(N, 7)``.
+    """
+    req = torch.as_tensor(qd_req)
+    cmd = torch.as_tensor(qd_cmd, device=req.device, dtype=req.dtype)
+    delta = (cmd - req).abs()
+    scale = req.abs().clamp_min(1e-6)
+    tol = torch.maximum(rel_tol * scale, torch.full_like(scale, abs_tol))
+    return delta > tol
 
 
 def apply_filtered_arm_targets(
