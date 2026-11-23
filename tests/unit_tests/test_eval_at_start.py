@@ -29,10 +29,10 @@ from rlinf.utils.runner_utils import (
 from rlinf.workers.env.env_worker import EnvWorker
 
 
-def test_should_eval_at_start_only_at_step_zero():
+def test_should_eval_at_start_covers_a_resumed_step():
     cfg = OmegaConf.create({"runner": {"eval_at_start": True}})
     assert should_eval_at_start(cfg, 0)
-    assert not should_eval_at_start(cfg, 1)
+    assert should_eval_at_start(cfg, 1100)
 
 
 def test_should_eval_at_start_respects_flag():

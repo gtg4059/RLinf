@@ -315,10 +315,13 @@ class EmbodiedRunner:
         return rollout_metrics, training_metrics
 
     def _maybe_eval_at_start(self) -> dict:
-        """Evaluate (and record videos) at global step 0 before the first update."""
+        """Evaluate (and record videos) once before the first update."""
         if not should_eval_at_start(self.cfg, self.global_step):
             return {}
-        self.logger.info("Evaluating the initial policy at step 0.")
+        self.logger.info(
+            "Evaluating the loaded policy before the first update at step %s.",
+            self.global_step,
+        )
         start_time = time.time()
         self.actor.set_global_step(self.global_step)
         self.rollout.set_global_step(self.global_step)

@@ -347,14 +347,17 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._gripper_keys = tuple(
             init_params.get("gripper_keys", _DEFAULT_GRIPPER_KEYS)
         )
-        # IsaacLab CRI-F: one run_cri_filter(q, qd) per env.step.
-        # cri_filter_enabled changes only the commanded trajectory.
-        # Policy CRI is always the previous step (reset/first obs = 0).
+        # Measured CRI is one run_cri_filter after the step, stored for the
+        # next observation. When cri_filter_enabled is set, a solve before
+        # the step slows the arm target only if that request's CRI is at or
+        # above cri_filter_trigger, aiming the output near cri_filter_target.
         self._compute_cri = bool(init_params.get("compute_cri", True))
         self._cri_filter = bool(init_params.get("cri_filter", True))
         self._cri_limit = float(init_params.get("cri_limit", 0.96))
         self._cbf_alpha = float(init_params.get("cbf_alpha", 0.02))
         self._cri_filter_enabled = bool(init_params.get("cri_filter_enabled", False))
+        self._cri_filter_trigger = float(init_params.get("cri_filter_trigger", 0.96))
+        self._cri_filter_target = float(init_params.get("cri_filter_target", 0.8))
         self._cri_penalty_weight = float(init_params.get("cri_penalty_weight", -0.02))
         # One charge on each spawn rewind. Hard mode still zeros the dense
         # barrier above; this cost stays.
@@ -488,6 +491,18 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._action_rate_sum = torch.zeros(
             self.num_envs, dtype=torch.float32, device=self.device
         )
+        self._filter_qd_req_sum = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self._filter_qd_used_sum = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self._filter_keep_sum = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
+        self._filter_steps = torch.zeros(
+            self.num_envs, dtype=torch.float32, device=self.device
+        )
         self._prev_action = None
         self._prev_action_valid = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
@@ -572,6 +587,11 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
                 self._time_penalty_sum.index_fill_(0, ids, 0.0)
             if getattr(self, "_action_rate_sum", None) is not None:
                 self._action_rate_sum.index_fill_(0, ids, 0.0)
+            if getattr(self, "_filter_steps", None) is not None:
+                self._filter_qd_req_sum.index_fill_(0, ids, 0.0)
+                self._filter_qd_used_sum.index_fill_(0, ids, 0.0)
+                self._filter_keep_sum.index_fill_(0, ids, 0.0)
+                self._filter_steps.index_fill_(0, ids, 0.0)
             if getattr(self, "_prev_action_valid", None) is not None:
                 self._prev_action_valid.index_fill_(0, ids, False)
             if getattr(self, "_cri_rewind_count", None) is not None:
@@ -589,6 +609,11 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             self._time_penalty_sum.zero_()
         if getattr(self, "_action_rate_sum", None) is not None:
             self._action_rate_sum.zero_()
+        if getattr(self, "_filter_steps", None) is not None:
+            self._filter_qd_req_sum.zero_()
+            self._filter_qd_used_sum.zero_()
+            self._filter_keep_sum.zero_()
+            self._filter_steps.zero_()
         if getattr(self, "_prev_action_valid", None) is not None:
             self._prev_action_valid.zero_()
         if getattr(self, "_cri_rewind_count", None) is not None:
@@ -886,6 +911,148 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         """CRI level that counts as a boundary hit, one value or one per env."""
         return self._cri_ovf_term_threshold
 
+    def _arm_qd_limit(self) -> torch.Tensor:
+        """Per-joint speed cap used as the CRI filter's requested velocity."""
+        cached = getattr(self, "_arm_qd_limit_cache", None)
+        if cached is not None:
+            return cached
+        from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.filter import (
+            DEFAULT_ARM_QD_LIMIT,
+        )
+
+        limit = torch.tensor(
+            DEFAULT_ARM_QD_LIMIT, device=self.device, dtype=torch.float32
+        )
+        try:
+            robot = self.env.scene["robot"]
+            names = list(robot.joint_names)
+            idx = [i for i, name in enumerate(names) if str(name).startswith("panda_joint")]
+            vel = torch.as_tensor(
+                robot.data.joint_vel_limits, device=self.device, dtype=torch.float32
+            )
+            if vel.ndim == 2:
+                vel = vel[0]
+            if len(idx) >= 7:
+                limit = vel[idx[:7]].abs()
+        except (AttributeError, KeyError, RuntimeError, TypeError, IndexError):
+            limit = torch.tensor(
+                DEFAULT_ARM_QD_LIMIT, device=self.device, dtype=torch.float32
+            )
+        self._arm_qd_limit_cache = limit[:7].reshape(7).to(
+            device=self.device, dtype=torch.float32
+        )
+        return self._arm_qd_limit_cache
+
+    def _apply_enabled_cri_filter(self, actions, row_mask=None):
+        """Slow the arm target when the requested CRI is at least 0.96.
+
+        The policy proposes an absolute joint target. The speed sent to the
+        solver is ``(q_tgt - q) / dt`` clipped to the Panda velocity limit.
+        ``cri_pre`` is the CRI of that request. A peak below the trigger
+        keeps the request. A peak of 0.96 is scaled by ``0.8 / 0.96``, so a
+        CRI that grows with speed lands near 0.8. The gripper channel stays
+        as written. Hold rows are left alone. With the filter off, the
+        original target is sent.
+        """
+        if (
+            not self._cri_filter_enabled
+            or not self._compute_cri
+            or actions is None
+            or self._last_q is None
+        ):
+            return actions
+        from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.filter import (
+            abs_joint_to_qd_nom,
+            apply_filtered_arm_targets,
+            clip_arm_velocity,
+            cri_output_speed_scale,
+        )
+
+        act = torch.as_tensor(actions, device=self.device, dtype=torch.float32)
+        squeeze = act.ndim == 1
+        if squeeze:
+            act = act.unsqueeze(0)
+        if act.shape[-1] < 7 or act.shape[0] == 0:
+            return actions
+        q = self._last_q[:, :7].to(device=act.device, dtype=torch.float32)
+        n = min(int(act.shape[0]), int(q.shape[0]))
+        if row_mask is None:
+            mask = torch.ones(n, dtype=torch.bool, device=act.device)
+        else:
+            mask = torch.as_tensor(row_mask, device=act.device).bool().reshape(-1)
+            if int(mask.numel()) < n:
+                return actions
+            mask = mask[:n]
+        if not bool(mask.any()):
+            return actions
+        qd_nom = abs_joint_to_qd_nom(act[:n, :7], q[:n], self._cri_step_dt)
+        qd_req = clip_arm_velocity(qd_nom, self._arm_qd_limit())
+        result = self._get_cri_solver().run_cri_filter(q[:n], qd_req)
+        self._cri_solve_count += 1
+        cri_pre = result.get("cri_pre") if isinstance(result, dict) else None
+        scale = cri_output_speed_scale(
+            None if cri_pre is None else torch.as_tensor(cri_pre),
+            trigger=float(getattr(self, "_cri_filter_trigger", 0.96)),
+            target=float(getattr(self, "_cri_filter_target", 0.8)),
+        )
+        if scale is None:
+            scale = torch.ones(n, device=act.device, dtype=torch.float32)
+        else:
+            scale = scale.to(device=act.device, dtype=torch.float32).reshape(-1)[:n]
+        qd_used = qd_req[:, :7] * scale.unsqueeze(-1)
+        IsaaclabPickPlaceCubePlateEnv._note_filter_speed(
+            self, qd_req[:, :7], qd_used, mask
+        )
+        filtered = apply_filtered_arm_targets(
+            act[:n], q[:n], qd_used, self._cri_step_dt
+        )
+        delta = torch.linalg.norm(qd_used - qd_req[:, :7], dim=-1)
+        scale = torch.linalg.norm(qd_req[:, :7], dim=-1).clamp_min(1e-6)
+        intervened = delta > torch.maximum(1e-3 * scale, torch.full_like(scale, 1e-4))
+        use = mask & intervened
+        merged = act.clone()
+        arm = merged[:n, :7]
+        merged[:n, :7] = torch.where(use.unsqueeze(-1), filtered[:, :7], arm)
+        filtered = merged
+        if squeeze:
+            filtered = filtered.squeeze(0)
+        if torch.is_tensor(actions):
+            return filtered.to(dtype=actions.dtype)
+        return filtered
+
+    def _note_filter_speed(self, qd_req, qd_used, live) -> None:
+        """Accumulate requested and sent joint speed for the eval metric."""
+        if getattr(self, "_filter_steps", None) is None:
+            return
+        req = torch.linalg.norm(qd_req, dim=-1)
+        used = torch.linalg.norm(qd_used, dim=-1)
+        keep = used / req.clamp_min(1e-6)
+        rows = live.to(device=req.device).reshape(-1)[: req.shape[0]]
+        if int(rows.shape[0]) < req.shape[0]:
+            return
+        idx = torch.arange(req.shape[0], device=req.device)
+        idx = idx[: self._filter_steps.shape[0]]
+        rows = rows[: idx.shape[0]]
+        req = req[: idx.shape[0]]
+        used = used[: idx.shape[0]]
+        keep = keep[: idx.shape[0]]
+        self._filter_qd_req_sum[idx] += torch.where(rows, req, torch.zeros_like(req))
+        self._filter_qd_used_sum[idx] += torch.where(rows, used, torch.zeros_like(used))
+        self._filter_keep_sum[idx] += torch.where(rows, keep, torch.zeros_like(keep))
+        self._filter_steps[idx] += rows.to(dtype=self._filter_steps.dtype)
+
+    def _filter_speed_metrics(self) -> dict[str, torch.Tensor]:
+        """Episode-mean requested speed, sent speed, and fraction kept."""
+        steps = getattr(self, "_filter_steps", None)
+        if steps is None or not bool((steps > 0).any()):
+            return {}
+        denom = steps.clamp_min(1.0)
+        return {
+            "filter_qd_req": self._filter_qd_req_sum / denom,
+            "filter_qd_used": self._filter_qd_used_sum / denom,
+            "filter_keep": self._filter_keep_sum / denom,
+        }
+
     def _solve_cri_from_obs(self, obs: dict[str, Any]) -> torch.Tensor:
         """One ``run_cri_filter(q, qd)`` from this-tick Isaac observations."""
         q, qd = measured_arm_q_qd(obs, num_envs=self.num_envs, device=self.device)
@@ -953,6 +1120,7 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             )
 
             episode_info[ACTION_RATE_REWARD_KEY] = self._action_rate_sum.clone()
+        episode_info.update(self._filter_speed_metrics())
         infos["episode"] = episode_info
         return infos
 
@@ -1063,6 +1231,11 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
                 sigma=self._cri_penalty_sigma,
                 row_mask=free,
             )
+
+        live = ~self._chunk_hold
+        if hold_after_done:
+            live = live & ~was_frozen
+        actions = self._apply_enabled_cri_filter(actions, row_mask=live)
 
         obs, step_reward, terminations, truncations, infos = self.env.step(actions)
 

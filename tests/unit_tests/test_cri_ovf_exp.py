@@ -17,6 +17,7 @@ import torch
 
 from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.filter import (
     abs_joint_to_qd_nom,
+    apply_filtered_arm_targets,
     shift_cri_filter_obs,
 )
 from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.constants import (
@@ -199,6 +200,144 @@ def test_cri_episode_reward_logs_match_isaaclab_episode_sum():
         cri_ovf_reward(torch.tensor([0.5, 1.0]), -0.002),
         torch.tensor([-0.001, -0.002]),
     )
+
+
+def test_apply_filtered_arm_targets_keeps_unfiltered_action():
+    """``qd_cmd == (q_tgt - q) / dt`` rebuilds the policy arm target."""
+    dt = 1.0 / 15.0
+    q = torch.zeros(2, 7)
+    q_tgt = torch.zeros(2, 7)
+    q_tgt[:, 0] = 0.15
+    q_tgt[:, 3] = -0.3
+    actions = torch.zeros(2, 8)
+    actions[:, :7] = q_tgt
+    actions[:, 7] = torch.tensor([0.0, 1.0])
+    qd_nom = abs_joint_to_qd_nom(q_tgt, q, dt=dt)
+    out = apply_filtered_arm_targets(actions, q, qd_nom, dt)
+    assert torch.allclose(out[:, :7], q_tgt)
+    assert torch.equal(out[:, 7], actions[:, 7])
+
+
+def test_apply_filtered_arm_targets_follows_qd_cmd():
+    dt = 1.0 / 15.0
+    q = torch.zeros(1, 7)
+    actions = torch.zeros(1, 8)
+    actions[0, 0] = 0.15
+    actions[0, 7] = 1.0
+    qd_cmd = torch.zeros(1, 7)
+    qd_cmd[0, 0] = 0.15 / dt / 2.0
+    out = apply_filtered_arm_targets(actions, q, qd_cmd, dt)
+    assert torch.allclose(out[0, 0], torch.tensor(0.075))
+    assert float(out[0, 7]) == 1.0
+    assert torch.equal(actions[0, :7], torch.tensor([0.15, 0, 0, 0, 0, 0, 0]))
+
+
+def _filter_env(q, solver, dt):
+    from types import SimpleNamespace
+
+    limit = torch.tensor([2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61])
+    return SimpleNamespace(
+        _cri_filter_enabled=True,
+        _compute_cri=True,
+        _last_q=q,
+        device=torch.device("cpu"),
+        _cri_step_dt=dt,
+        _cri_solve_count=0,
+        _arm_qd_limit=lambda: limit,
+        _get_cri_solver=lambda: solver,
+    )
+
+
+def test_enabled_cri_filter_rewrites_live_arm_targets():
+    """A request CRI of 0.96 keeps 0.8/0.96 of the speed. A hold row stays put."""
+    from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.env import (
+        IsaaclabPickPlaceCubePlateEnv,
+    )
+
+    dt = 1.0 / 15.0
+    q = torch.zeros(2, 7)
+    actions = torch.zeros(2, 8)
+    # 0.12 rad in one control step is 1.8 rad/s, under the 2.175 limit.
+    actions[:, 0] = 0.12
+    actions[:, 7] = torch.tensor([0.0, 1.0])
+    kept = 0.8 / 0.96
+
+    class _Solver:
+        def run_cri_filter(self, q_in, qd_in):
+            del q_in
+            cri = torch.zeros(qd_in.shape[0], 9)
+            cri[:, 0] = 0.96
+            return {"qd_cmd": qd_in.detach().cpu().numpy() * 0.5, "cri_pre": cri}
+
+    env = _filter_env(q, _Solver(), dt)
+    out = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(env, actions)
+    assert torch.allclose(out[:, 0], torch.full((2,), 0.12 * kept))
+    assert torch.equal(out[:, 7], actions[:, 7])
+    assert torch.equal(actions[:, 0], torch.full((2,), 0.12))
+    assert env._cri_solve_count == 1
+
+    live = torch.tensor([True, False])
+    masked = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(
+        env, actions, row_mask=live
+    )
+    assert torch.allclose(masked[0, 0], torch.tensor(0.12 * kept))
+    assert torch.allclose(masked[1, 0], torch.tensor(0.12))
+
+    env._cri_filter_enabled = False
+    same = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(env, actions)
+    assert same is actions
+
+
+def test_low_requested_cri_keeps_the_full_speed():
+    """A request CRI of 0.16 stays under 0.96, so the arm target is unchanged."""
+    from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.env import (
+        IsaaclabPickPlaceCubePlateEnv,
+    )
+
+    dt = 1.0 / 15.0
+    actions = torch.zeros(1, 8)
+    actions[0, 0] = 0.12
+
+    class _Solver:
+        def run_cri_filter(self, q_in, qd_in):
+            del q_in
+            cri = torch.full((qd_in.shape[0], 9), 0.16)
+            return {"qd_cmd": qd_in.detach().cpu().numpy() * 0.5, "cri_pre": cri}
+
+    env = _filter_env(torch.zeros(1, 7), _Solver(), dt)
+    env.num_envs = 1
+    env._filter_qd_req_sum = torch.zeros(1)
+    env._filter_qd_used_sum = torch.zeros(1)
+    env._filter_keep_sum = torch.zeros(1)
+    env._filter_steps = torch.zeros(1)
+    out = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(env, actions)
+    assert torch.allclose(out[0, 0], torch.tensor(0.12))
+    metrics = IsaaclabPickPlaceCubePlateEnv._filter_speed_metrics(env)
+    assert torch.allclose(metrics["filter_keep"], torch.tensor(1.0))
+    assert float(metrics["filter_qd_req"]) == pytest.approx(0.12 * 15.0)
+
+
+def test_cri_filter_keeps_far_target_when_solver_passes_velocity():
+    """A setpoint past the speed limit stays put when the QP does not intervene."""
+    from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.env import (
+        IsaaclabPickPlaceCubePlateEnv,
+    )
+
+    dt = 1.0 / 15.0
+    q = torch.zeros(1, 7)
+    actions = torch.zeros(1, 8)
+    actions[0, 0] = 1.0
+
+    class _Solver:
+        def run_cri_filter(self, q_in, qd_in):
+            del q_in
+            got = qd_in.detach().cpu()
+            assert float(got[0, 0]) <= 2.175 + 1e-5
+            return {"qd_cmd": got.numpy()}
+
+    env = _filter_env(q, _Solver(), dt)
+    out = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(env, actions)
+    assert torch.allclose(out[:, :7], actions[:, :7])
 
 
 def test_abs_joint_to_qd_nom_matches_isaaclab():

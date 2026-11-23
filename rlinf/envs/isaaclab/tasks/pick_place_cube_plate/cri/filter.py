@@ -49,6 +49,100 @@ def abs_joint_to_qd_nom(
     return (np.asarray(q_tgt) - np.asarray(q)) / dt
 
 
+# Franka Panda implicit actuators in the fridge task: joints 1–4 at
+# 2.175 rad/s, joints 5–7 at 2.61 rad/s.
+DEFAULT_ARM_QD_LIMIT = (2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61)
+
+
+def cri_output_speed_scale(
+    cri: torch.Tensor | None,
+    *,
+    trigger: float = 0.96,
+    target: float = 0.8,
+) -> torch.Tensor | None:
+    """Scale joint speed so a CRI at or above ``trigger`` lands near ``target``.
+
+    CRI is treated as linear in speed. A peak of 0.96 with a target of 0.8
+    keeps ``0.8 / 0.96`` of the requested speed. Peaks below ``trigger`` keep
+    the full request. ``None`` means the caller has no CRI and should not slow
+    the command.
+
+    Args:
+        cri: Per-row CRI, shape ``(N,)`` or ``(N, K)``. The row peak is used.
+        trigger: Requested CRI at which slowing starts.
+        target: CRI the scaled command should land near.
+
+    Returns:
+        A per-row speed fraction in ``(0, 1]``, or ``None`` when ``cri`` is.
+    """
+    if cri is None:
+        return None
+    peak = torch.as_tensor(cri, dtype=torch.float32)
+    if peak.ndim > 1:
+        peak = peak.amax(dim=-1)
+    peak = peak.clamp(min=0.0)
+    scale = torch.ones_like(peak)
+    if trigger <= 0.0 or target <= 0.0:
+        return scale
+    hot = peak >= float(trigger)
+    slowed = (float(target) / peak.clamp(min=float(trigger))).clamp(max=1.0)
+    return torch.where(hot, slowed, scale)
+
+
+def clip_arm_velocity(
+    qd: torch.Tensor,
+    limit: torch.Tensor | tuple[float, ...] = DEFAULT_ARM_QD_LIMIT,
+) -> torch.Tensor:
+    """Clamp each arm joint velocity to the actuator limit.
+
+    The position error ``(q_tgt - q) / dt`` can ask for a speed the Panda
+    drive will never track. The CRI filter should see the fastest command
+    the actuator can actually execute.
+    """
+    lim = torch.as_tensor(limit, device=qd.device, dtype=qd.dtype).reshape(-1)
+    if int(lim.numel()) == 1:
+        lim = lim.expand(qd.shape[-1])
+    lim = lim[: qd.shape[-1]]
+    return qd.clamp(-lim, lim)
+
+
+def apply_filtered_arm_targets(
+    actions: torch.Tensor,
+    q: torch.Tensor,
+    qd_cmd: torch.Tensor,
+    dt: float,
+) -> torch.Tensor:
+    """Replace the 7 arm targets with ``q + qd_cmd * dt``.
+
+    ``actions`` is ``(N, >=7)`` absolute joint positions. A gripper channel
+    after the arm is left as written. When ``qd_cmd`` is
+    ``(q_tgt - q) / dt``, the arm targets come back unchanged.
+
+    Args:
+        actions: Policy or hold targets, ``(N, >=7)``.
+        q: Current arm joint positions, ``(N, 7)``.
+        qd_cmd: Filtered joint velocity, ``(N, 7)``.
+        dt: Control period in seconds.
+
+    Returns:
+        A copy of ``actions`` whose arm columns track ``qd_cmd``.
+    """
+    if dt <= 0.0:
+        raise ValueError(f"dt must be positive, got {dt}")
+    out = actions.clone()
+    cmd = torch.as_tensor(qd_cmd, device=out.device, dtype=out.dtype)
+    cur = torch.as_tensor(q, device=out.device, dtype=out.dtype)
+    if cmd.ndim == 1:
+        cmd = cmd.unsqueeze(0)
+    if cur.ndim == 1:
+        cur = cur.unsqueeze(0)
+    n = out.shape[0]
+    out[:, :DEFAULT_NUM_JOINTS] = cur[:n, :DEFAULT_NUM_JOINTS] + (
+        cmd[:n, :DEFAULT_NUM_JOINTS] * dt
+    )
+    return out
+
+
 def shift_cri_filter_obs(
     cri_pre: np.ndarray,
     extra: np.ndarray | None = None,

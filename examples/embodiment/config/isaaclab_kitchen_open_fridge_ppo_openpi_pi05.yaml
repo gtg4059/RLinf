@@ -32,19 +32,24 @@ runner:
     experiment_name: "isaaclab_kitchen_open_fridge_ppo_openpi_pi05"
     logger_backends: ["tensorboard"]
 
-  max_epochs: 1000
+  # Step 1100 is already done. The loop continues from there to 2000.
+  max_epochs: 2000
   max_steps: -1
 
   only_eval: False
+  # Eval and its videos run once before the first update, then every
+  # 100 steps, same cadence as checkpoints.
   # save_interval must be a multiple of val_check_interval.
-  val_check_interval: 20
-  eval_at_start: False
-  save_interval: 20
+  val_check_interval: 100
+  eval_at_start: True
+  save_interval: 100
   weight_sync_interval: 1
 
-  # Fresh run from polaris_openpi_ckpt. The KL reference is that
-  # checkpoint, snapshotted before any resume load.
-  resume_dir: null
+  # Finetune the step-1100 actor. CRI tokens still use measured joint
+  # position and velocity from the previous step. cri_filter_enabled
+  # now rewrites the plant command with qd_cmd. The KL reference is
+  # still polaris_openpi_ckpt, snapshotted before this resume load.
+  resume_dir: ${oc.env:REPO_PATH,/workspace/RLinf}/logs/20261120-09:37:19-isaaclab_kitchen_open_fridge_ppo_openpi_pi05/isaaclab_kitchen_open_fridge_ppo_openpi_pi05/checkpoints/global_step_1100
   ckpt_path: null
 
 algorithm:
@@ -130,8 +135,14 @@ env:
       stand_height_m: 0.8
       robot_pos: [4.603651840801024, -1.4710035928444452, 0.8]
       robot_rot: [0.70710678, 0.0, 0.0, 0.70710678]
+      # Solver input is measured q and joint_vel after the step.
+      # A request whose CRI is at least 0.96 is slowed by 0.8 / CRI,
+      # so the command CRI lands near 0.8. Below 0.96 the request is kept.
+      # filter_qd_req / filter_qd_used / filter_keep report the speeds.
       cri_filter: True
-      cri_filter_enabled: False
+      cri_filter_enabled: True
+      cri_filter_trigger: 0.96
+      cri_filter_target: 0.8
       # Crossing the CRI limit rewinds the arm to the spawn pose.
       # The episode clock keeps running and that step pays 0. A door
       # already past 0.2 is left open, so the per-step +1 continues.
@@ -159,8 +170,8 @@ env:
         height: 224
         width: 224
     video_cfg:
-      # Train rollouts do not write mp4. Eval records every
-      # runner.val_check_interval step.
+      # Train rollouts do not write mp4. Eval writes mp4 every
+      # runner.val_check_interval step (100).
       save_video: False
       info_on_video: True
       fps: 15
@@ -230,8 +241,14 @@ env:
       stand_height_m: 0.8
       robot_pos: [4.603651840801024, -1.4710035928444452, 0.8]
       robot_rot: [0.70710678, 0.0, 0.0, 0.70710678]
+      # Solver input is measured q and joint_vel after the step.
+      # A request whose CRI is at least 0.96 is slowed by 0.8 / CRI,
+      # so the command CRI lands near 0.8. Below 0.96 the request is kept.
+      # filter_qd_req / filter_qd_used / filter_keep report the speeds.
       cri_filter: True
-      cri_filter_enabled: False
+      cri_filter_enabled: True
+      cri_filter_trigger: 0.96
+      cri_filter_target: 0.8
       # Crossing the CRI limit rewinds the arm to the spawn pose.
       # The episode clock keeps running and that step pays 0. A door
       # already past 0.2 is left open, so the per-step +1 continues.
@@ -280,6 +297,9 @@ env:
         - episode.cri_max
         - episode.cri_limit
         - episode.handle_cm
+        - episode.filter_qd_req
+        - episode.filter_qd_used
+        - episode.filter_keep
       video_image_keys:
         - main_images
         - exterior2_images

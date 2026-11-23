@@ -53,8 +53,19 @@ def should_enable_eval(cfg: Any) -> bool:
 
 
 def should_eval_at_start(cfg: Any, global_step: int) -> bool:
-    """Return True when the runner should evaluate the initial policy at step 0."""
-    return bool(_runner_get(cfg, "eval_at_start", False)) and int(global_step) == 0
+    """Return True when the runner should evaluate before the first update.
+
+    The runner calls this once, with the loaded step. A fresh run is step 0.
+    A resume evaluates that checkpoint before the next update, so the start
+    video is the policy training continues from.
+
+    Args:
+        cfg: Runner config. ``runner.eval_at_start`` selects this eval.
+        global_step: Loaded step. The runner invokes this once, so any
+            loaded step qualifies.
+    """
+    del global_step
+    return bool(_runner_get(cfg, "eval_at_start", False))
 
 
 def success_floor_tripped(history: list[float], window: int, floor: float) -> bool:

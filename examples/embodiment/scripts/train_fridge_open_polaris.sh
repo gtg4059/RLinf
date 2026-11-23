@@ -2,6 +2,11 @@
 # Train kitchen fridge open-door PPO from the PolarIS CRI-prefix adapter
 # (default: checkpoint/pi05_droid_jointpos_polaris_cri_adapter_rlinf_30000).
 #
+# The default yaml resumes the 20261120 run at global_step_1100 and
+# trains through step 2000. The CRI filter rewrites commands with qd_cmd.
+# An eval video is written before the first update, then checkpoints,
+# eval, and eval videos continue every 100 steps.
+#
 # Host entry: bind-mounts this checkout into the local embodied-isaaclab
 # image and launches the named Hydra config. First positional is the config
 # (same style as run_embodiment.sh); later tokens are Hydra overrides.
@@ -34,7 +39,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 DEFAULT_CONFIG_NAME="isaaclab_kitchen_open_fridge_ppo_openpi_pi05"
 
 _usage() {
-  sed -n '2,28p' "$0"
+  sed -n '2,34p' "$0"
 }
 
 if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
