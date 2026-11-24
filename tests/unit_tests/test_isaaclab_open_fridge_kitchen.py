@@ -693,6 +693,16 @@ def test_command_filter_is_off_within_12cm_of_the_handle():
     assert not bool(env._cri_filter_suppressed(3, torch.device("cpu")).any())
 
 
+def test_ovf_limit_stays_at_the_filter_line_near_the_handle():
+    """Near the handle the filter is off, so the measured line stays 0.96."""
+    env = IsaaclabOpenFridgeKitchenEnv.__new__(IsaaclabOpenFridgeKitchenEnv)
+    env._cri_ovf_term_threshold = 0.96
+    env._last_handle_reach = torch.tensor(
+        [[0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.2]]
+    )
+    assert env._cri_ovf_term_limits() == pytest.approx(0.96)
+
+
 def test_cri_limit_is_3_within_12cm_of_the_handle():
     """12 cm and closer uses 3. 12.1 cm stays at 0.96."""
     distance = torch.tensor([0.12, 0.121])

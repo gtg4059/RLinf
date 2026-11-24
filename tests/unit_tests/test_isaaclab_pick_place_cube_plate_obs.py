@@ -221,6 +221,24 @@ def test_build_traj_info_splits_q_and_this_tick_cri():
     assert traj["action"].shape == (1, 8)
     assert traj["qd"].shape == (1, 7)
 
+    raw = actions + 0.5
+    hit = torch.tensor([1.0], dtype=torch.float32)
+    richer = build_traj_info(
+        states=states,
+        actions=actions,
+        action_raw=raw,
+        cri=cri,
+        cri_request=cri + 0.1,
+        cri_hit=hit,
+        qd_req=torch.ones((1, 7), dtype=torch.float32),
+        qd_used=torch.full((1, 7), 0.8, dtype=torch.float32),
+    )
+    assert torch.allclose(richer["action_raw"], raw)
+    assert torch.allclose(richer["cri_request"], cri + 0.1)
+    assert float(richer["cri_hit"][0]) == 1.0
+    assert richer["qd_req"].shape == (1, 7)
+    assert torch.allclose(richer["qd_used"], torch.full((1, 7), 0.8))
+
 
 def test_measured_arm_q_qd_uses_obs_joint_vel():
     """CRI inputs are Isaac observations, not commanded qd_nom."""

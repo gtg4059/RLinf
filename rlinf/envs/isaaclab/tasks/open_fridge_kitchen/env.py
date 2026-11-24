@@ -28,7 +28,6 @@ from rlinf.envs.isaaclab.tasks.open_fridge_kitchen.door_reward import (
     ee_bar_distance_bonus,
     ee_bar_distance_penalty,
     success_pay_after_cri,
-    cri_limit_near_handle,
     gripper_past_handle,
     handle_reach_distance,
     openness_level_reward,
@@ -136,8 +135,8 @@ class IsaaclabOpenFridgeKitchenEnv(IsaaclabPickPlaceCubePlateEnv):
         self._isaac_success_termination = bool(
             init_params.get("isaac_success_termination", True)
         )
-        # Within cri_handle_relax_distance_m of the handle bar the reset
-        # level is cri_handle_relax_limit (3). Farther away it stays at
+        # Within cri_handle_relax_distance_m the command filter is off and
+        # overflow is not measured. Filter-on rows are judged at
         # cri_penalty_limit (0.96).
         self._cri_handle_relax_distance_m = float(
             init_params.get("cri_handle_relax_distance_m", 0.08)
@@ -281,7 +280,12 @@ class IsaaclabOpenFridgeKitchenEnv(IsaaclabPickPlaceCubePlateEnv):
         return off
 
     def _cri_ovf_term_limits(self) -> float | torch.Tensor:
-        """Raise the reset level near the handle. Farther rows keep 0.96."""
+        """Overflow line used only while the command filter is on.
+
+        The line is ``cri_penalty_limit``. Rows inside the handle gap have
+        the filter off, and the step drops those rows from the overflow
+        count instead of raising this line.
+        """
         base = float(self._cri_ovf_term_threshold)
         reach = getattr(self, "_last_handle_reach", None)
         if reach is None or int(reach.shape[-1]) < 9:
@@ -289,13 +293,7 @@ class IsaaclabOpenFridgeKitchenEnv(IsaaclabPickPlaceCubePlateEnv):
         distance, valid = handle_reach_distance(reach)
         self._last_handle_distance = distance.detach()
         self._last_handle_valid = valid.detach()
-        return cri_limit_near_handle(
-            distance,
-            valid,
-            base_limit=base,
-            near_distance_m=self._cri_handle_relax_distance_m,
-            near_limit=self._cri_handle_relax_limit,
-        )
+        return base
 
     def _hand_left_scene_mask(self) -> torch.Tensor | None:
         """Rows whose gripper is past ``hand_fridge_reset_distance_m``.

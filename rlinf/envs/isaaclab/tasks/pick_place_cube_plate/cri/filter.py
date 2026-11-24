@@ -23,6 +23,8 @@
   At or above the point limit the direction-change vector is applied with
   weight ``min(1, direction_gain * peak / point_limit)``, so the configured
   gain is the floor and a higher peak uses more of the cut.
+- A request already at or above the hard limit is scaled, after that cut,
+  until a fresh ``run_cri_filter`` on the same ``q`` reports a peak under it.
 - Time-scale ``s`` is not used. ``delta = ||qd_cmd - qd_RL||``.
 """
 
@@ -212,6 +214,78 @@ def subtract_approach_velocity(
     use = drop_approach | strong
     out[:n, :joints] = torch.where(use.unsqueeze(-1), qd_new, qd_j)
     return out
+
+
+def proportional_speed_scale(
+    peak: torch.Tensor,
+    limit: float = 0.96,
+) -> torch.Tensor:
+    """Speed multiplier that lands a linear CRI reading on ``limit``.
+
+    A peak at or below ``limit`` keeps scale 1. A higher peak keeps
+    ``limit / peak`` of the joint velocity, so the removed fraction is
+    ``(peak - limit) / peak``.
+
+    Args:
+        peak: Network CRI peak, shape ``(N,)``.
+        limit: Command peak the scale aims at.
+
+    Returns:
+        Per-row scale, shape ``(N,)``.
+    """
+    scale = torch.ones_like(peak, dtype=torch.float32)
+    hot = peak > float(limit)
+    shrunk = float(limit) / peak.clamp_min(1e-6)
+    return torch.where(hot, shrunk.to(dtype=scale.dtype), scale)
+
+
+def scale_velocity_below_cri(
+    qd: torch.Tensor,
+    over: torch.Tensor,
+    cri_peak_of: Any,
+    *,
+    limit: float = 0.96,
+    iters: int = 6,
+) -> torch.Tensor:
+    """Shrink commands whose CRI is still at or above ``limit``.
+
+    ``cri_peak_of(qd)`` returns the 9-point peak of that joint velocity.
+    ``over`` marks rows whose unfiltered request already reached ``limit``.
+    A row whose current command is already under the limit is kept. The
+    other rows take the largest scale the callback reported under the
+    limit. If every probe stays at or above it, that row is sent at zero
+    speed.
+
+    Args:
+        qd: Direction-filtered joint velocity, shape ``(N, joints)``.
+        over: True on rows that need the hard-limit check, shape ``(N,)``.
+        cri_peak_of: Maps a velocity batch to a peak of shape ``(N,)``.
+        limit: Command peak must land strictly under this.
+        iters: Binary-search steps. Six steps resolve the scale to 1/64.
+
+    Returns:
+        Velocity of shape ``(N, joints)``.
+    """
+    if qd.numel() == 0 or not bool(over.any()):
+        return qd
+    peak = cri_peak_of(qd)
+    still = over.reshape(-1)[: qd.shape[0]] & (peak >= float(limit))
+    if not bool(still.any()):
+        return qd
+    lo = torch.zeros(qd.shape[0], device=qd.device, dtype=qd.dtype)
+    hi = torch.ones_like(lo)
+    best = torch.zeros_like(lo)
+    for _ in range(int(iters)):
+        mid = (lo + hi) * 0.5
+        trial = qd.clone()
+        trial[still] = qd[still] * mid[still].unsqueeze(-1)
+        probed = cri_peak_of(trial)
+        ok = still & (probed < float(limit))
+        best = torch.where(ok, mid, best)
+        lo = torch.where(ok, mid, lo)
+        hi = torch.where(still & ~ok, mid, hi)
+    scaled = qd * best.unsqueeze(-1)
+    return torch.where(still.unsqueeze(-1), scaled, qd)
 
 
 def joint_command_changed(

@@ -262,22 +262,40 @@ def measured_arm_q_qd(
     return q, qd_t
 
 
+def _as_traj_tensor(value: Any) -> torch.Tensor:
+    tensor = torch.as_tensor(value, dtype=torch.float32)
+    if tensor.dim() == 0:
+        tensor = tensor.unsqueeze(0)
+    return tensor
+
+
 def build_traj_info(
     *,
     states: torch.Tensor | None,
     actions: Any = None,
+    action_raw: Any = None,
     cri: torch.Tensor | None = None,
+    cri_request: torch.Tensor | None = None,
     cri_ovf: torch.Tensor | None = None,
+    cri_hit: torch.Tensor | None = None,
+    cri_rewind: torch.Tensor | None = None,
+    qd_req: torch.Tensor | None = None,
+    qd_used: torch.Tensor | None = None,
     joint_vel: torch.Tensor | None = None,
+    door_openness: torch.Tensor | None = None,
+    handle_reach: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Per-step robot / CRI arrays aligned with a RecordVideo frame.
 
-    ``cri`` is this-tick ``cri_pre`` (the motion that produced the frame),
-    not the delayed policy observation.
+    ``cri`` is this-tick measured ``cri_pre`` before a spawn rewind.
+    ``action`` is the command sent to Isaac. ``action_raw`` is the policy
+    target before the CRI command filter. ``cri_request`` is the CRI of
+    that requested joint velocity.
     """
+    del cri_ovf
     traj: dict[str, torch.Tensor] = {}
     if states is not None:
-        state_t = torch.as_tensor(states, dtype=torch.float32)
+        state_t = _as_traj_tensor(states)
         if state_t.dim() == 1:
             state_t = state_t.unsqueeze(0)
         traj["states"] = state_t
@@ -285,20 +303,45 @@ def build_traj_info(
         if state_t.shape[-1] > 7:
             traj["gripper"] = state_t[..., 7:8]
     if actions is not None:
-        action_t = torch.as_tensor(actions, dtype=torch.float32)
+        action_t = _as_traj_tensor(actions)
         if action_t.dim() == 1:
             action_t = action_t.unsqueeze(0)
         traj["action"] = action_t
+    if action_raw is not None:
+        raw_t = _as_traj_tensor(action_raw)
+        if raw_t.dim() == 1:
+            raw_t = raw_t.unsqueeze(0)
+        traj["action_raw"] = raw_t
     if cri is not None:
-        cri_t = torch.as_tensor(cri, dtype=torch.float32)
+        cri_t = _as_traj_tensor(cri)
         if cri_t.dim() == 1:
             cri_t = cri_t.unsqueeze(0)
         traj["cri"] = cri_t
+    if cri_request is not None:
+        request_t = _as_traj_tensor(cri_request)
+        if request_t.dim() == 1:
+            request_t = request_t.unsqueeze(0)
+        traj["cri_request"] = request_t
+    if cri_hit is not None:
+        traj["cri_hit"] = _as_traj_tensor(cri_hit).reshape(-1)
+    if cri_rewind is not None:
+        traj["cri_rewind"] = _as_traj_tensor(cri_rewind).reshape(-1)
+    if qd_req is not None:
+        traj["qd_req"] = _as_traj_tensor(qd_req)
+    if qd_used is not None:
+        traj["qd_used"] = _as_traj_tensor(qd_used)
     if joint_vel is not None:
-        qd_t = torch.as_tensor(joint_vel, dtype=torch.float32)
+        qd_t = _as_traj_tensor(joint_vel)
         if qd_t.dim() == 1:
             qd_t = qd_t.unsqueeze(0)
         traj["qd"] = qd_t
+    if door_openness is not None:
+        traj["door_openness"] = _as_traj_tensor(door_openness).reshape(-1)
+    if handle_reach is not None:
+        reach_t = _as_traj_tensor(handle_reach)
+        if reach_t.dim() == 1:
+            reach_t = reach_t.unsqueeze(0)
+        traj["handle_reach"] = reach_t
     return traj
 
 
@@ -352,8 +395,13 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         # the step reads J and dir. The live command drops dir · v_lin of
         # the highest-CRI point once the 9-point peak is at or above
         # cri_filter_target. The direction-change weight is
-        # min(1, cri_filter_direction_gain * peak / cri_filter_target),
-        # including a request already over 0.96.
+        # min(1, cri_filter_direction_gain * peak / cri_filter_target).
+        # A request at or above cri_penalty_limit is scaled until a second
+        # solve on that command is strictly under the limit.
+        # cri_filter_proportional instead keeps the requested joint-velocity
+        # direction and multiplies its length by cri_penalty_limit / peak
+        # once the network peak exceeds that limit. One re-solve follows,
+        # and a still-high peak is scaled once more.
         # cri_filter_speed_enabled also scales the arm toward
         # cri_filter_strong_target once the peak reaches cri_filter_strong_cri.
         self._compute_cri = bool(init_params.get("compute_cri", True))
@@ -361,12 +409,15 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         self._cri_limit = float(init_params.get("cri_limit", 0.96))
         self._cbf_alpha = float(init_params.get("cbf_alpha", 0.02))
         self._cri_filter_enabled = bool(init_params.get("cri_filter_enabled", False))
-        self._cri_filter_target = float(init_params.get("cri_filter_target", 0.92))
+        self._cri_filter_target = float(init_params.get("cri_filter_target", 0.8))
         self._cri_filter_direction_gain = float(
             init_params.get("cri_filter_direction_gain", 0.8)
         )
         self._cri_filter_speed_enabled = bool(
             init_params.get("cri_filter_speed_enabled", False)
+        )
+        self._cri_filter_proportional = bool(
+            init_params.get("cri_filter_proportional", False)
         )
         self._cri_filter_strong_cri = float(
             init_params.get("cri_filter_strong_cri", 0.92)
@@ -856,7 +907,7 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
                 batch_size=max(int(self.num_envs), 1),
                 device=self.device,
                 cri_filter=True,
-                cri_limit=float(getattr(self, "_cri_filter_target", 0.92)),
+                cri_limit=float(getattr(self, "_cri_filter_target", 0.8)),
                 cbf_alpha=self._cbf_alpha,
                 filter_enabled=self._cri_filter_enabled,
             )
@@ -895,25 +946,35 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         infos: Any,
         obs: dict[str, Any] | None,
         actions: Any = None,
+        action_raw: Any = None,
         cri_pre: torch.Tensor | None = None,
         ovf: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         """Attach per-step ``traj`` arrays for RecordVideo dumps."""
+        del ovf
         payload = infos if isinstance(infos, dict) else {}
         states = None
         joint_vel = None
         if isinstance(obs, dict):
             states = obs.get("states")
             joint_vel = obs.get("joint_vel")
-        cri = cri_pre
+        measured = getattr(self, "_traj_cri_measured", None)
+        cri = measured if measured is not None else cri_pre
         if cri is None and self._cri_obs_cache is not None:
             cri = self._cri_obs_cache
         payload["traj"] = build_traj_info(
             states=states,
             actions=actions,
+            action_raw=action_raw,
             cri=cri,
-            cri_ovf=ovf,
+            cri_request=getattr(self, "_traj_cri_request", None),
+            cri_hit=getattr(self, "_last_cri_ovf_term", None),
+            cri_rewind=getattr(self, "_traj_cri_rewind", None),
+            qd_req=getattr(self, "_traj_qd_req", None),
+            qd_used=getattr(self, "_traj_qd_used", None),
             joint_vel=joint_vel,
+            door_openness=getattr(self, "_traj_door_openness", None),
+            handle_reach=getattr(self, "_traj_handle_reach", None),
         )
         return payload
 
@@ -971,6 +1032,84 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         """
         return torch.zeros(int(n), dtype=torch.bool, device=device)
 
+    def _scale_over_limit_command(self, q, qd, cri_pre, mask):
+        """Scale a command whose request CRI is at or above the reset line.
+
+        The direction edit has already run. Rows under the line are kept.
+        Rows at or above it are scaled until a new solve on the same ``q``
+        reports a peak strictly under ``cri_penalty_limit``.
+        """
+        from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.filter import (
+            scale_velocity_below_cri,
+        )
+
+        limit = float(getattr(self, "_cri_penalty_limit", 0.96))
+        cri_t = torch.as_tensor(cri_pre, device=qd.device, dtype=torch.float32)
+        if cri_t.dim() == 1:
+            cri_t = cri_t.unsqueeze(0)
+        n = int(qd.shape[0])
+        peak = cri_t[:n].amax(dim=-1)
+        over = peak >= limit
+        rows = mask.reshape(-1)[:n]
+        over = over & rows.to(device=over.device)
+        if not bool(over.any()):
+            return qd
+
+        def cri_peak_of(qd_try: torch.Tensor) -> torch.Tensor:
+            result = self._get_cri_solver().run_cri_filter(q, qd_try)
+            self._cri_solve_count += 1
+            solved = result.get("cri_pre") if isinstance(result, dict) else None
+            if solved is None:
+                return torch.full((qd_try.shape[0],), limit, device=qd_try.device)
+            solved_t = torch.as_tensor(
+                solved, device=qd_try.device, dtype=torch.float32
+            )
+            if solved_t.dim() == 1:
+                solved_t = solved_t.unsqueeze(0)
+            return solved_t[: qd_try.shape[0]].amax(dim=-1)
+
+        return scale_velocity_below_cri(qd, over, cri_peak_of, limit=limit)
+
+    def _scale_proportional_command(self, q, qd, cri_pre, mask):
+        """Shrink speed by ``limit / peak`` when the network peak exceeds it.
+
+        The joint-velocity direction stays the request. A peak at or below
+        the limit, including the band from ``cri_filter_target`` up to the
+        limit, is unchanged. After the first scale, one re-solve runs. If
+        that peak is still at or above the limit, ``limit / peak`` is
+        applied once more.
+        """
+        from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.filter import (
+            proportional_speed_scale,
+        )
+
+        limit = float(getattr(self, "_cri_penalty_limit", 0.96))
+        cri_t = torch.as_tensor(cri_pre, device=qd.device, dtype=torch.float32)
+        if cri_t.dim() == 1:
+            cri_t = cri_t.unsqueeze(0)
+        n = int(qd.shape[0])
+        peak = cri_t[:n].amax(dim=-1)
+        rows = mask.reshape(-1)[:n].to(device=peak.device)
+        over = (peak > limit) & rows
+        if not bool(over.any()):
+            return qd
+        qd_scaled = qd * proportional_speed_scale(peak, limit).unsqueeze(-1)
+        qd_scaled = torch.where(over.unsqueeze(-1), qd_scaled, qd)
+        result = self._get_cri_solver().run_cri_filter(q, qd_scaled)
+        self._cri_solve_count += 1
+        solved = result.get("cri_pre") if isinstance(result, dict) else None
+        if solved is None:
+            return qd_scaled
+        solved_t = torch.as_tensor(solved, device=qd.device, dtype=torch.float32)
+        if solved_t.dim() == 1:
+            solved_t = solved_t.unsqueeze(0)
+        peak2 = solved_t[:n].amax(dim=-1)
+        still = over & (peak2 >= limit)
+        if not bool(still.any()):
+            return qd_scaled
+        again = proportional_speed_scale(peak2, limit).unsqueeze(-1)
+        return torch.where(still.unsqueeze(-1), qd_scaled * again, qd_scaled)
+
     def _apply_enabled_cri_filter(self, actions, row_mask=None):
         """Remove ``dir · v_lin`` of the highest-CRI point before 0.96.
 
@@ -985,9 +1124,11 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
 
         A 9-point peak at or above ``cri_filter_target`` applies
         ``min(1, cri_filter_direction_gain * peak / cri_filter_target)`` of
-        the approach removal, including a request already over 0.96. The uniform speed
-        scale runs only when ``cri_filter_speed_enabled`` is set: at or
-        above ``cri_filter_strong_cri`` the remaining joint speed is then
+        the approach removal. A request at or above ``cri_penalty_limit`` is
+        then scaled until ``run_cri_filter`` on that command reports a peak
+        strictly under the limit. The uniform speed scale runs only when
+        ``cri_filter_speed_enabled`` is set: at or above
+        ``cri_filter_strong_cri`` the remaining joint speed is then
         multiplied by ``min(1, cri_filter_strong_target / peak)``. The
         gripper channel stays as written. A gripper within the handle
         distance skips this rewrite. Hold rows are left alone.
@@ -1035,7 +1176,12 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         cri_pre = result.get("cri_pre") if isinstance(result, dict) else None
         jac = result.get("impact_jacobian") if isinstance(result, dict) else None
         dire = result.get("impact_dir") if isinstance(result, dict) else None
-        if jac is not None and dire is not None and cri_pre is not None:
+        proportional = bool(getattr(self, "_cri_filter_proportional", False))
+        if proportional and cri_pre is not None:
+            qd_lib = IsaaclabPickPlaceCubePlateEnv._scale_proportional_command(
+                self, q[:n], qd_req[:, :7], cri_pre, mask
+            )
+        elif jac is not None and dire is not None and cri_pre is not None:
             # 속도 배율은 cri_filter_speed_enabled 일 때만 곱한다.
             # 9점 최댓값이 cri_filter_target 이상이면 방향 수정 벡터를
             # min(1, direction_gain * peak / target) 만큼 반영한다.
@@ -1045,7 +1191,7 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
                 dire,
                 cri_pre,
                 hard_limit=float(getattr(self, "_cri_limit", 0.96)),
-                point_limit=float(getattr(self, "_cri_filter_target", 0.92)),
+                point_limit=float(getattr(self, "_cri_filter_target", 0.8)),
                 strong_cri=float(getattr(self, "_cri_filter_strong_cri", 0.92)),
                 strong_target=float(getattr(self, "_cri_filter_strong_target", 0.0095)),
                 apply_speed_scale=bool(
@@ -1066,6 +1212,15 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         if qd_lib.ndim == 1:
             qd_lib = qd_lib.unsqueeze(0)
         qd_lib = qd_lib[:n, :7]
+        if (
+            not proportional
+            and jac is not None
+            and dire is not None
+            and cri_pre is not None
+        ):
+            qd_lib = IsaaclabPickPlaceCubePlateEnv._scale_over_limit_command(
+                self, q[:n], qd_lib, cri_pre, mask
+            )
         changed = joint_command_changed(qd_req[:, :7], qd_lib)
         # dir · v_lin depends on the whole qd. Once the approach removal
         # moves any joint, the plant tracks that full command.
@@ -1081,6 +1236,13 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         arm = merged[:n, :7]
         merged[:n, :7] = torch.where(row_hit.unsqueeze(-1), filtered[:, :7], arm)
         filtered = merged
+        self._traj_qd_req = qd_req[:, :7].detach()
+        self._traj_qd_used = qd_used.detach()
+        if cri_pre is not None:
+            cri_req = torch.as_tensor(cri_pre, device=act.device, dtype=torch.float32)
+            if cri_req.dim() == 1:
+                cri_req = cri_req.unsqueeze(0)
+            self._traj_cri_request = cri_req[:n].detach()
         if squeeze:
             filtered = filtered.squeeze(0)
         if torch.is_tensor(actions):
@@ -1255,6 +1417,14 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         far_reset_ids = torch.zeros(0, dtype=torch.long, device=self.device)
         self._last_cri_ovf_term = None
         self._last_cri_live = None
+        self._traj_qd_req = None
+        self._traj_qd_used = None
+        self._traj_cri_request = None
+        self._traj_cri_measured = None
+        self._traj_cri_rewind = None
+        self._traj_door_openness = None
+        self._traj_handle_reach = None
+        actions_raw = None
         # Spawn rewind and success-hold both pin absolute joint targets.
         # Rewind hold applies in training too: hold_after_done only freezes
         # rows that already succeeded, and a CRI rewind is not one of those.
@@ -1275,8 +1445,10 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             self._elapsed_steps += 1
             truncations = self.elapsed_steps >= self.cfg.max_episode_steps
             infos = self._record_metrics(step_reward, terminations, {})
+            if torch.is_tensor(actions):
+                actions_raw = actions.detach().clone()
             infos = self._attach_traj_info(
-                infos, self._hold_obs, actions=actions
+                infos, self._hold_obs, actions=actions, action_raw=actions_raw
             )
             return self._hold_obs, step_reward, terminations, truncations, infos
 
@@ -1302,6 +1474,8 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         live = ~self._chunk_hold
         if hold_after_done:
             live = live & ~was_frozen
+        if torch.is_tensor(actions):
+            actions_raw = actions.detach().clone()
         actions = self._apply_enabled_cri_filter(actions, row_mask=live)
 
         obs, step_reward, terminations, truncations, infos = self.env.step(actions)
@@ -1328,11 +1502,18 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
         obs = self._wrap_obs(obs)
         if hold_after_done and bool(was_frozen.any()):
             obs = overwrite_frozen_obs(obs, self._hold_obs, was_frozen)
+        door = getattr(self, "_last_door_openness", None)
+        reach = getattr(self, "_last_handle_reach", None)
+        if torch.is_tensor(door):
+            self._traj_door_openness = door.detach().clone()
+        if torch.is_tensor(reach):
+            self._traj_handle_reach = reach.detach().clone()
 
         cri_pre = None
         ovf = None
         if self._compute_cri:
             cri_pre = self._solve_cri_from_obs(obs)
+            self._traj_cri_measured = cri_pre.detach().clone()
             cri_limits = self._cri_ovf_term_limits()
             if self._cri_exceed_mode == "soft":
                 # y = 1 + (CRI - limit) on and past the limit, else 0.
@@ -1349,6 +1530,16 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
                     device=r_task.device, dtype=r_task.dtype
                 )
             cri_hit = cri_ovf_violated(cri_pre, threshold=cri_limits).reshape(-1)
+            # The handle gap turns the command filter off. Those rows are
+            # not an overflow measurement.
+            filter_off = self._cri_filter_suppressed(
+                int(cri_hit.shape[0]), cri_hit.device
+            )
+            if bool(filter_off.any()):
+                cri_hit = cri_hit & ~filter_off
+                if ovf is not None:
+                    ovf = ovf.clone()
+                    ovf[filter_off] = 0
             from rlinf.envs.isaaclab.spawn_rewind import cri_boundary_rewind_mask
 
             # An open door stays. Rewinding it would close the door and
@@ -1376,6 +1567,12 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
                 obs, cri_pre, rewind_ids = self._rewind_cri_boundary(
                     obs, cri_hit, was_frozen, cri_pre
                 )
+            rewind_row = torch.zeros(
+                self.num_envs, dtype=torch.float32, device=self.device
+            )
+            if int(rewind_ids.numel()) > 0:
+                rewind_row[rewind_ids.to(device=self.device)] = 1.0
+            self._traj_cri_rewind = rewind_row
             if self._cri_ovf_termination_enabled and bool(live_cri.any()):
                 self._last_cri_ovf_term = live_cri.clone()
                 terminations = terminations | live_cri.reshape_as(terminations)
@@ -1575,7 +1772,12 @@ class IsaaclabPickPlaceCubePlateEnv(IsaaclabBaseEnv):
             terminations[:] = False
 
         infos = self._attach_traj_info(
-            infos, obs, actions=actions, cri_pre=cri_pre, ovf=ovf
+            infos,
+            obs,
+            actions=actions,
+            action_raw=actions_raw,
+            cri_pre=cri_pre,
+            ovf=ovf,
         )
 
         _auto_reset = auto_reset and self.auto_reset

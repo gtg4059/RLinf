@@ -136,16 +136,16 @@ env:
       robot_pos: [4.603651840801024, -1.4710035928444452, 0.8]
       robot_rot: [0.70710678, 0.0, 0.0, 0.70710678]
       # Solver input is measured q and joint_vel after the step.
-      # Direction only. Once the 9-point peak is at or above 0.92, the
-      # approach-removal vector is applied with weight
-      # min(1, 0.8 * peak / 0.92). At 0.92 that weight is 80%, and a higher
-      # peak uses more of the cut, including a request over 0.96.
-      # cri_filter_speed_enabled is off, so joint speed is not scaled.
+      # Below a network CRI of 0.96 the arm command is unchanged, including
+      # the band from 0.8 up to 0.96. Above 0.96 the joint-velocity direction
+      # stays the request and its length is multiplied by 0.96/peak.
+      # One re-solve follows; a peak still at or above 0.96 is scaled once more.
       # Measured overflow and rewind stay at 0.96.
       # filter_qd_req / filter_qd_used / filter_keep report the speeds.
       cri_filter: True
       cri_filter_enabled: True
-      cri_filter_target: 0.92
+      cri_filter_target: 0.8
+      cri_filter_proportional: true
       cri_filter_direction_gain: 0.8
       cri_filter_speed_enabled: false
       cri_filter_strong_cri: 0.92
@@ -159,7 +159,8 @@ env:
       cri_chunk_penalty: 0.0
       cri_rewind_penalty: 0.0
       cri_penalty_limit: 0.96
-      # Within this gap the command filter is off. The check is distance only.
+      # Within this gap the command filter is off, and overflow is not
+      # measured. Filter-on rows are judged at cri_penalty_limit.
       cri_handle_relax_distance_m: 0.12
       cri_handle_relax_limit: 3.0
       cri_boundary_rewind: true
@@ -250,16 +251,16 @@ env:
       robot_pos: [4.603651840801024, -1.4710035928444452, 0.8]
       robot_rot: [0.70710678, 0.0, 0.0, 0.70710678]
       # Solver input is measured q and joint_vel after the step.
-      # Direction only. Once the 9-point peak is at or above 0.92, the
-      # approach-removal vector is applied with weight
-      # min(1, 0.8 * peak / 0.92). At 0.92 that weight is 80%, and a higher
-      # peak uses more of the cut, including a request over 0.96.
-      # cri_filter_speed_enabled is off, so joint speed is not scaled.
+      # Below a network CRI of 0.96 the arm command is unchanged, including
+      # the band from 0.8 up to 0.96. Above 0.96 the joint-velocity direction
+      # stays the request and its length is multiplied by 0.96/peak.
+      # One re-solve follows; a peak still at or above 0.96 is scaled once more.
       # Measured overflow and rewind stay at 0.96.
       # filter_qd_req / filter_qd_used / filter_keep report the speeds.
       cri_filter: True
       cri_filter_enabled: True
-      cri_filter_target: 0.92
+      cri_filter_target: 0.8
+      cri_filter_proportional: true
       cri_filter_direction_gain: 0.8
       cri_filter_speed_enabled: false
       cri_filter_strong_cri: 0.92
@@ -273,7 +274,8 @@ env:
       cri_chunk_penalty: 0.0
       cri_rewind_penalty: 0.0
       cri_penalty_limit: 0.96
-      # Within this gap the command filter is off. The check is distance only.
+      # Within this gap the command filter is off, and overflow is not
+      # measured. Filter-on rows are judged at cri_penalty_limit.
       cri_handle_relax_distance_m: 0.12
       cri_handle_relax_limit: 3.0
       cri_boundary_rewind: true
@@ -320,6 +322,12 @@ env:
         - main_images
         - exterior2_images
         - wrist_images
+      # {idx}_traj.npz next to the eval video. action is the plant command,
+      # action_raw is the policy target, cri is measured CRI before a rewind,
+      # and cri_request is the CRI of the velocity the filter saw.
+      # All eval envs are stored; the mp4 is still env 0 only.
+      save_trajectory: True
+      save_trajectory_all_envs: True
       save_camera_stills: True
       camera_image_keys:
         - main_images

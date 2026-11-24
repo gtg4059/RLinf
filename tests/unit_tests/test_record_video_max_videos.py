@@ -135,6 +135,28 @@ def test_flush_video_writes_traj_npz(tmp_path, monkeypatch):
     assert payload["env_ids"].tolist() == [0]
 
 
+def test_trajectory_all_envs_keeps_every_row(tmp_path, monkeypatch):
+    monkeypatch.setattr(RecordVideo, "_save_video", lambda *args, **kwargs: None)
+    cfg = _VideoCfg(str(tmp_path), max_videos=2)
+    cfg.save_trajectory = True
+    cfg.save_trajectory_all_envs = True
+    env = RecordVideo(_DummyEnv(), cfg, fps=5)
+    env.add_new_frames(
+        {"main_images": np.zeros((2, 8, 8, 3), dtype=np.uint8)},
+        {
+            "traj": {
+                "q": np.arange(14, dtype=np.float32).reshape(2, 7),
+                "action_raw": np.ones((2, 8), dtype=np.float32),
+            }
+        },
+    )
+    env.flush_video(video_sub_dir="step_20")
+    payload = np.load(tmp_path / "seed_0" / "step_20" / "0_traj.npz")
+    assert payload["q"].shape == (1, 2, 7)
+    assert payload["action_raw"].shape == (1, 2, 8)
+    assert payload["env_ids"].tolist() == [0, 1]
+
+
 def test_max_videos_also_stops_trajectory(tmp_path, monkeypatch):
     monkeypatch.setattr(RecordVideo, "_save_video", lambda *args, **kwargs: None)
     cfg = _VideoCfg(str(tmp_path), max_videos=1)

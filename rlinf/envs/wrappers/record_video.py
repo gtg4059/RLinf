@@ -74,7 +74,8 @@ class RecordVideo(gym.Wrapper):
             clips without dumping every epoch),
             ``save_trajectory`` (if True, write ``{idx}_traj.npz`` next to
             the MP4 with per-frame robot / CRI arrays from ``info["traj"]``
-            or obs ``states`` / ``cri``).
+            or obs ``states`` / ``cri``). ``save_trajectory_all_envs`` keeps
+            every env in that npz when the video itself shows only the first.
         fps: Explicit FPS override. If ``None``, FPS is resolved from
             ``video_cfg.fps``, environment config/metadata, then fallback ``30``.
     """
@@ -115,6 +116,9 @@ class RecordVideo(gym.Wrapper):
         self._max_videos = None if raw_max_videos is None else max(int(raw_max_videos), 0)
         self._save_camera_stills = bool(self._cfg_get("save_camera_stills", False))
         self._save_trajectory = bool(self._cfg_get("save_trajectory", False))
+        self._trajectory_all_envs = bool(
+            self._cfg_get("save_trajectory_all_envs", False)
+        )
         self._traj_rows: list[dict[str, np.ndarray]] = []
         camera_keys = self._cfg_get("camera_image_keys", None)
         if camera_keys is None:
@@ -541,7 +545,7 @@ class RecordVideo(gym.Wrapper):
     def _filter_traj_array(self, value: np.ndarray) -> np.ndarray:
         """Keep the recorded env subset on the batch axis."""
         arr = np.asarray(value)
-        if self._record_env_ids is None or arr.ndim == 0:
+        if self._trajectory_all_envs or self._record_env_ids is None or arr.ndim == 0:
             return arr
         env_ids = [i for i in self._record_env_ids if i < arr.shape[0]]
         if not env_ids:
@@ -603,7 +607,10 @@ class RecordVideo(gym.Wrapper):
                 else:
                     stacked.append(fill)
             payload[key] = np.stack(stacked, axis=0)
-        if self._record_env_ids is not None:
+        sample = next((value for value in payload.values() if value.ndim >= 2), None)
+        if self._trajectory_all_envs and sample is not None:
+            payload["env_ids"] = np.arange(sample.shape[1], dtype=np.int32)
+        elif self._record_env_ids is not None:
             payload["env_ids"] = np.asarray(self._record_env_ids, dtype=np.int32)
         payload["fps"] = np.int32(self._fps)
         os.makedirs(output_dir, exist_ok=True)

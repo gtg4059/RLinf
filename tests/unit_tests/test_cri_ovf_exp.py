@@ -19,6 +19,8 @@ from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.filter import (
     abs_joint_to_qd_nom,
     apply_filtered_arm_targets,
     shift_cri_filter_obs,
+    proportional_speed_scale,
+    scale_velocity_below_cri,
     subtract_approach_velocity,
 )
 from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.cri.constants import (
@@ -343,12 +345,22 @@ def test_approach_component_is_removed_before_the_hard_limit():
     cri = torch.zeros(1, 9)
     cri[0, 0] = 0.92
 
+    req_norm = torch.linalg.norm(torch.tensor([0.12, 0.06])) / dt
+
     class _Solver:
         def run_cri_filter(self, q_in, qd_in):
             del q_in
+            qd_t = torch.as_tensor(qd_in, dtype=torch.float32)
+            if qd_t.ndim == 1:
+                qd_t = qd_t.unsqueeze(0)
+            ratio = torch.linalg.norm(qd_t[:, :7], dim=-1, keepdim=True) / req_norm
+            if float(ratio[0]) > 0.999:
+                solved = cri.expand(qd_t.shape[0], -1).clone()
+            else:
+                solved = cri * ratio
             return {
-                "qd_cmd": qd_in.detach().cpu().numpy() * 0.1,
-                "cri_pre": cri,
+                "qd_cmd": qd_t.detach().cpu().numpy() * 0.1,
+                "cri_pre": solved,
                 "impact_jacobian": jac,
                 "impact_dir": direction,
             }
@@ -385,6 +397,144 @@ def test_approach_component_is_removed_before_the_hard_limit():
     # Approach joint goes to 0, then the tangential joint is scaled by 0.75/0.96.
     assert torch.allclose(slowed[0, 0], torch.zeros(1))
     assert torch.allclose(slowed[0, 1], torch.tensor(0.06 * 0.75 / 0.96))
+
+
+def test_request_above_hard_limit_is_scaled_under_it():
+    """A 1.39 request that keeps its tangent is scaled until the solve is under 0.96."""
+    from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.env import (
+        IsaaclabPickPlaceCubePlateEnv,
+    )
+
+    dt = 1.0 / 15.0
+    actions = torch.zeros(1, 8)
+    actions[0, 0] = 0.12
+    actions[0, 1] = 0.06
+    actions[0, 7] = 0.4
+    jac = torch.zeros(1, 9, 6, 7)
+    jac[0, 0, 0, 0] = 1.0
+    direction = torch.zeros(1, 9, 3)
+    direction[0, 0, 0] = 1.0
+    tangent_qd = 0.06 / dt
+
+    class _Solver:
+        def run_cri_filter(self, q_in, qd_in):
+            del q_in
+            qd_t = torch.as_tensor(qd_in, dtype=torch.float32)
+            if qd_t.ndim == 1:
+                qd_t = qd_t.unsqueeze(0)
+            solved = torch.zeros(qd_t.shape[0], 9)
+            solved[:, 0] = 1.39 * qd_t[:, 1].abs() / tangent_qd
+            return {
+                "qd_cmd": qd_t.detach().cpu().numpy(),
+                "cri_pre": solved,
+                "impact_jacobian": jac,
+                "impact_dir": direction,
+            }
+
+    env = _filter_env(torch.zeros(1, 7), _Solver(), dt)
+    env._cri_filter_target = 0.8
+    env._cri_filter_direction_gain = 0.8
+    env._cri_filter_speed_enabled = False
+    env._cri_penalty_limit = 0.96
+    out = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(env, actions)
+    assert torch.allclose(out[0, 0], torch.zeros(1), atol=1e-5)
+    kept = float(out[0, 1]) / 0.06
+    assert kept < 0.96 / 1.39
+    assert kept > 0.96 / 1.39 - (1.0 / 32.0)
+    assert torch.allclose(out[0, 7], torch.tensor(0.4))
+    assert env._cri_solve_count > 1
+
+
+def test_scale_velocity_below_cri_keeps_the_largest_safe_scale():
+    qd = torch.tensor([[1.39, 0.0]])
+
+    def cri_peak_of(qd_try):
+        return qd_try[:, 0].abs()
+
+    out = scale_velocity_below_cri(
+        qd, torch.tensor([True]), cri_peak_of, limit=0.96, iters=6
+    )
+    assert float(out[0, 0]) < 0.96
+    assert float(out[0, 0]) > 0.96 - (1.39 / 32.0)
+
+
+def test_proportional_scale_is_one_until_the_limit():
+    peak = torch.tensor([0.5, 0.8, 0.96, 1.39, 2.0])
+    scale = proportional_speed_scale(peak, limit=0.96)
+    assert torch.allclose(scale[:3], torch.ones(3))
+    assert torch.allclose(scale[3], torch.tensor(0.96 / 1.39))
+    assert torch.allclose(scale[4], torch.tensor(0.96 / 2.0))
+
+
+def test_proportional_command_keeps_direction_and_caps_speed():
+    """A 1.39 request is shortened by 0.96/1.39. Both joints share that scale."""
+    from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.env import (
+        IsaaclabPickPlaceCubePlateEnv,
+    )
+
+    dt = 1.0 / 15.0
+    actions = torch.zeros(1, 8)
+    actions[0, 0] = 0.12
+    actions[0, 1] = 0.06
+    actions[0, 7] = 0.4
+    base = torch.linalg.norm(torch.tensor([0.12, 0.06])) / dt
+
+    class _Solver:
+        def run_cri_filter(self, q_in, qd_in):
+            del q_in
+            qd_t = torch.as_tensor(qd_in, dtype=torch.float32)
+            if qd_t.ndim == 1:
+                qd_t = qd_t.unsqueeze(0)
+            ratio = torch.linalg.norm(qd_t[:, :7], dim=-1) / base
+            solved = torch.zeros(qd_t.shape[0], 9)
+            solved[:, 0] = 1.39 * ratio
+            return {"cri_pre": solved, "qd_cmd": qd_t.detach().cpu().numpy()}
+
+    env = _filter_env(torch.zeros(1, 7), _Solver(), dt)
+    env._cri_filter_proportional = True
+    env._cri_penalty_limit = 0.96
+    out = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(env, actions)
+    assert torch.allclose(out[0, 0], torch.tensor(0.12 * 0.96 / 1.39))
+    assert torch.allclose(out[0, 1], torch.tensor(0.06 * 0.96 / 1.39))
+    assert torch.allclose(out[0, 7], torch.tensor(0.4))
+    assert env._cri_solve_count == 2
+
+    actions[0, 0] = 0.04
+    mild = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(env, actions)
+    assert torch.allclose(mild[0, 0], torch.tensor(0.04))
+    assert torch.allclose(mild[0, 1], torch.tensor(0.06))
+
+
+def test_proportional_command_scales_once_more_when_the_resolve_stays_high():
+    from rlinf.envs.isaaclab.tasks.pick_place_cube_plate.env import (
+        IsaaclabPickPlaceCubePlateEnv,
+    )
+
+    dt = 1.0 / 15.0
+    actions = torch.zeros(1, 8)
+    actions[0, 0] = 0.12
+    actions[0, 7] = 0.2
+
+    class _Solver:
+        def __init__(self):
+            self.calls = 0
+
+        def run_cri_filter(self, q_in, qd_in):
+            del q_in, qd_in
+            self.calls += 1
+            solved = torch.zeros(1, 9)
+            solved[0, 0] = 1.39 if self.calls == 1 else 1.20
+            return {"cri_pre": solved}
+
+    solver = _Solver()
+    env = _filter_env(torch.zeros(1, 7), solver, dt)
+    env._cri_filter_proportional = True
+    env._cri_penalty_limit = 0.96
+    out = IsaaclabPickPlaceCubePlateEnv._apply_enabled_cri_filter(env, actions)
+    expected = 0.12 * (0.96 / 1.39) * (0.96 / 1.20)
+    assert torch.allclose(out[0, 0], torch.tensor(expected))
+    assert torch.allclose(out[0, 7], torch.tensor(0.2))
+    assert solver.calls == 2
 
 
 def test_near_handle_row_skips_the_command_filter():
