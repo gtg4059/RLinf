@@ -8,7 +8,7 @@ configure_cudacri 는 Python 버전 + CUDA 태그(SFD_CUDACRI_CUDA / Isaac Sim)�
 (구형 평탄 lib/ 도 허용).
 TensorRT: Engine/.../model_fp16.engine 우선, deserialize 실패 시 같은 폴더 model.onnx 로 런타임 빌드.
 Isaac Sim: export SAFETICS_TRT_PREFER_ONNX=1 로 engine 건너뛰기 가능.
-cmake --build build --target isaaclab_deploy 로 patchelf 적용 lib/{3.11,3.12,3.12-cu128}/·Engine/ 을 IsaacLab articulation 에 배포.
+cmake --build build --target isaaclab_deploy 로 patchelf 적용 lib/{3.11,3.11-cu128,3.12,3.12-cu128}/·Engine/ 을 IsaacLab articulation 에 배포. 3.11-cu128 은 3.11 빌드의 복제다.
 cmake --build build --target rlinf_deploy 로 같은 번들 + lib/3.11-cu128 + libsfd_compat.so 를 RLinf pick_place_cube_plate/cri 에 배포.
 
 Realtime tail-spike mitigation (SafeGiver SFD_CoreService_Test + Isaac host tuning):

@@ -15,7 +15,7 @@ SFD_CoreService_Test 의 RealTimeBudgetReport / RealTimePassGrade 와 동일 기
         run_cri_filter,
     )
 
-    configure_cri_filter(service, cri_limit=0.96, alpha=0.02)
+    configure_cri_filter(service, cri_limit=0.9, alpha=0.02)
     monitor = CriRealtimeMonitor.from_env()
     for i, (q, qd) in enumerate(ticks):
         # 전방만: run_cri_at_motion_state
@@ -377,11 +377,16 @@ def _call_service(solver_service: Any, snake: str, camel: str, *args: Any, **kwa
 
 def configure_cri_filter(
     solver_service: Any,
-    cri_limit: float = 0.96,
+    cri_limit: float = 0.9,
     alpha: float = 0.02,
     enabled: bool | None = True,
 ) -> dict[str, float | bool]:
-    """Isaac CRI_F: LoadAnalysis 이후 1회. 하드 한도 0.96 + 근방 계수 α=0.02."""
+    """Isaac CRI_F: LoadAnalysis 이후 1회.
+
+    ``cri_limit``는 접근 성분 ``dir · v_lin``을 빼기 시작하는 점별 기준이다.
+    0.9이면 그 점만 감속하고, 9채널 최댓값이 0.96이면 요청을 유지한다.
+    넘침 판정 0.96은 OVF와 되감기에 두고 여기로 넣지 않는다.
+    """
     _call_service(solver_service, "set_cri_filter_limit", "RunSolver_CUDA_SetCriFilterLimit", cri_limit)
     _call_service(solver_service, "set_cbf_alpha", "RunSolver_CUDA_SetCbfAlpha", alpha)
     if enabled is not None:
